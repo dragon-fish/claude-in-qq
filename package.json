@@ -1,0 +1,15 @@
+{
+  "name": "claude-channel-qq",
+  "version": "0.0.1",
+  "description": "QQ channel for Claude Code — drive your local session from QQ private chat, with remote tool approval.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "bun run server.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.23.0",
+    "qrcode": "^1.5.4"
+  }
+}

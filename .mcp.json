@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "qq": {
+      "command": "bun",
+      "args": ["run", "server.ts"]
+    }
+  }
+}

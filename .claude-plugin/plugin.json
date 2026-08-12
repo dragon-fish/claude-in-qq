@@ -1,0 +1,6 @@
+{
+  "name": "qq",
+  "description": "QQ channel for Claude Code — drive your local session from QQ private chat, with remote tool approval. Scan-to-configure provisions the bot with no manual application.",
+  "version": "0.0.1",
+  "keywords": ["qq", "messaging", "channel", "mcp"]
+}
