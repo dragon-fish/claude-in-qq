@@ -159,7 +159,15 @@ async function qqFetch(path: string, init: RequestInit = {}): Promise<Response> 
 //
 // A C2C reply carrying msg_id is "passive": free, but capped at 4 uses per
 // inbound message and valid for 60 minutes. Past either bound it must go out
-// as "active", which draws on a separate daily allowance.
+// as "active", which draws on a separate daily allowance — 1000 a day per
+// user. Both figures are the documented single-chat ones; group chat differs
+// (5 uses, 5 minutes) and is not supported here.
+//
+// The active send rate for single chat is 10/qps on a personal-certified bot.
+// Appends wait on each other, so this bridge measures ~2.8/s at its fastest
+// and cannot approach it.
+//
+// @see https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/overview.html
 
 const PASSIVE_MAX_USES = 4
 const PASSIVE_TTL_MS = 60 * 60 * 1000
@@ -374,10 +382,11 @@ const STREAM_TAIL_MARGIN = 512
  * the safe side of one — a reply that rolls a message early costs one extra
  * message; a reply that never rolls loses its ending.
  *
- * No observation supports a ceiling existing at all. The failures once blamed
- * on length turned out to be 50001, which QQ documents as a transient
- * internal error; this stays only because being wrong in this direction is
- * cheap.
+ * Neither observation nor documentation supports a ceiling existing at all —
+ * the overview page lists reply counts, daily allowances and QPS, and says
+ * nothing about how long one message may grow. The failures once blamed on
+ * length turned out to be 50001, which QQ documents as a transient internal
+ * error. This stays only because being wrong in this direction is cheap.
  */
 const STREAM_MAX_CHARS = 4000
 
