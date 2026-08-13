@@ -40,6 +40,8 @@ import {
 
 /** Mutable: /cwd retargets the agent, which means rebuilding the session. */
 let workdir = process.env.QQ_BRIDGE_CWD ?? process.env.HOME!
+/** Mutable: /mode changes it live via setPermissionMode. */
+let permissionMode = process.env.QQ_PERMISSION_MODE ?? 'auto'
 const APPROVAL_TIMEOUT_MS = 30 * 60 * 1000
 const QUESTION_TIMEOUT_MS = 15 * 60 * 1000
 /** Don't narrate every tool call; report at most this often. */
@@ -455,6 +457,10 @@ function commandDeps(user: string): CommandDeps {
     },
     sessionId: loadSessionId,
     setSessionId: saveSessionId,
+    permissionMode: () => permissionMode,
+    setPermissionMode: mode => {
+      permissionMode = mode
+    },
     counts: () => ({
       allowed: loadAccess().allowed.length,
       approvals: pendingApprovals.size,
@@ -515,7 +521,10 @@ async function runSession(): Promise<void> {
     options: {
       systemPrompt: { type: 'preset', preset: 'claude_code', append: OPERATOR_CONTEXT },
       cwd: workdir,
-      permissionMode: 'default',
+      // 'auto' lets a classifier clear the routine calls and only escalate what
+      // it considers risky. 'default' escalates every write and every command,
+      // which on a phone means approving your way through the whole task.
+      permissionMode,
       resume: resume ?? undefined,
       // The terminal question tool has no UI here — nobody is watching a
       // terminal. Left enabled it renders into the void and comes back

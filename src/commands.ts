@@ -37,6 +37,8 @@ export type CommandDeps = {
   restartSession(reason: string): void
   sessionId(): string | null
   setSessionId(id: string | null): void
+  permissionMode(): string
+  setPermissionMode(mode: string): void
   counts(): { allowed: number; approvals: number; questions: number }
 }
 
@@ -209,6 +211,61 @@ register(
   },
 
   {
+    name: 'mode',
+    usage: '/mode [模式]',
+    summary: '不带参数则列出权限模式',
+    async run(arg, deps) {
+      const q = await requireQuery(deps)
+      if (!q) return
+
+      // bypassPermissions is deliberately absent: it needs
+      // allowDangerouslySkipPermissions, and a phone is not an isolated VM.
+      const modes = [
+        { value: 'auto', label: 'auto 智能判断', desc: '分类器放行常规操作，只对有风险的问你' },
+        { value: 'default', label: 'default 每步都问', desc: '任何写入和命令都要批准' },
+        { value: 'acceptEdits', label: 'acceptEdits 改文件免批', desc: '文件编辑自动通过，命令仍要批' },
+        { value: 'plan', label: 'plan 只读规划', desc: '只看不动，先给方案' },
+      ]
+
+      const apply = async (value: string) => {
+        try {
+          await q.setPermissionMode(value)
+          deps.setPermissionMode(value)
+          await deps.reply(`权限模式已切到 \`${value}\``)
+        } catch (err) {
+          await deps.reply(`切换失败：${err}`)
+        }
+      }
+
+      if (arg) {
+        const hit = modes.find(m => m.value.toLowerCase() === arg.toLowerCase())
+        if (!hit) {
+          await deps.reply(`未知模式 \`${arg}\`，可选：${modes.map(m => m.value).join('、')}`)
+          return
+        }
+        await apply(hit.value)
+        return
+      }
+
+      const labels = modes.map(m => m.label)
+      const idx = await deps.askChoice(labels, mode => {
+        const lines = [`**权限模式**（当前 \`${deps.permissionMode()}\`）`, '']
+        if (mode !== 'text') {
+          lines.push('| | 模式 | 说明 |', '| --- | --- | --- |')
+          modes.forEach((m, i) =>
+            lines.push(`| ${mode === 'letters' ? 'ABCDEFGH'[i] : '·'} | ${m.value} | ${cell(m.desc)} |`),
+          )
+          lines.push('')
+        }
+        lines.push('点按钮切换')
+        return lines.join('\n')
+      })
+      if (idx < 0) return
+      await apply(modes[idx].value)
+    },
+  },
+
+  {
     name: 'resume',
     usage: '/resume',
     summary: '从历史会话里挑一个恢复',
@@ -291,6 +348,7 @@ register(
           '**桥接状态**',
           `工作目录：\`${deps.workdir()}\``,
           `会话：\`${deps.sessionId() ?? '(新会话)'}\``,
+          `权限模式：\`${deps.permissionMode()}\``,
           `白名单：${c.allowed} 人`,
           `待审批：${c.approvals}　待回答：${c.questions}`,
         ].join('\n'),
