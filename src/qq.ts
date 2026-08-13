@@ -368,6 +368,16 @@ const STREAM_TAIL_MARGIN = 512
  */
 const STREAM_MAX_CHARS = 4000
 
+/**
+ * Smallest gap between two appends on one stream.
+ *
+ * Writes arrive per finished line, which for a long reply is a request every
+ * fraction of a second. Coalescing them into one update every 300ms costs
+ * nothing legible — text updating three times a second reads as continuous —
+ * and cuts the request count by an order of magnitude.
+ */
+const STREAM_THROTTLE_MS = 300
+
 export function createStream(openid: string, replyTo?: string): StreamHandle {
   let streamId: string | null = null
   let index = 0
@@ -387,6 +397,9 @@ export function createStream(openid: string, replyTo?: string): StreamHandle {
   let nearlyFull = false
   /** Log the reported capacity once per stream, not once per append. */
   let sawRemaining = false
+  /** Written but not yet sent, waiting for the throttle window to close. */
+  let pending = ''
+  let flushTimer: ReturnType<typeof setTimeout> | null = null
 
   async function send(closing: boolean, delta: string): Promise<void> {
     if (failed) return
@@ -442,6 +455,33 @@ export function createStream(openid: string, replyTo?: string): StreamHandle {
     if (full.length >= STREAM_MAX_CHARS) nearlyFull = true
   }
 
+  /**
+   * Appends are coalesced on a timer rather than sent per write.
+   *
+   * A write happens per finished line, so an unthrottled long reply is a
+   * hundred-odd requests in a couple of minutes — needless load, and the most
+   * likely explanation for the burst of 50001s, which arrived in a cluster
+   * and then never again. Three updates a second still reads as continuous
+   * text; the eye cannot follow faster than that anyway.
+   */
+  function scheduleFlush(): void {
+    if (flushTimer || failed) return
+    flushTimer = setTimeout(() => {
+      flushTimer = null
+      flushPending()
+    }, STREAM_THROTTLE_MS)
+  }
+
+  function flushPending(): void {
+    if (!pending || failed) return
+    const chunk = pending
+    pending = ''
+    chain = chain.then(() => send(false, chunk)).catch(err => {
+      failed = true
+      log('stream write threw:', err)
+    })
+  }
+
   return {
     get live() {
       return streamId !== null && !failed
@@ -455,13 +495,17 @@ export function createStream(openid: string, replyTo?: string): StreamHandle {
     write(text: string) {
       if (!text || failed) return chain
       full += text
-      chain = chain.then(() => send(false, text)).catch(err => {
-        failed = true
-        log('stream write threw:', err)
-      })
+      pending += text
+      scheduleFlush()
       return chain
     },
     end() {
+      // Whatever is still waiting on the timer goes first, in order.
+      if (flushTimer) {
+        clearTimeout(flushTimer)
+        flushTimer = null
+      }
+      flushPending()
       chain = chain
         .then(async () => {
           // Nothing was ever sent, so there is no stream to close.
