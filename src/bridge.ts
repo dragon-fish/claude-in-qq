@@ -38,10 +38,13 @@ import {
   type InboundMessage,
 } from './qq.js'
 
-/** Mutable: /cwd retargets the agent, which means rebuilding the session. */
-let workdir = process.env.QQ_BRIDGE_CWD ?? process.env.HOME!
-/** Mutable: /mode changes it live via setPermissionMode. */
-let permissionMode = process.env.QQ_PERMISSION_MODE ?? 'auto'
+/**
+ * Mutable and persisted. A value chosen with /cwd or /mode outranks the env
+ * default: it is the operator's most recent explicit decision, and the env var
+ * only describes how this process happened to be launched.
+ */
+let workdir = ''
+let permissionMode = ''
 const APPROVAL_TIMEOUT_MS = 30 * 60 * 1000
 const QUESTION_TIMEOUT_MS = 15 * 60 * 1000
 /** Don't narrate every tool call; report at most this often. */
@@ -388,24 +391,45 @@ async function handleButton(openid: string, buttonData: string): Promise<void> {
 // restart — a crash, a deploy, an edit to this file — silently starts a new
 // conversation, and the operator is left talking to someone with amnesia.
 
-const SESSION_FILE = join(STATE_DIR, 'session.json')
+const STATE_FILE = join(STATE_DIR, 'session.json')
 
-function loadSessionId(): string | null {
+/**
+ * What survives a restart.
+ *
+ * The session id matters most — without it every restart starts a fresh
+ * conversation — but workdir and permission mode are just as load-bearing:
+ * a bridge that forgets them silently runs the next task in the wrong
+ * directory, or under stricter rules than the operator last chose.
+ */
+type BridgeState = {
+  session_id?: string | null
+  workdir?: string
+  permission_mode?: string
+}
+
+function loadState(): BridgeState {
   try {
-    const data = JSON.parse(readFileSync(SESSION_FILE, 'utf8')) as { session_id?: string }
-    return data.session_id ?? null
+    return JSON.parse(readFileSync(STATE_FILE, 'utf8')) as BridgeState
   } catch {
-    return null
+    return {}
   }
 }
 
-function saveSessionId(id: string | null): void {
+function patchState(patch: BridgeState): void {
   try {
     mkdirSync(STATE_DIR, { recursive: true })
-    writeFileSync(SESSION_FILE, JSON.stringify({ session_id: id }, null, 2))
+    writeFileSync(STATE_FILE, JSON.stringify({ ...loadState(), ...patch }, null, 2))
   } catch (err) {
-    log('failed to persist session id:', err)
+    log('failed to persist state:', err)
   }
+}
+
+function loadSessionId(): string | null {
+  return loadState().session_id ?? null
+}
+
+function saveSessionId(id: string | null): void {
+  patchState({ session_id: id })
 }
 
 // ------------------------------------------------------------------- commands
@@ -450,6 +474,7 @@ function commandDeps(user: string): CommandDeps {
     workdir: () => workdir,
     setWorkdir: path => {
       workdir = path
+      patchState({ workdir: path })
     },
     restartSession: reason => {
       restartReason = reason
@@ -460,6 +485,7 @@ function commandDeps(user: string): CommandDeps {
     permissionMode: () => permissionMode,
     setPermissionMode: mode => {
       permissionMode = mode
+      patchState({ permission_mode: mode })
     },
     counts: () => ({
       allowed: loadAccess().allowed.length,
@@ -593,13 +619,17 @@ async function runSession(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  const state = loadState()
+  workdir = state.workdir ?? process.env.QQ_BRIDGE_CWD ?? process.env.HOME!
+  permissionMode = state.permission_mode ?? process.env.QQ_PERMISSION_MODE ?? 'auto'
+
   if (!HAS_CREDENTIALS) {
     log('QQ_APP_ID / QQ_CLIENT_SECRET missing — run: bun run onboard.ts')
     process.exit(1)
   }
 
   await connectGateway({ onMessage: handleMessage, onButton: handleButton })
-  log(`bridge up, workdir=${workdir}, state=${STATE_DIR}`)
+  log(`bridge up, workdir=${workdir}, mode=${permissionMode}, state=${STATE_DIR}`)
 
   // The session is rebuilt rather than the process restarted: /clear and /cwd
   // both need a fresh query, and a crashed query should not take the QQ
