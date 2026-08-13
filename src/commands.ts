@@ -42,6 +42,8 @@ export type CommandDeps = {
    * message, since commands happen entirely outside its view.
    */
   noteToAgent(text: string): void
+  /** Record that a command ran, so the agent learns what happened while it was blind. */
+  recordCommand(name: string, args: string): void
   permissionMode(): string
   setPermissionMode(mode: string): void
   counts(): { allowed: number; approvals: number; questions: number }
@@ -379,8 +381,13 @@ export async function dispatch(text: string, deps: CommandDeps): Promise<boolean
   const cmd = registry.get(m[1].toLowerCase())
   if (!cmd) return false
 
+  const arg = (m[2] ?? '').trim()
+  // Recorded before running: a command that throws still happened, and the
+  // agent is better off knowing it was attempted.
+  deps.recordCommand(cmd.name, arg)
+
   try {
-    await cmd.run((m[2] ?? '').trim(), deps)
+    await cmd.run(arg, deps)
   } catch (err) {
     await deps.reply(`\`/${cmd.name}\` 执行出错：${err}`)
   }

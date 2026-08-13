@@ -151,28 +151,59 @@ class MessageQueue implements AsyncIterable<SDKUserMessage> {
 const queue = new MessageQueue()
 
 /**
- * Facts the agent has no way to observe.
+ * Slash commands the operator ran since the agent last heard from them.
  *
- * Slash commands are handled entirely by the bridge — the agent never sees the
- * command or its output — so a command with a side effect leaves it holding a
- * stale picture: interrupted mid-task and unaware, or reasoning about a working
- * directory that changed underneath it. These notes ride along with the next
- * real message rather than as their own turn, which would make the agent
- * respond to an event instead of to the person.
+ * The bridge handles commands entirely on its own — the agent never sees the
+ * command, its arguments, or its output. Left unsaid, that produces an agent
+ * reasoning about a working directory that moved, or one that believes it
+ * finished work the operator interrupted. Even a command with no side effect is
+ * a signal worth passing on: someone reading /help is working out what this
+ * thing can do.
  */
-const pendingNotices: string[] = []
+type CommandRecord = { name: string; args: string; at: number; note?: string }
 
-function noteToAgent(text: string): void {
-  pendingNotices.push(text)
-  log(`queued notice: ${text}`)
+const commandLog: CommandRecord[] = []
+
+function recordCommand(name: string, args: string): void {
+  commandLog.push({ name, args, at: Date.now() })
 }
 
-/** Wrap queued notices around the operator's message, then clear them. */
-function withNotices(text: string): string {
-  if (!pendingNotices.length) return text
-  const notes = pendingNotices.join('\n')
-  pendingNotices.length = 0
-  return `<system-note>\n${notes}\n</system-note>\n\n${text}`
+/** Attach an explanation to the command currently running. */
+function noteToAgent(text: string): void {
+  const last = commandLog[commandLog.length - 1]
+  if (last) last.note = last.note ? `${last.note}\n${text}` : text
+  else commandLog.push({ name: 'unknown', args: '', at: Date.now(), note: text })
+  log(`command note: ${text}`)
+}
+
+const xmlAttr = (v: string) => v.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;')
+
+/**
+ * Prepend the command log to the operator's message.
+ *
+ * It rides along with a real message rather than arriving as its own turn: a
+ * turn of its own would have the agent respond to the event instead of to the
+ * person.
+ */
+function withCommandLog(text: string): string {
+  if (!commandLog.length) return text
+
+  const entries = commandLog.map(c => {
+    const at = new Date(c.at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+    const attrs = `name="${xmlAttr(c.name)}"${c.args ? ` args="${xmlAttr(c.args)}"` : ''} time="${at}"`
+    return c.note ? `<command ${attrs}>\n${c.note}\n</command>` : `<command ${attrs} />`
+  })
+  const n = commandLog.length
+  commandLog.length = 0
+
+  return [
+    '<harness-reminder>',
+    `操作者在此期间执行了 ${n} 条斜杠指令。你看不到指令本身及其输出，以下是摘要：`,
+    ...entries,
+    '</harness-reminder>',
+    '',
+    text,
+  ].join('\n')
 }
 
 // ------------------------------------------------------------------ approvals
@@ -373,7 +404,7 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
     }
   }
 
-  const text = withNotices([msg.content, ...notes].filter(Boolean).join('\n'))
+  const text = withCommandLog([msg.content, ...notes].filter(Boolean).join('\n'))
   if (blocks.length) {
     // Image first, then the words about it — the order the person sent them in.
     queue.push([...blocks, { type: 'text', text: text || '(图片)' }])
@@ -508,6 +539,7 @@ function commandDeps(user: string): CommandDeps {
     sessionId: loadSessionId,
     setSessionId: saveSessionId,
     noteToAgent,
+    recordCommand,
     permissionMode: () => permissionMode,
     setPermissionMode: mode => {
       permissionMode = mode
