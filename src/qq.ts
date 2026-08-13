@@ -331,12 +331,22 @@ export type StreamHandle = {
 
 /**
  * How little headroom QQ has to report before a stream is treated as full.
- * Deliberately generous: overshooting costs one extra message, undershooting
- * silently truncates a reply. The real values are logged the first time each
- * stream sees one, so this can be tightened against observation rather than
- * guesswork.
+ *
+ * Observed behaviour: every append comes back with `remain_msg_len: 0`,
+ * whatever the message actually holds — so zero means "not reported", not
+ * "no room left". Reading it literally rolled the stream on every single
+ * chunk and chopped one reply into a message per line. Only a positive value
+ * is believed.
  */
 const STREAM_TAIL_MARGIN = 512
+
+/**
+ * The fallback ceiling, counted here rather than asked for. Nothing in the
+ * response says how large a streamed message may grow, so this is a guess on
+ * the safe side of one — a reply that rolls a message early costs one extra
+ * message; a reply that never rolls loses its ending.
+ */
+const STREAM_MAX_CHARS = 4000
 
 export function createStream(openid: string, replyTo?: string): StreamHandle {
   let streamId: string | null = null
@@ -392,13 +402,14 @@ export function createStream(openid: string, replyTo?: string): StreamHandle {
     }
     const data = (await res.json()) as { id?: string; remain_msg_len?: number }
     if (!streamId && data.id) streamId = data.id
-    if (typeof data.remain_msg_len === 'number') {
+    if (typeof data.remain_msg_len === 'number' && data.remain_msg_len > 0) {
       if (!sawRemaining) {
         sawRemaining = true
         log(`stream capacity: remain_msg_len=${data.remain_msg_len} after ${index} chunk(s)`)
       }
       if (data.remain_msg_len <= STREAM_TAIL_MARGIN) nearlyFull = true
     }
+    if (full.length >= STREAM_MAX_CHARS) nearlyFull = true
   }
 
   return {
