@@ -873,8 +873,33 @@ class LineStreamer {
       this.atLineStart = true
       await this.emit(rest, wasAtStart)
     }
-    await this.writeFence(next === 'trace')
+    if (next === 'trace') {
+      // The reply may itself be inside a code block — showing code is a normal
+      // thing to do. Opening the trace block without closing that one first
+      // means the trace's own fence closes the reply's block instead, and
+      // every fence after it lands on the wrong side. Suspend it, and reopen
+      // it on the way back with the language it was written with.
+      if (this.proseFence !== null) await this.writeThrough('```\n')
+      await this.writeFence(true)
+    } else {
+      await this.writeFence(false)
+      if (this.proseFence !== null) await this.writeThrough(`\`\`\`${this.proseFence}\n`)
+    }
     this.channel = next
+  }
+
+  /**
+   * The info string of the reply's own open code block, or null when the reply
+   * is not inside one. Tracked because the trace has to step around it.
+   */
+  private proseFence: string | null = null
+
+  /** Update `proseFence` for one line of the reply. */
+  private trackProseFence(line: string): void {
+    const fence = /^ {0,3}(`{3,}|~{3,})\s*(.*)$/.exec(line.replace(/\n$/, ''))
+    if (!fence) return
+    if (this.proseFence === null) this.proseFence = fence[2].trim()
+    else this.proseFence = null
   }
 
   /**
@@ -1035,10 +1060,13 @@ class LineStreamer {
 
     // Keeping the newline with its line, so a split never loses one.
     for (const line of text.split(/(?<=\n)/)) {
-      const media = lineStart
-        ? /^MEDIA:[ \t]*(\S.*?)[ \t]*$/.exec(line.replace(/\n$/, ''))
-        : null
+      const atStart = lineStart
+      const media = atStart ? /^MEDIA:[ \t]*(\S.*?)[ \t]*$/.exec(line.replace(/\n$/, '')) : null
       lineStart = line.endsWith('\n')
+      // Only whole lines: a fence is a line, and half of one released early
+      // by the chunker would read as an opening fence with a truncated info
+      // string.
+      if (atStart && lineStart) this.trackProseFence(line)
       if (!media) {
         prose += line
         continue
