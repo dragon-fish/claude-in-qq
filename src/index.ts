@@ -49,10 +49,16 @@ import {
  */
 let workdir = ''
 let permissionMode = ''
+/**
+ * Whether the reply carries the work as well as the answer. Both default on:
+ * a long task that shows nothing for ten minutes reads as a hang, and the
+ * trace is what distinguishes the two. Off is one /verbose away when it turns
+ * out to be noise.
+ */
+let showThinking = true
+let showTools = true
 const APPROVAL_TIMEOUT_MS = 30 * 60 * 1000
 const QUESTION_TIMEOUT_MS = 15 * 60 * 1000
-/** Don't narrate every tool call; report at most this often. */
-const PROGRESS_INTERVAL_MS = 25_000
 
 /**
  * Appended to Claude Code's own system prompt. Without it the agent assumes a
@@ -513,6 +519,8 @@ type BridgeState = {
   session_id?: string | null
   workdir?: string
   permission_mode?: string
+  show_thinking?: boolean
+  show_tools?: boolean
 }
 
 function loadState(): BridgeState {
@@ -597,6 +605,12 @@ function commandDeps(user: string): CommandDeps {
       permissionMode = mode
       patchState({ permission_mode: mode })
     },
+    verbose: () => ({ thinking: showThinking, tools: showTools }),
+    setVerbose: v => {
+      showThinking = v.thinking
+      showTools = v.tools
+      patchState({ show_thinking: v.thinking, show_tools: v.tools })
+    },
     counts: () => ({
       allowed: loadAccess().allowed.length,
       approvals: pendingApprovals.size,
@@ -657,11 +671,25 @@ async function deliverReply(text: string): Promise<void> {
  * renders as literal asterisks until the closing one arrives. Whole lines avoid
  * both, and read better than characters appearing one at a time.
  */
+/**
+ * Which kind of content a push carries.
+ *
+ * `prose` is the reply itself — markdown, and the only place a MEDIA line
+ * means anything. `trace` is the work behind it (thinking summaries, tool
+ * calls), which goes inside a fenced code block: QQ collapses those past
+ * fifteen lines, so a long task folds itself away instead of burying the
+ * answer, and nothing inside a fence is parsed as markdown or as a MEDIA line.
+ */
+type Channel = 'prose' | 'trace'
+
 class LineStreamer {
   private buffer = ''
   private stream: StreamHandle | null = null
   /** Text that missed the stream and has to go out as an ordinary message. */
   private overflow = ''
+  private channel: Channel = 'prose'
+  /** Whether the last text handed to the stream ended a line. */
+  private atStreamLineStart = true
 
   constructor(
     private readonly open: () => StreamHandle,
@@ -675,7 +703,8 @@ class LineStreamer {
    */
   private atLineStart = true
 
-  async push(delta: string): Promise<void> {
+  async push(delta: string, channel: Channel = 'prose'): Promise<void> {
+    if (channel !== this.channel) await this.switchTo(channel)
     this.buffer += delta
 
     const cut = this.buffer.lastIndexOf('\n')
@@ -691,12 +720,66 @@ class LineStreamer {
     // that is decided by the first few characters. Once the line cannot be one,
     // release it in small pieces — otherwise a paragraph-long line sits invisible
     // while a short one appears at once, and the reply arrives in lurches.
-    if (this.buffer.length >= LineStreamer.CHUNK && !this.mightBeMedia()) {
+    //
+    // Inside a fence there is no MEDIA line to wait for and nothing to gain:
+    // released mid-line, a thinking summary twitches forward a few characters
+    // at a time in a box the eye is already skimming. Whole lines only.
+    if (
+      this.channel === 'prose' &&
+      this.buffer.length >= LineStreamer.CHUNK &&
+      !this.mightBeMedia()
+    ) {
       const chunk = this.buffer
       this.buffer = ''
       this.atLineStart = false
       await this.emit(chunk, false)
     }
+  }
+
+  /**
+   * Close one channel and open the other. The fence character is the same
+   * either way — ``` both ends the code block and starts it — so a switch is
+   * always exactly one fence, whichever direction it goes.
+   */
+  private async switchTo(next: Channel): Promise<void> {
+    if (this.buffer) {
+      const rest = this.buffer
+      const wasAtStart = this.atLineStart
+      this.buffer = ''
+      this.atLineStart = true
+      await this.emit(rest, wasAtStart)
+    }
+    await this.writeFence()
+    this.channel = next
+  }
+
+  /** Emit a ``` on its own line, adding the newline it needs to be one. */
+  private async writeFence(): Promise<void> {
+    await this.writeThrough(`${this.atStreamLineStart ? '' : '\n'}\`\`\`\n`)
+  }
+
+  /**
+   * A growing message has a maximum size. When QQ says this one is nearly
+   * there, close it and carry on in the next — reopening the fence, because a
+   * code block does not survive the message boundary and the trace would
+   * otherwise continue as bare text in the new one.
+   */
+  private async rollStream(): Promise<void> {
+    const spent = this.stream
+    this.stream = null
+    try {
+      // Close the fence before closing the message, or the one being left
+      // behind keeps an open code block and swallows its own last line.
+      if (this.channel === 'trace' && spent && !spent.failed) await spent.write('```\n')
+      await spent?.end()
+    } catch (err) {
+      log('failed to close a full stream:', err)
+    }
+    this.atStreamLineStart = true
+    if (this.channel !== 'trace') return
+    const next = this.open()
+    this.stream = next
+    if (!next.failed) await next.write('```\n')
   }
 
   private static readonly CHUNK = 12
@@ -721,6 +804,13 @@ class LineStreamer {
       this.buffer = ''
       await this.emit(rest, wasAtStart)
     }
+    // A turn that ends mid-trace — interrupted, or one that never got round to
+    // an answer — would otherwise leave the fence open and swallow whatever the
+    // next message renders beneath it.
+    if (this.channel === 'trace') {
+      await this.writeFence()
+      this.channel = 'prose'
+    }
     await this.stream?.end()
     this.stream = null
     if (this.overflow.trim()) {
@@ -730,7 +820,35 @@ class LineStreamer {
     }
   }
 
+  /**
+   * Hand text to the open stream, opening one on first use and diverting to
+   * `overflow` once QQ has refused. The single place `atStreamLineStart` is
+   * maintained, so a fence always lands on its own line.
+   */
+  private async writeThrough(chunk: string): Promise<void> {
+    if (!chunk) return
+    if (this.stream?.full) await this.rollStream()
+    this.stream ??= this.open()
+    this.atStreamLineStart = chunk.endsWith('\n')
+    if (this.stream.failed) {
+      // Out of passive quota, or QQ refused. Hold it back rather than drop it;
+      // finish() posts it as a normal message so nothing is lost and nothing
+      // already on screen gets repeated.
+      this.overflow += chunk
+      return
+    }
+    await this.stream.write(chunk)
+  }
+
   private async emit(text: string, firstLineIsStart: boolean): Promise<void> {
+    // Nothing inside a fence is a MEDIA line or markdown, so it needs none of
+    // the line-by-line inspection below — and must not get it, or a trace that
+    // quoted a MEDIA line would send the file.
+    if (this.channel === 'trace') {
+      if (text.trim()) await this.writeThrough(text)
+      return
+    }
+
     let prose = ''
     // Only a real line start can be a MEDIA line. A fragment released mid-line
     // has already been ruled out, and re-testing it would let text that merely
@@ -740,15 +858,7 @@ class LineStreamer {
       const chunk = prose
       prose = ''
       if (!chunk.trim()) return
-      this.stream ??= this.open()
-      if (this.stream.failed) {
-        // Out of passive quota, or QQ refused. Hold it back rather than drop it;
-        // finish() posts it as a normal message so nothing is lost and nothing
-        // already on screen gets repeated.
-        this.overflow += chunk
-        return
-      }
-      await this.stream.write(chunk)
+      await this.writeThrough(chunk)
     }
 
     // Keeping the newline with its line, so a split never loses one.
@@ -768,6 +878,7 @@ class LineStreamer {
       await flush()
       await this.stream?.end()
       this.stream = null
+      this.atStreamLineStart = true
       await this.sendMedia(media[1])
     }
     await flush()
@@ -799,6 +910,11 @@ async function runSession(): Promise<void> {
       // Needed for streamed replies: without it the SDK only reports finished
       // assistant messages, and there is nothing to stream.
       includePartialMessages: true,
+      // The raw chain of thought is never returned by any model; 'summarized'
+      // asks for the readable digest instead. Without it the default is
+      // 'omitted' — thinking blocks still arrive, with empty text — and the
+      // trace would show tool calls with nothing between them.
+      thinking: { type: 'adaptive', display: 'summarized' },
       canUseTool: async (toolName: string, input: Record<string, unknown>) => {
         // This bridge's own tools only talk to the operator — they touch no
         // files, run no commands, and reach nothing outside the chat. Gating
@@ -817,18 +933,25 @@ async function runSession(): Promise<void> {
   })
   activeQuery = q
 
-  let lastProgressAt = 0
-  const pendingTools: string[] = []
-  let streamer: LineStreamer | null = null
-
   /**
-   * Close the open stream. Returns whether the reply was already delivered —
-   * once a streamer exists it owns the whole reply, falling back to ordinary
-   * messages internally, so the finished assistant message must not be sent
-   * again on top of it.
+   * One stream per turn, not per assistant message.
+   *
+   * A turn is "say a little, call a tool, say a little more", and each of those
+   * spoken parts is its own assistant message. Closing the stream at the end of
+   * each one turned a single answer into a series of QQ messages, and every one
+   * of them spent a passive reply — four of which exist per inbound message, so
+   * a long task ran out before it reached its own conclusion. Held open until
+   * `result`, the whole turn costs one.
    */
-  async function closeStreamer(): Promise<boolean> {
-    if (!streamer) return false
+  let streamer: LineStreamer | null = null
+  /**
+   * Whether the current assistant message's text already went out as deltas.
+   * The finished message arrives after them and would otherwise repeat it.
+   */
+  let streamedText = false
+
+  async function closeStreamer(): Promise<void> {
+    if (!streamer) return
     const s = streamer
     streamer = null
     try {
@@ -836,8 +959,22 @@ async function runSession(): Promise<void> {
     } catch (err) {
       log('failed to close stream:', err)
     }
-    return true
   }
+
+  /** Write into the fenced trace block. Newlines are the caller's to place. */
+  async function trace(text: string): Promise<void> {
+    try {
+      streamer ??= newStreamer()
+      await streamer.push(text, 'trace')
+    } catch (err) {
+      // The trace is commentary. Losing a line of it must never take down the
+      // turn that was busy producing the actual answer.
+      log('trace push failed:', err)
+    }
+  }
+
+  /** Which content block the deltas currently belong to. */
+  let block: string | null = null
 
   function newStreamer(): LineStreamer {
     return new LineStreamer(
@@ -869,52 +1006,57 @@ async function runSession(): Promise<void> {
       // a resumable session behind.
       if (m.session_id) saveSessionId(m.session_id)
     } else if (m.type === 'stream_event') {
+      // Everything the operator sees is driven from here rather than from the
+      // finished assistant message, because only the event order says what
+      // happened when: a thought, then the call it led to, then the next
+      // thought. Reading tool calls off the finished message instead would
+      // stack them after their own reasoning.
       const ev = m.event
-      if (ev?.type === 'content_block_delta' && ev.delta?.type === 'text_delta') {
-        streamer ??= newStreamer()
-        try {
-          await streamer.push(ev.delta.text)
-        } catch (err) {
-          log('stream push failed:', err)
+      if (ev?.type === 'content_block_start') {
+        block = ev.content_block?.type ?? null
+        if (block === 'thinking' && showThinking) await trace('💭 ')
+        else if (block === 'tool_use' && showTools) await trace(`⚙️ ${ev.content_block.name}\n`)
+      } else if (ev?.type === 'content_block_delta') {
+        const delta = ev.delta
+        if (delta?.type === 'text_delta') {
+          streamer ??= newStreamer()
+          streamedText = true
+          try {
+            await streamer.push(delta.text)
+          } catch (err) {
+            log('stream push failed:', err)
+          }
+        } else if (delta?.type === 'thinking_delta' && showThinking) {
+          await trace(delta.thinking)
         }
+      } else if (ev?.type === 'content_block_stop') {
+        // A thinking summary carries no trailing newline of its own, and the
+        // trace only flushes whole lines — without this the last thought sits
+        // in the buffer until something else happens to end a line.
+        if (block === 'thinking' && showThinking) await trace('\n')
+        block = null
       }
     } else if (m.type === 'assistant') {
-      // The finished message arrives after its deltas. If the stream carried it,
-      // there is nothing left to send; if it never got off the ground, this is
-      // where the whole text goes out the old way.
-      const streamed = await closeStreamer()
-      for (const block of m.message?.content ?? []) {
-        if (block.type === 'text' && block.text.trim()) {
-          if (streamed) continue
+      // The finished message arrives after its deltas, and is only needed when
+      // the stream never got off the ground — then this is where the whole text
+      // goes out the old way.
+      for (const b of m.message?.content ?? []) {
+        if (b.type === 'text' && b.text.trim() && !streamedText) {
           try {
-            await deliverReply(block.text.trim())
+            await deliverReply(b.text.trim())
           } catch (err) {
             log('failed to deliver reply:', err)
           }
-        } else if (block.type === 'tool_use') {
-          // Progress exists so a long task is not silent, not to narrate every
-          // step; report at an interval rather than per call.
-          pendingTools.push(block.name)
-          const now = Date.now()
-          if (now - lastProgressAt > PROGRESS_INTERVAL_MS) {
-            lastProgressAt = now
-            const summary = [...new Set(pendingTools)].join('、')
-            pendingTools.length = 0
-            try {
-              const user = requireUser()
-              await sendToQQ(user, `⏳ 正在执行：${summary}`, lastInboundMsgId.get(user))
-            } catch {
-              // progress is best-effort
-            }
-          }
         }
       }
+      streamedText = false
     } else if (m.type === 'result') {
-      // A turn can end without a final assistant message (interrupt, error), so
-      // the stream is closed here too rather than left hanging half-written.
+      // The one place the stream closes. A turn can also end without a final
+      // assistant message (interrupt, error), and this catches that too rather
+      // than leaving it half-written.
       await closeStreamer()
-      pendingTools.length = 0
-      lastProgressAt = 0
+      block = null
+      streamedText = false
       log(`turn finished: ${m.subtype}, turns=${m.num_turns}`)
     }
   }
@@ -924,6 +1066,8 @@ async function main(): Promise<void> {
   const state = loadState()
   workdir = state.workdir ?? process.env.QQ_BRIDGE_CWD ?? process.env.HOME!
   permissionMode = state.permission_mode ?? process.env.QQ_PERMISSION_MODE ?? 'auto'
+  showThinking = state.show_thinking ?? true
+  showTools = state.show_tools ?? true
 
   if (!HAS_CREDENTIALS) {
     log('QQ_APP_ID / QQ_CLIENT_SECRET missing — run: bun run onboard.ts')

@@ -46,6 +46,9 @@ export type CommandDeps = {
   recordCommand(name: string, args: string): void
   permissionMode(): string
   setPermissionMode(mode: string): void
+  /** Which parts of the work are shown alongside the answer. */
+  verbose(): { thinking: boolean; tools: boolean }
+  setVerbose(v: { thinking: boolean; tools: boolean }): void
   counts(): { allowed: number; approvals: number; questions: number }
 }
 
@@ -279,6 +282,64 @@ register(
       })
       if (idx < 0) return
       await apply(modes[idx].value)
+    },
+  },
+
+  {
+    name: 'verbose',
+    usage: '/verbose [full|think|tools|off]',
+    summary: '回复里是否附带思考与工具调用',
+    async run(arg, deps) {
+      // Both on by default: a long task that shows nothing reads as a hang.
+      // The trace rides inside the same streamed message as the answer, in a
+      // code block QQ folds past fifteen lines, so it costs no extra message —
+      // only screen. This is the switch for when that screen is the problem.
+      const levels = [
+        { value: 'full', label: 'full 思考+工具', thinking: true, tools: true },
+        { value: 'think', label: 'think 只要思考', thinking: true, tools: false },
+        { value: 'tools', label: 'tools 只要工具', thinking: false, tools: true },
+        { value: 'off', label: 'off 只要答案', thinking: false, tools: false },
+      ]
+      const current = deps.verbose()
+      const name = (v: { thinking: boolean; tools: boolean }) =>
+        levels.find(l => l.thinking === v.thinking && l.tools === v.tools)?.value ?? '?'
+
+      const apply = async (hit: (typeof levels)[number]) => {
+        deps.setVerbose({ thinking: hit.thinking, tools: hit.tools })
+        await deps.reply(`已切到 \`${hit.value}\``)
+      }
+
+      if (arg) {
+        const hit = levels.find(l => l.value.toLowerCase() === arg.toLowerCase())
+        if (!hit) {
+          await deps.reply(`未知取值 \`${arg}\`，可选：${levels.map(l => l.value).join('、')}`)
+          return
+        }
+        await apply(hit)
+        return
+      }
+
+      const idx = await deps.askChoice(
+        levels.map(l => l.label),
+        mode => {
+          const lines = [`**回复详略**（当前 \`${name(current)}\`）`, '']
+          if (mode !== 'text') {
+            lines.push('| | 取值 | 显示 |', '| --- | --- | --- |')
+            levels.forEach((l, i) =>
+              lines.push(
+                `| ${mode === 'letters' ? 'ABCDEFGH'[i] : '·'} | ${l.value} | ${cell(
+                  [l.thinking && '思考', l.tools && '工具调用'].filter(Boolean).join(' + ') || '只有答案',
+                )} |`,
+              ),
+            )
+            lines.push('')
+          }
+          lines.push('点按钮切换')
+          return lines.join('\n')
+        },
+      )
+      if (idx < 0) return
+      await apply(levels[idx])
     },
   },
 

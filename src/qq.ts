@@ -320,7 +320,23 @@ export type StreamHandle = {
   readonly live: boolean
   /** True if QQ rejected something; the caller should fall back to sendToQQ. */
   readonly failed: boolean
+  /**
+   * True once QQ reports this message is nearly out of room. The caller should
+   * close it and open another rather than write into a message that will start
+   * rejecting appends — one growing message still has a maximum length, and a
+   * turn long enough to reach it would otherwise lose its own conclusion.
+   */
+  readonly full: boolean
 }
+
+/**
+ * How little headroom QQ has to report before a stream is treated as full.
+ * Deliberately generous: overshooting costs one extra message, undershooting
+ * silently truncates a reply. The real values are logged the first time each
+ * stream sees one, so this can be tightened against observation rather than
+ * guesswork.
+ */
+const STREAM_TAIL_MARGIN = 512
 
 export function createStream(openid: string, replyTo?: string): StreamHandle {
   let streamId: string | null = null
@@ -337,6 +353,10 @@ export function createStream(openid: string, replyTo?: string): StreamHandle {
   const passiveId = claimPassive(replyTo)
   const seq = msgSeq++
   let failed = !passiveId
+  /** Distinct from `full`, which is the accumulated text this stream has sent. */
+  let nearlyFull = false
+  /** Log the reported capacity once per stream, not once per append. */
+  let sawRemaining = false
 
   async function send(closing: boolean, delta: string): Promise<void> {
     if (failed) return
@@ -372,6 +392,13 @@ export function createStream(openid: string, replyTo?: string): StreamHandle {
     }
     const data = (await res.json()) as { id?: string; remain_msg_len?: number }
     if (!streamId && data.id) streamId = data.id
+    if (typeof data.remain_msg_len === 'number') {
+      if (!sawRemaining) {
+        sawRemaining = true
+        log(`stream capacity: remain_msg_len=${data.remain_msg_len} after ${index} chunk(s)`)
+      }
+      if (data.remain_msg_len <= STREAM_TAIL_MARGIN) nearlyFull = true
+    }
   }
 
   return {
@@ -380,6 +407,9 @@ export function createStream(openid: string, replyTo?: string): StreamHandle {
     },
     get failed() {
       return failed
+    },
+    get full() {
+      return nearlyFull
     },
     write(text: string) {
       if (!text || failed) return chain
