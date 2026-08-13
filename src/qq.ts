@@ -356,7 +356,7 @@ export type StreamHandle = {
  * whatever the message actually holds — so zero means "not reported", not
  * "no room left". Reading it literally rolled the stream on every single
  * chunk and chopped one reply into a message per line. Only a positive value
- * is believed.
+ * is believed, and none has ever arrived.
  */
 const STREAM_TAIL_MARGIN = 512
 
@@ -365,8 +365,23 @@ const STREAM_TAIL_MARGIN = 512
  * response says how large a streamed message may grow, so this is a guess on
  * the safe side of one — a reply that rolls a message early costs one extra
  * message; a reply that never rolls loses its ending.
+ *
+ * No observation supports a ceiling existing at all. The failures once blamed
+ * on length turned out to be 50001, which QQ documents as a transient
+ * internal error; this stays only because being wrong in this direction is
+ * cheap.
  */
 const STREAM_MAX_CHARS = 4000
+
+/**
+ * How many times a 5xx is retried before the stream gives up and the rest of
+ * the reply falls back to ordinary messages. QQ documents 50001 as a
+ * transient internal error to be retried; two extra attempts a few hundred
+ * milliseconds apart cover it without stalling the reply if the service is
+ * genuinely down.
+ */
+const STREAM_RETRIES = 2
+const STREAM_RETRY_BASE_MS = 300
 
 /*
  * There is deliberately no throttle here.
@@ -411,6 +426,13 @@ export function createStream(openid: string, replyTo?: string): StreamHandle {
   async function send(closing: boolean, delta: string): Promise<void> {
     if (failed) return
     const startedAt = Date.now()
+    // Fixed for the whole attempt sequence. A retry has to re-send the same
+    // index: the index is the position of this fragment in the message, not a
+    // request counter, and skipping one leaves a hole the closing replace can
+    // no longer reconcile — that is what 40007 reports.
+    const myIndex = index++
+    let res!: Response
+    let body = ''
     // Append while generating, replace once at the end.
     //
     // Replacing every time would resend the whole reply with every line — the
@@ -423,33 +445,39 @@ export function createStream(openid: string, replyTo?: string): StreamHandle {
     // paragraph. It cannot repair a lost chunk — replace demands that the new
     // text begin with what was already delivered — but it does make the loss
     // visible in the log.
-    const res = await qqFetch(`/v2/users/${openid}/stream_messages`, {
-      method: 'POST',
-      body: JSON.stringify({
-        input_mode: closing ? 'replace' : 'append',
-        input_state: closing ? 10 : 1,
-        index: index++,
-        content_type: 'markdown',
-        content_raw: closing ? full : delta,
-        msg_id: passiveId,
-        msg_seq: seq,
-        ...(streamId ? { stream_msg_id: streamId } : {}),
-      }),
-    })
-    if (!res.ok) {
-      failed = true
-      // The length is the point of this line. QQ will not say how large a
-      // streamed message may grow — remain_msg_len is always 0 — and then
-      // answers 50001 once it has had enough. Recording how much was in it
-      // each time this happens is the only way to find the real ceiling and
-      // set STREAM_MAX_CHARS under it, so the stream rolls to a new message
-      // deliberately instead of being cut off and falling back to chunks.
-      log(
-        `stream ${streamId ? 'append' : 'open'} failed [${res.status}] at ${full.length} chars, ` +
-          `chunk ${index}:`,
-        (await res.text()).slice(0, 200),
-      )
-      return
+    // 50001 is documented as "service internal error — please retry later",
+    // and is the only failure seen against this endpoint so far. Giving up on
+    // it drops the rest of the reply out of the stream and finishes it as
+    // chunked ordinary messages, which is a visible downgrade for something
+    // the vendor says to just try again. (Rate limiting is a different code,
+    // 50002, and has never appeared.)
+    for (let attempt = 0; ; attempt++) {
+      res = await qqFetch(`/v2/users/${openid}/stream_messages`, {
+        method: 'POST',
+        body: JSON.stringify({
+          input_mode: closing ? 'replace' : 'append',
+          input_state: closing ? 10 : 1,
+          index: myIndex,
+          content_type: 'markdown',
+          content_raw: closing ? full : delta,
+          msg_id: passiveId,
+          msg_seq: seq,
+          ...(streamId ? { stream_msg_id: streamId } : {}),
+        }),
+      })
+      if (res.ok) break
+      body = (await res.text()).slice(0, 200)
+      if (res.status < 500 || attempt >= STREAM_RETRIES) {
+        failed = true
+        log(
+          `stream ${streamId ? 'append' : 'open'} failed [${res.status}] at ${full.length} chars, ` +
+            `index ${myIndex}, ${attempt + 1} attempt(s):`,
+          body,
+        )
+        return
+      }
+      await new Promise(r => setTimeout(r, STREAM_RETRY_BASE_MS * (attempt + 1)))
+      log(`stream retry ${attempt + 1}/${STREAM_RETRIES} after [${res.status}]: ${body}`)
     }
     const data = (await res.json()) as { id?: string; remain_msg_len?: number }
     if (!streamId && data.id) streamId = data.id
