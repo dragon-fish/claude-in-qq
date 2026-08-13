@@ -106,6 +106,61 @@ export function formatContextUsage(u: any): string {
   return lines.join('\n')
 }
 
+/**
+ * How long until a window resets, in words.
+ *
+ * The API gives an ISO timestamp, which answers "when" — but the question
+ * being asked is "how long do I have to wait", and on a phone at 1am nobody
+ * wants to subtract two timestamps in their head.
+ */
+function untilReset(iso: string | null | undefined): string {
+  if (!iso) return '—'
+  const ms = new Date(iso).getTime() - Date.now()
+  if (!Number.isFinite(ms)) return '—'
+  if (ms <= 0) return '已重置'
+  const minutes = Math.floor(ms / 60_000)
+  const hours = Math.floor(minutes / 60)
+  if (hours >= 24) {
+    const days = Math.floor(hours / 24)
+    return hours % 24 ? `${days} 天 ${hours % 24} 小时后` : `${days} 天后`
+  }
+  if (hours > 0) return minutes % 60 ? `${hours} 小时 ${minutes % 60} 分后` : `${hours} 小时后`
+  return `${Math.max(minutes, 1)} 分后`
+}
+
+const USAGE_WINDOWS: [string, string][] = [
+  ['five_hour', '5 小时'],
+  ['seven_day', '7 天'],
+  ['seven_day_opus', '7 天 · Opus'],
+  ['seven_day_sonnet', '7 天 · Sonnet'],
+  ['seven_day_oauth_apps', '7 天 · OAuth 应用'],
+]
+
+/** Render the plan windows. Exported so the shape stays testable. */
+export function formatUsage(u: any): string {
+  const lines = ['**用量**']
+  if (u.subscription_type) lines.push(`套餐：\`${u.subscription_type}\``)
+
+  if (u.rate_limits_available === false || !u.rate_limits) {
+    // API key, Bedrock, Vertex, or a token without the usage scope — the plan
+    // windows are a claude.ai concept and simply do not exist here.
+    lines.push('', '当前登录方式没有套餐额度（API key 或第三方后端）。')
+  } else {
+    const rows = USAGE_WINDOWS.flatMap(([key, label]) => {
+      const w = u.rate_limits[key]
+      if (!w) return []
+      const used = typeof w.utilization === 'number' ? `${w.utilization.toFixed(0)}%` : '—'
+      return [`| ${label} | ${used} | ${untilReset(w.resets_at)} |`]
+    })
+    if (rows.length) lines.push('', '| 窗口 | 已用 | 重置 |', '| --- | --- | --- |', ...rows)
+    else lines.push('', '暂无额度数据。')
+  }
+
+  const cost = u.session?.total_cost_usd
+  if (typeof cost === 'number' && cost > 0) lines.push('', `本次会话：$${cost.toFixed(2)}`)
+  return lines.join('\n')
+}
+
 // ------------------------------------------------------------------- commands
 
 register(
@@ -340,6 +395,30 @@ register(
       )
       if (idx < 0) return
       await apply(levels[idx])
+    },
+  },
+
+  {
+    name: 'usage',
+    usage: '/usage',
+    summary: '套餐额度：5 小时 / 7 天窗口用了多少，何时重置',
+    async run(_arg, deps) {
+      const q = await requireQuery(deps)
+      if (!q) return
+
+      // The SDK spells this one with a warning in the name. Honour it: call it
+      // through an optional chain and catch, so the day it is renamed this
+      // command degrades to a sentence instead of taking the turn down.
+      const read = q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET
+      if (typeof read !== 'function') {
+        await deps.reply('这个 SDK 版本没有暴露用量接口。')
+        return
+      }
+      try {
+        await deps.reply(formatUsage(await read.call(q)))
+      } catch (err) {
+        await deps.reply(`读取用量失败：${err}`)
+      }
     },
   },
 

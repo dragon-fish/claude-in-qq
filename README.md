@@ -24,7 +24,7 @@ CLAUDE.md、skills、MCP，跑在真实的文件系统上。需要审批的工�
   所以长任务不会把答案埋掉，也不额外花消息条数。嫌吵用 `/verbose` 关掉
 - **审批**：工具调用弹按钮，点「允许」或「拒绝」。默认 `auto` 模式，只有模型判定有风险的操作才问
 - **提问**：Claude 需要你拿主意时会推一组按钮出来，等同于 TUI 里的 AskUserQuestion
-- **斜杠指令**：`/help` `/stop` `/clear` `/context` `/model` `/mode` `/verbose` `/resume` `/cwd` `/status`。
+- **斜杠指令**：`/help` `/stop` `/clear` `/context` `/usage` `/model` `/mode` `/verbose` `/resume` `/cwd` `/status`。
   启动时自动注册进 QQ 的指令面板，在聊天里点「/」直接选，不用记也不用手动同步
 - **图片进出**：发图给它看；它用**顶头独占一行**的 `MEDIA:/绝对路径` 把文件发回来，文件会插在正文
   对应的位置而不是堆在末尾。一条消息只能带一个附件，所以多个文件它会打包成 zip——手机 QQ 能直接
