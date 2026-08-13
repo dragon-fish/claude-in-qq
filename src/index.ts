@@ -83,6 +83,11 @@ in your reply. It is sent as a native QQ attachment and the line itself is
 removed, so write the sentence around it as if the file were already attached.
 Images they send you arrive as images; you can look at them directly.
 
+QQ allows one attachment per message, so several MEDIA lines mean several
+messages and several notifications. Past two or three files, zip them and send
+the one archive instead — QQ on a phone previews the images inside a zip
+without extracting it, so a batch of pictures stays just as viewable.
+
 To ask them something, call mcp__qq__qq_ask with your question and 2-8 short
 options. It renders as tappable buttons and blocks until they answer, and they
 can also reply in their own words. Use it for a real fork — an ambiguous
