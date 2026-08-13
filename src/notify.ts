@@ -19,9 +19,11 @@
  * things worth interrupting someone over, not progress chatter.
  */
 
+import { createHash } from 'node:crypto'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename } from 'node:path'
-import { appendRelayed, HAS_CREDENTIALS, loadAccess, sendToQQ } from './qq.js'
+import { basename, join } from 'node:path'
+import { appendRelayed, HAS_CREDENTIALS, loadAccess, sendToQQ, STATE_DIR } from './qq.js'
 
 async function readStdin(): Promise<string> {
   const chunks: Buffer[] = []
@@ -60,6 +62,56 @@ if (!access.allowed.length) {
   process.exit(1)
 }
 
+// ------------------------------------------------------------------ rate limit
+//
+// Not a security boundary — anything that can run this can also read the
+// credentials next to it and call the QQ API directly. It guards against the
+// realistic failure instead: a loop or a retry without backoff burning the
+// account's 1000 active messages a day, which are shared with the bridge. Spend
+// them all here and the bridge goes mute mid-conversation, with nothing on the
+// operator's screen to explain why. The daily cap is deliberately a small
+// fraction of the account's, so the conversation always has room left.
+
+const HOURLY_MAX = 10
+const DAILY_MAX = 50
+const DEDUP_MS = 5 * 60 * 1000
+const RATE_FILE = join(STATE_DIR, 'notify-rate.json')
+
+type Sent = { at: number; hash: string }
+
+const digest = (s: string) => createHash('sha256').update(s).digest('hex').slice(0, 16)
+
+function loadSent(): Sent[] {
+  try {
+    const parsed = JSON.parse(readFileSync(RATE_FILE, 'utf8'))
+    return Array.isArray(parsed) ? (parsed as Sent[]) : []
+  } catch {
+    return []
+  }
+}
+
+const now = Date.now()
+const hash = digest(text)
+const recent = loadSent().filter(s => now - s.at < 24 * 60 * 60 * 1000)
+
+const lastHour = recent.filter(s => now - s.at < 60 * 60 * 1000).length
+const duplicate = recent.find(s => s.hash === hash && now - s.at < DEDUP_MS)
+
+if (duplicate) {
+  const ago = Math.round((now - duplicate.at) / 1000)
+  console.error(`同样的内容 ${ago} 秒前刚发过，已拦下。如果这是循环，先修循环。`)
+  process.exit(1)
+}
+if (lastHour >= HOURLY_MAX) {
+  console.error(`一小时内已发 ${lastHour} 条，达到上限 ${HOURLY_MAX}。`)
+  console.error('这个限制是为了不把账号的主动消息额度用光——用光了 bridge 也没法回你消息。')
+  process.exit(1)
+}
+if (recent.length >= DAILY_MAX) {
+  console.error(`24 小时内已发 ${recent.length} 条，达到上限 ${DAILY_MAX}。`)
+  process.exit(1)
+}
+
 const cwd = process.cwd().replace(homedir(), '~')
 const origin = from || basename(process.cwd())
 const body = from
@@ -78,8 +130,18 @@ for (const openid of access.allowed) {
 
 if (failed === access.allowed.length) process.exit(1)
 
+// Counted only once it actually went out, so a failing send cannot exhaust the
+// budget — the retry it provokes would otherwise be locked out by its own
+// failures.
+recent.push({ at: now, hash })
+try {
+  writeFileSync(RATE_FILE, JSON.stringify(recent), { mode: 0o600 })
+} catch {
+  // A missing rate file must not stop a message the operator is waiting for.
+}
+
 // Tell the bridge's agent what went out on its channel. Without this the
 // operator can reply "about that thing just now" to an agent that never saw it.
-appendRelayed({ at: Date.now(), from: origin, cwd, text })
+appendRelayed({ at: now, from: origin, cwd, text })
 
 console.log(`已送达 ${access.allowed.length - failed}/${access.allowed.length}`)
