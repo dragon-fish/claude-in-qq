@@ -84,8 +84,15 @@ qq-notify --from "重构订单模块" "测试全绿，可以合了"
 pytest 2>&1 | tail -20 | qq-notify --from "跑测试"
 ```
 
-`~/.local/bin/qq-notify` 是指向 `src/notify.ts` 的软链，靠 shebang 执行，所以工作目录是调用方的。
-配套的 skill 在 `~/.claude/skills/qq-notify/`，你对任意 CC 说「做完了 QQ 喊我一声」它就会用。
+```bash
+skills/install.sh        # 装命令和配套 skill，两个都是指向本仓库的软链
+```
+
+装完 `~/.local/bin/qq-notify` 指向 `src/notify.ts`，靠 shebang 执行——所以显示的工作目录是**调用方**的，
+不是项目的。`~/.claude/skills/qq-notify` 指向 `skills/qq-notify`，于是你对任意 CC 说「做完了 QQ 喊我
+一声」它就知道该干什么。软链而非拷贝，改仓库即生效，没有第二份要同步。
+
+这一步和服务无关：不跑常驻服务也能发通知。
 
 消息带上来源和目录，因为它落在你和 bridge 聊天的同一个窗口里。bridge 那个 Claude 也会在下次对话时
 被告知有别的会话借用了通道——否则你提起某条消息，它会毫无印象。

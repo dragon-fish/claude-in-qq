@@ -1,0 +1,66 @@
+---
+name: qq-notify
+description: Use when the user asks to be pinged on QQ when something finishes — "做完了QQ喊我一声", "跑完通知我", "长任务结束叫我". Sends a one-way message to the user's QQ private chat from any directory on this machine. Not for asking questions or anything needing a reply.
+---
+
+# 给用户的 QQ 捎话
+
+本机常驻着 claude-in-qq——用户自己的 QQ bot，平时他在 QQ 私聊里遥控另一个 Claude Code 会话。这个
+skill 让**任意**会话借用那条通道，给用户手机上发一条消息。
+
+```bash
+qq-notify --from "<本次对话在做什么>" "<消息正文>"
+```
+
+## 先确认你不是正宫
+
+**如果你本身就是通过 QQ 在跟用户对话的那个会话，不要用这个 skill。**你正常写的每一句话都会直接送到
+他手机上，用不着借道。你若用了，等于给自己所在的房间寄信，而且下一轮系统还会通知你「有别的会话借用了
+通道」，凭空造出一个不存在的第三方。
+
+判断方法：如果你的 system prompt 里说「你通过 QQ 私聊被访问，对方在手机上」，那就是你。直接说话即可。
+
+## 用法
+
+`--from` 写当前对话的简短主题（如 `重构订单模块`、`排查 CI 失败`），让用户一眼认出是哪个窗口在喊他。
+工作目录会自动附上，不用手写。正文也可以从 stdin 传：
+
+```bash
+pytest 2>&1 | tail -20 | qq-notify --from "跑测试"
+```
+
+## 单向，没有回复
+
+用户**无法回复这条消息**。他在 QQ 里的回复会进到 bridge 那个常驻会话，不会回到你这里。所以：
+
+- 只发**结论**：「构建完成，3 个测试失败」「部署上线了」
+- 不要发**问题**：「要不要继续？」——他答了你也收不到，只会让他白等
+- 需要用户决策时，就停下来在当前窗口等他，别用这个
+
+## 什么时候值得发
+
+用户明确要求了才发。这是主动消息，占用账号 1000 条/天 的额度，更重要的是它会响在用户手机上。长任务
+真正结束、或者中途撞上需要他知道的坏消息，才值得打断他一次。任务进度、阶段性汇报都不要发。
+
+## 用户那边会看到什么
+
+```
+**重构订单模块**（`~/GitRepositories/foo`）下的 Claude 给你留言：
+
+测试全绿，可以合了
+```
+
+bridge 里那个 Claude 也会在下次对话时被告知「有另一个会话借了这条通道」，所以不会出现用户提起某事、
+而它毫无印象的情况——这个不用你操心，自动的。
+
+## 出错了怎么办
+
+| 报错 | 含义 |
+| --- | --- |
+| `QQ 凭据缺失` | bot 还没配过，需要用户在 claude-in-qq 项目目录跑 `bun run onboard` |
+| `白名单为空` | 没有可送达的人，需要用户跑 `bun run pair` |
+| `command not found` | 软链没了。它指向项目里的 `src/notify.ts` |
+
+项目在哪：`readlink -f "$(command -v qq-notify)"` 会指到 `<项目>/src/notify.ts`。
+
+发不出去就在当前窗口如实告诉用户，不要反复重试——他可能压根不在手机边上。
