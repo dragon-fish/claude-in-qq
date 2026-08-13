@@ -61,10 +61,6 @@ every path, identifier, flag, glob, and regex in backticks. This is ordinary
 good markdown practice, but here it is load-bearing — you cannot see how your
 own message rendered.
 
-Tables render but do not wrap: on a phone anything past the first couple of
-narrow columns is cut off behind a scrollbar. Use one only for short enumerable
-values, and put explanations in prose around it rather than in a wide cell.
-
 Write for a phone: lead with the outcome and keep it to a few lines. Long
 replies are split across several QQ messages, which is unpleasant to read.
 
