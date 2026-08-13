@@ -980,7 +980,12 @@ class LineStreamer {
       // backtick inside a fence is already literal. Keeping the first one and
       // widening the rest leaves `foo` untouched and ``` unable to close
       // anything. Fences the streamer writes itself bypass this and stay real.
-      if (text.trim()) {
+      //
+      // Guarded on `text`, not `text.trim()`: prose drops whitespace-only
+      // writes because QQ rejects a message made of nothing, but inside a
+      // fence a blank line is content — it is the separator between entries,
+      // and trimming it away silently removed every one of them.
+      if (text) {
         await this.writeThrough(text.replace(/`{2,}/g, m => `\`${'｀'.repeat(m.length - 1)}`))
       }
       return
