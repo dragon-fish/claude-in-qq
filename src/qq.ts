@@ -412,8 +412,14 @@ export function createStream(openid: string, replyTo?: string): StreamHandle {
   let sending = false
   let lastSentAt = 0
 
+  /** Round-trip samples, so the append rate can be attributed rather than guessed. */
+  let sentCount = 0
+  let sentMs = 0
+  let slowestMs = 0
+
   async function send(closing: boolean, delta: string): Promise<void> {
     if (failed) return
+    const startedAt = Date.now()
     // Append while generating, replace once at the end.
     //
     // Replacing every time would resend the whole reply with every line — the
@@ -456,6 +462,10 @@ export function createStream(openid: string, replyTo?: string): StreamHandle {
     }
     const data = (await res.json()) as { id?: string; remain_msg_len?: number }
     if (!streamId && data.id) streamId = data.id
+    const took = Date.now() - startedAt
+    sentCount += 1
+    sentMs += took
+    if (took > slowestMs) slowestMs = took
     if (typeof data.remain_msg_len === 'number' && data.remain_msg_len > 0) {
       if (!sawRemaining) {
         sawRemaining = true
@@ -539,6 +549,12 @@ export function createStream(openid: string, replyTo?: string): StreamHandle {
           // Nothing was ever sent, so there is no stream to close.
           if (!streamId || failed) return
           await send(true, '')
+          if (sentCount) {
+            log(
+              `stream done: ${sentCount} appends, ${full.length} chars, ` +
+                `avg ${Math.round(sentMs / sentCount)}ms, slowest ${slowestMs}ms`,
+            )
+          }
         })
         .catch(err => {
           failed = true
