@@ -480,6 +480,13 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
 
   const text = withCommandLog([msg.content, ...notes].filter(Boolean).join('\n'))
   log(`inbound from ${msg.openid.slice(0, 8)}: ${msg.content.slice(0, 60)}${blocks.length ? ` (+${blocks.length} 图)` : ''}`)
+
+  // A stream is bound to the inbound message it replies to and cannot be
+  // moved to a newer one. Left open while the operator says something else,
+  // the reply keeps growing inside a message that now sits above their words —
+  // from their side, something they already read is editing itself. Sealing
+  // here means whatever the agent says next answers from below.
+  await sealStream()
   if (blocks.length) {
     // Image first, then the words about it — the order the person sent them in.
     queue.push([...blocks, { type: 'text', text: text || '(图片)' }])
