@@ -12,7 +12,7 @@
 
 import { createSdkMcpServer, query, tool } from '@anthropic-ai/claude-agent-sdk'
 import { z } from 'zod'
-import { dispatch, type CommandDeps } from './commands.js'
+import { allCommands, dispatch, type CommandDeps } from './commands.js'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
@@ -36,6 +36,7 @@ import {
   sendFile,
   sendToQQ,
   STATE_DIR,
+  syncCommandPanel,
   type InboundMessage,
 } from './qq.js'
 
@@ -737,6 +738,15 @@ async function main(): Promise<void> {
 
   await connectGateway({ onMessage: handleMessage, onButton: handleButton })
   log(`bridge up, workdir=${workdir}, mode=${permissionMode}, state=${STATE_DIR}`)
+
+  // Republish the command panel, so editing a command is enough to change what
+  // the operator sees under "/". Safe to repeat: the sync updates the existing
+  // panel rather than adding one. Deliberately not awaited and never fatal — a
+  // bridge that will not start because a cosmetic list failed to update would
+  // be a bad trade, and the panel QQ already has stays usable meanwhile.
+  void syncCommandPanel(allCommands().map(c => ({ name: `/${c.name}`, desc: c.summary })))
+    .then(id => log(`command panel synced (${id})`))
+    .catch(err => log('command panel sync failed, keeping the existing one:', err))
 
   // The session is rebuilt rather than the process restarted: /clear and /cwd
   // both need a fresh query, and a crashed query should not take the QQ
