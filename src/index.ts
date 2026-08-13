@@ -879,11 +879,18 @@ class LineStreamer {
       // means the trace's own fence closes the reply's block instead, and
       // every fence after it lands on the wrong side. Suspend it, and reopen
       // it on the way back with the language it was written with.
-      if (this.proseFence !== null) await this.writeThrough('```\n')
+      // Through writeFence, which puts it on a line of its own. Written by
+      // hand it landed against the end of whatever the reply had just said,
+      // and a fence that does not start its line is not a fence at all — it
+      // is inline-code punctuation, so the block it was meant to close stayed
+      // open and everything after it nested one level too deep.
+      if (this.proseFence !== null) await this.writeFence(false)
       await this.writeFence(true)
     } else {
       await this.writeFence(false)
-      if (this.proseFence !== null) await this.writeThrough(`\`\`\`${this.proseFence}\n`)
+      if (this.proseFence !== null) {
+        await this.writeThrough(`${this.atStreamLineStart ? '' : '\n'}\`\`\`${this.proseFence}\n`)
+      }
     }
     this.channel = next
   }
