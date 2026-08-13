@@ -65,15 +65,21 @@ if (!access.allowed.length) {
 // ------------------------------------------------------------------ rate limit
 //
 // Not a security boundary — anything that can run this can also read the
-// credentials next to it and call the QQ API directly. It guards against the
-// realistic failure instead: a loop or a retry without backoff burning the
-// account's 1000 active messages a day, which are shared with the bridge. Spend
-// them all here and the bridge goes mute mid-conversation, with nothing on the
-// operator's screen to explain why. The daily cap is deliberately a small
-// fraction of the account's, so the conversation always has room left.
+// credentials next to it and call the QQ API directly. It catches a runaway
+// loop, and the caps are loose because the damage one could do is bounded.
+//
+// The two quotas are separate pools. Replying to an inbound message spends
+// passive quota, budgeted per inbound message (4 within an hour of each), so
+// the operator writing in always gets an answer no matter what happened here.
+// Only what nobody asked for is active quota, 1000 a day: the tail of a reply
+// past its four passive sends, and mid-task progress. Draining it degrades
+// those, it does not silence the conversation.
+//
+// Duplicate detection does most of the work regardless — a loop repeats itself,
+// and that is visible in one message rather than a hundred.
 
-const HOURLY_MAX = 10
-const DAILY_MAX = 50
+const HOURLY_MAX = 30
+const DAILY_MAX = 200
 const DEDUP_MS = 5 * 60 * 1000
 const RATE_FILE = join(STATE_DIR, 'notify-rate.json')
 
@@ -104,7 +110,7 @@ if (duplicate) {
 }
 if (lastHour >= HOURLY_MAX) {
   console.error(`一小时内已发 ${lastHour} 条，达到上限 ${HOURLY_MAX}。`)
-  console.error('这个限制是为了不把账号的主动消息额度用光——用光了 bridge 也没法回你消息。')
+  console.error('正常用法一天也就几条，撞到这里通常意味着有什么在自动重发。')
   process.exit(1)
 }
 if (recent.length >= DAILY_MAX) {
