@@ -4,8 +4,8 @@
 # after editing this script, or after changing code that needs a restart.
 #
 #   service/install.sh              install / reload
-#   launchctl kickstart -k gui/$UID/local.claude-qq-bridge    restart
-#   launchctl bootout gui/$UID/local.claude-qq-bridge         stop & unload
+#   launchctl kickstart -k gui/$UID/local.claude-in-qq    restart
+#   launchctl bootout gui/$UID/local.claude-in-qq         stop & unload
 #
 # The plist is generated here rather than committed, because a working one has
 # to name this machine: absolute home paths, the PATH of the shell you actually
@@ -15,7 +15,7 @@
 
 set -eu
 
-LABEL=local.claude-qq-bridge
+LABEL=local.claude-in-qq
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DEST="$HOME/Library/LaunchAgents/$LABEL.plist"
 TARGET="gui/$(id -u)"
@@ -68,7 +68,7 @@ PROXY_ENV=$(
 )
 
 mkdir -p "$LOG_DIR" "$HOME/Library/LaunchAgents"
-chmod +x "$ROOT/service/run.sh"
+chmod +x "$ROOT/service/claude-in-qq.sh"
 
 # Deliberately absent: LimitLoadToSessionType. It belongs to the old `launchctl
 # load` syntax, and under `bootstrap` it silently keeps the job from ever
@@ -84,7 +84,7 @@ cat > "$DEST" <<PLIST
 
     <key>ProgramArguments</key>
     <array>
-        <string>$(xml "$ROOT")/service/run.sh</string>
+        <string>$(xml "$ROOT")/service/claude-in-qq.sh</string>
     </array>
 
     <key>WorkingDirectory</key>
@@ -112,8 +112,9 @@ $PROXY_ENV
       and unrelated timers had silently stopped firing too — a stuck launchd
       after a failed overnight update, cleared by a reboot.
 
-      Both mechanisms can fire at once without racing: run.sh exits immediately
-      when a bridge is already alive, so the worst case is a /bin/sh per minute.
+      Both mechanisms can fire at once without racing: the launch script exits
+      immediately when a bridge is already alive, so the worst case of the
+      redundancy is one /bin/sh per minute.
     -->
     <key>StartInterval</key>
     <integer>60</integer>
