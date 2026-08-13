@@ -375,12 +375,16 @@ const STREAM_MAX_CHARS = 4000
  * is dozens of requests a second. A ceiling here makes that rate a constant
  * rather than a function of how quickly the model happens to generate.
  *
- * 300ms was tried first and read as visibly steppy — three updates a second
- * is enough to follow but not enough to look like writing. At 100ms the text
- * moves continuously again, and the request rate is still an order of
- * magnitude below what per-line sending produces.
+ * Tuned down by eye: 300ms was plainly steppy, 100ms still read worse than
+ * no throttle at all. This is a floor on the gap between two requests, not a
+ * fixed cadence — when a round trip takes longer than the interval, the next
+ * batch simply goes out when the previous one lands.
+ *
+ * QQ documents a per-bot ceiling far above this, so the remaining reason to
+ * throttle is not the limit but the shape: it keeps the request rate a
+ * property of the transport rather than of how fast the model generates.
  */
-const STREAM_THROTTLE_MS = 100
+const STREAM_THROTTLE_MS = 22
 
 export function createStream(openid: string, replyTo?: string): StreamHandle {
   let streamId: string | null = null
@@ -404,6 +408,9 @@ export function createStream(openid: string, replyTo?: string): StreamHandle {
   /** Written but not yet sent, waiting for the throttle window to close. */
   let pending = ''
   let flushTimer: ReturnType<typeof setTimeout> | null = null
+  /** True while a request is in flight, so batches never queue behind it. */
+  let sending = false
+  let lastSentAt = 0
 
   async function send(closing: boolean, delta: string): Promise<void> {
     if (failed) return
@@ -468,21 +475,39 @@ export function createStream(openid: string, replyTo?: string): StreamHandle {
    * and then never again.
    */
   function scheduleFlush(): void {
-    if (flushTimer || failed) return
-    flushTimer = setTimeout(() => {
-      flushTimer = null
-      flushPending()
-    }, STREAM_THROTTLE_MS)
+    if (flushTimer || sending || failed) return
+    const since = Date.now() - lastSentAt
+    flushTimer = setTimeout(
+      () => {
+        flushTimer = null
+        flushPending()
+      },
+      Math.max(0, STREAM_THROTTLE_MS - since),
+    )
   }
 
   function flushPending(): void {
-    if (!pending || failed) return
+    if (!pending || failed || sending) return
     const chunk = pending
     pending = ''
-    chain = chain.then(() => send(false, chunk)).catch(err => {
-      failed = true
-      log('stream write threw:', err)
-    })
+    sending = true
+    chain = chain
+      .then(async () => {
+        await send(false, chunk)
+        lastSentAt = Date.now()
+      })
+      .catch(err => {
+        failed = true
+        log('stream write threw:', err)
+      })
+      .finally(() => {
+        sending = false
+        // Anything written while that request was in flight goes next, spaced
+        // from it by the same interval — so a slow round trip degrades into
+        // "send the next batch when this one lands" instead of a queue that
+        // grows faster than it drains.
+        if (pending) scheduleFlush()
+      })
   }
 
   return {
