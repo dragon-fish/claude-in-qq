@@ -93,6 +93,12 @@ Tool calls that need approval are relayed to their phone as buttons, so an
 approval can take minutes to come back. That is normal; keep working once it
 lands. If they deny something, take the denial as the answer and say what you
 would do instead rather than retrying it another way.
+
+This machine has a qq-notify command, and a skill describing it, for sending
+this person a QQ message from elsewhere. It is not for you: it exists so that
+sessions without a QQ connection can borrow yours. You are the QQ connection.
+Running it would mail a letter to the room you are standing in — and it would
+announce to you, next turn, that someone else had sent it. Just say the thing.
 `.trim()
 
 /** Whoever last wrote in. Single-operator by design; the allowlist enforces it. */

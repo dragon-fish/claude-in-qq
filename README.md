@@ -1,82 +1,111 @@
-# claude-qq-channel
+# claude-in-qq
 
-把 QQ 私聊变成 Claude Code 的遥控器。消息进入**本机正在运行的 CC 会话**，Claude 用你真实的
-skills / CLAUDE.md / hooks 干活；需要审批的工具调用转发到 QQ，回一句 `yes <id>` 就放行。
+把 QQ 私聊变成 Claude Code 的遥控器。手机上发一句话，本机的 Claude Code 就开始干活——用你真实的
+CLAUDE.md、skills、MCP，跑在真实的文件系统上。需要审批的工具调用变成 QQ 里的按钮，点一下放行。
 
-基于官方 [Channels](https://code.claude.com/docs/en/channels)（research preview）实现。
+不是聊天机器人，也不是借 CC 订阅跑别的 agent。是 Claude Code 本身，换了个前端。
 
-## 当前状态
+## 能做什么
 
-已验证可用：
+- **对话**：QQ 私聊直接就是 prompt。回复以 markdown 渲染，QQ 支持加粗、行内代码、列表、围栏代码块、
+  链接、表格
+- **审批**：工具调用弹按钮，点「允许」或「拒绝」。默认 `auto` 模式，只有模型判定有风险的操作才问
+- **提问**：Claude 需要你拿主意时会推一组按钮出来，等同于 TUI 里的 AskUserQuestion
+- **斜杠指令**：`/help` `/stop` `/clear` `/context` `/model` `/mode` `/resume` `/cwd` `/status`
+- **图片进出**：发图给它看；它用 `MEDIA:/绝对路径` 把文件（截图、报表、日志）发回来
+- **不掉线**：会话 ID 落盘，重启机器后接着上次的上下文聊
+- **捎话**：本机任意目录的其他 CC 会话可以借这条通道给你发通知（见下）
 
-- [x] 扫码配置：一次表都不用填，腾讯侧自动建 bot 应用并加好友
-- [x] 凭据解密（AES-256-GCM）与落盘（`~/.claude/channels/qq/.env`，600）
-- [x] 扫码者 openid 自动进白名单
-- [x] WebSocket 网关连接（`gateway connected` → `ready`）
+## 架构
 
-尚未验证：
+```
+QQ 手机客户端
+   │  C2C 私聊 / 按钮点击
+   ▼
+腾讯开放平台 WebSocket 网关
+   │
+   ▼
+src/index.ts ──── Claude Agent SDK ──── Claude Code（订阅额度，非 API 计费）
+   │                    │
+   │                    └─ canUseTool → 审批按钮推回 QQ
+   └─ src/qq.ts：凭据、白名单、配额、网关、键盘、媒体
+```
 
-- [ ] 端到端：QQ 发消息 → CC 会话收到 → Claude 回复到 QQ
-- [ ] 权限中继：QQ 收到审批请求 → 回 `yes <id>` → 工具放行
-- [ ] 常驻方式（见下）
+关键在于 SDK **拥有**这个会话，而不是往别人的会话里推消息。所以常驻、审批中继、斜杠指令都只是普通
+函数调用，不需要一个开着的终端。
 
-## 明天从这里继续
+| 文件 | 职责 |
+| --- | --- |
+| `src/index.ts` | 主循环：消息进 SDK、事件出 QQ、审批与提问的中继 |
+| `src/qq.ts` | 协议层，只认 QQ 不认 Claude |
+| `src/commands.ts` | 斜杠指令注册表 |
+| `src/notify.ts` | 单向通知入口，不经过主进程 |
+| `src/onboard.ts` | 扫码配置 |
+| `src/pair.ts` | 白名单管理，只能在本机跑 |
+| `service/` | launchd 常驻 |
 
-### 1. 起一个带 channel 的会话
-
-首次启动要过三个一次性确认框（development channel 警告、新 MCP server 授权、workspace trust）：
+## 上手
 
 ```bash
-cd ~/GitRepositories/claude-qq-channel
-claude --dangerously-load-development-channels server:qq
+bun install
+bun run onboard          # 扫码，腾讯侧自动建应用并加好友
 ```
 
-> ⚠️ 不要用 `claude` 这个 alias —— `~/.zshrc:183` 把它定义成了带
-> `--dangerously-skip-permissions`，那会让所有远程会话跳过权限检查，而 QQ 端根本看不出来。
-> 用 `claude-safe`，或直接写 `/Users/you/.local/bin/claude`。
+扫码的人自动进白名单。之后再有人给 bot 发消息，只会拿到一个配对码，**必须有人在这台机器上批准**：
 
-起来后 QQ 里的 bot 会从「离线」变「在线」（在线状态 = 本进程的网关连接）。
-然后用手机 QQ 私聊 bot 发一句话，看会不会出现在会话里。
-
-### 2. 决定常驻方式
-
-`tmux` 不是必须的，它只是给交互式 CC 一个 TTY。三条路按优先级：
-
-| 方案 | 开机自启 | 待验证 |
-| --- | --- | --- |
-| launchd + `claude -p` | ✅ | `-p` 能否长驻等 channel 事件；启动确认框在非交互下如何表现 |
-| launchd + `script -q -c '...' /dev/null` 伪 TTY | ✅ | 伪 TTY 下确认框能否自动过 |
-| tmux | ❌ 重启不恢复 | 无 |
-
-官方文档提到 `-p` 模式下需要终端输入的工具会被自动禁用，所以会话不会卡住等输入——这是方案
-一可行的依据，但要实测。
-
-**launchd 必须显式注入代理环境变量**（不读 `.zshrc`）。clash 规则会把大陆流量改写为 direct，
-所以 `q.qq.com` 照常带代理即可，不用 `no_proxy`。
-
-### 3. 补完
-
-- [ ] 端到端跑通后，把 `.mcp.json` 改成插件形态（`${CLAUDE_PLUGIN_ROOT}`），或写进用户级
-      `~/.claude.json` 用绝对路径，这样任意目录都能加载
-- [ ] 消息长度上限 `MAX_CHUNK` 目前取保守的 1500，实测后按 QQ 真实限制调整
-- [ ] 附件目前只转发 URL，没有下载
-
-## 结构
-
+```bash
+bun run pair             # 看白名单和待配对
+bun run pair <code>      # 批准
 ```
-server.ts            channel 主体：网关、入站 gate、reply 工具、权限中继、配额管理
-onboard.ts           扫码配置：create_bind_task → 轮询 → AES-GCM 解密 → 落盘
-skills/configure/    /qq:configure —— 扫码或手工填凭据、查状态
-skills/access/       /qq:access —— 白名单与配对码管理
-docs/DESIGN.md       协议要点、配额规则、安全模型、已知风险
+
+这条路径故意不走 QQ：白名单成员同时拥有批准工具调用的权限，让一条聊天消息就能授权，白名单就形同虚设。
+
+装成常驻服务：
+
+```bash
+service/install.sh       # 从交互式 shell 跑，它要读你真实的 PATH 和代理
 ```
+
+plist 由脚本现场生成，不进仓库——一份能用的 plist 必然带着这台机器的绝对路径、PATH 和可能含内网域名的
+`no_proxy`。
+
+```bash
+launchctl kickstart -k gui/$UID/local.claude-in-qq    # 重启
+launchctl bootout   gui/$UID/local.claude-in-qq       # 停止并卸载
+tail -f ~/.claude/channels/qq/bridge.log              # 日志
+```
+
+## 捎话
+
+任意目录的其他 CC 会话（或脚本、CI）可以给你的 QQ 发一条单向通知：
+
+```bash
+qq-notify --from "重构订单模块" "测试全绿，可以合了"
+pytest 2>&1 | tail -20 | qq-notify --from "跑测试"
+```
+
+`~/.local/bin/qq-notify` 是指向 `src/notify.ts` 的软链，靠 shebang 执行，所以工作目录是调用方的。
+配套的 skill 在 `~/.claude/skills/qq-notify/`，你对任意 CC 说「做完了 QQ 喊我一声」它就会用。
+
+消息带上来源和目录，因为它落在你和 bridge 聊天的同一个窗口里。bridge 那个 Claude 也会在下次对话时
+被告知有别的会话借用了通道——否则你提起某条消息，它会毫无印象。
+
+**单向**：你的回复会进到 bridge 会话，不会回到发起方。所以只发结论，不要发问题。
+
+## 安全模型
+
+- **白名单即审批权**。能发消息的人就能批准工具调用，所以只加自己
+- `access.json` 缺失或损坏时按空白名单处理（拒绝所有），不是放行
+- 待审批的工具入参放在围栏代码块里，免得内容自己伪装成 markdown，让你看不清在批什么
+- 默认 `auto` 权限模式。`/mode` 可切 `default`（每个危险操作都问），但不提供 `bypassPermissions`——
+  那是给一次性容器用的，不该出现在一台你日常用的机器上
+- 凭据存在 `~/.claude/channels/qq/.env`，权限 600
 
 ## 已知风险
 
-- **扫码用的 `/lite/create_bind_task` 和 `/lite/poll_bind_result` 不在腾讯公开文档里**，
-  是从 Hermes 的实现里挖出来的（目标页 `q.qq.com/qqbot/openclaw/connect.html` 带 `openclaw`
-  字样，是腾讯给这类 agent 工具开的口子）。今天实测可用，随时可能变。变了就退回手工注册
-  应用 + `/qq:configure <app_id> <secret>`，这条路径已保留。
-- **Channels 是 research preview**，`--channels` 语法和协议契约官方明示可能变动。
-- **白名单即审批权限**。能通过 channel 回消息的人就能批准工具调用，所以只加你自己。
-- `access.json` 缺失或损坏时按空白名单处理（拒绝所有），不是放行。
+- **扫码用的 `/lite/create_bind_task` 和 `/lite/poll_bind_result` 不在腾讯公开文档里**，随时可能变。
+  变了就退回手工注册应用，把 `QQ_APP_ID` / `QQ_CLIENT_SECRET` 写进 `.env`，这条路径仍然可用
+- **被动消息有配额**：回复携带 `msg_id` 时 60 分钟内最多 4 条，超出后自动转主动消息，主动消息
+  1000 条/天。长任务的进度播报因此是节流的
+- **按钮文字上限约 20 字**，且随屏幕宽度变化。选项过长时自动降级为截断标签，再不行退成 A/B/C/D
+- Agent SDK 的 `resume` 跨目录续接依赖官方行为，`/cwd` 保留上下文正是建立在这上面
