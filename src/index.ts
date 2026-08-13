@@ -61,6 +61,19 @@ const APPROVAL_TIMEOUT_MS = 30 * 60 * 1000
 const QUESTION_TIMEOUT_MS = 15 * 60 * 1000
 
 /**
+ * End the turn's growing message, so whatever comes next starts a new one.
+ *
+ * Anything sent mid-turn as its own message — an approval prompt, a question
+ * with buttons — lands *below* a stream that is still open above it. Keep
+ * writing and the text grows into a message the operator has already scrolled
+ * past to answer, which reads as the past editing itself. Sealing first puts
+ * the reply underneath the thing it is replying to, where it happened.
+ *
+ * Assigned per turn by `runSession`; a no-op between turns.
+ */
+let sealStream: () => Promise<void> = async () => {}
+
+/**
  * Appended to Claude Code's own system prompt. Without it the agent assumes a
  * terminal it can print to and a human watching it, and both assumptions are
  * wrong here.
@@ -320,6 +333,7 @@ async function askApproval(toolName: string, input: Record<string, unknown>): Pr
     '点按钮，或回复 y / n',
   ].join('\n')
 
+  await sealStream()
   await sendToQQ(user, body, lastInboundMsgId.get(user), buildApprovalKeyboard(id))
 
   return new Promise<boolean>(resolve => {
@@ -367,6 +381,7 @@ const qqTools = createSdkMcpServer({
         }
         lines.push('点按钮选择，或直接打字回答')
 
+        await sealStream()
         await sendToQQ(user, lines.join('\n'), lastInboundMsgId.get(user), keyboard)
 
         const answer = await new Promise<string>(resolve => {
@@ -569,6 +584,7 @@ async function askChoice(
   const id = randomId()
   const { keyboard, mode } = buildAskKeyboard(id, options)
 
+  await sealStream()
   await sendToQQ(user, renderBody(mode), lastInboundMsgId.get(user), keyboard)
 
   const answer = await new Promise<string>(resolve => {
@@ -635,6 +651,10 @@ const MEDIA_LINE_RE = /^MEDIA:[ \t]*(\S.*?)[ \t]*$/gm
 async function deliverReply(text: string): Promise<void> {
   const user = requireUser()
   const replyTo = lastInboundMsgId.get(user)
+
+  // Reached only when the stream never carried the text, but a trace block may
+  // still be open above — these are ordinary messages and must land under it.
+  await sealStream()
 
   const paths: string[] = []
   const prose = text.replace(MEDIA_LINE_RE, (_m, p: string) => {
@@ -992,6 +1012,8 @@ async function runSession(): Promise<void> {
       log('trace push failed:', err)
     }
   }
+
+  sealStream = closeStreamer
 
   /** Which content block the deltas currently belong to. */
   let block: string | null = null
