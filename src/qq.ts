@@ -657,31 +657,48 @@ export async function deleteCommandPanel(panelId: string): Promise<void> {
 export const LABEL_CEILING = 20
 export const LETTERS = 'ABCDEFGH'
 
+/**
+ * Six rows come back as 400 / 40034029 ("内联键盘行/列超限"); five are accepted.
+ * Measured against the live API — the width is far looser (six per row passed),
+ * so height is the only dimension worth defending.
+ */
+const MAX_ROWS = 5
+
 type ButtonSpec = { label: string; visited: string; style: number; data: string }
 
-function keyboardFrom(groupId: string, buttons: ButtonSpec[], perRow: number): Record<string, unknown> {
-  const built = buttons.map((b, i) => ({
-    id: `b${i}`,
-    render_data: { label: b.label, visited_label: b.visited, style: b.style },
-    // action.type 1 is Callback — it delivers button_data via INTERACTION_CREATE.
-    // type 2 would be a plain link and would never reach us.
-    action: { type: 1, data: b.data, permission: { type: 2 }, click_limit: 1 },
-    group_id: groupId,
+function keyboardRows(groupId: string, rows: ButtonSpec[][]): Record<string, unknown> {
+  // A rejected keyboard takes the whole message down with it, so say which
+  // layout was wrong here rather than reading 40034029 out of the log later.
+  if (rows.length > MAX_ROWS) {
+    throw new Error(`键盘 ${rows.length} 行超过 QQ 上限 ${MAX_ROWS}`)
+  }
+  let n = 0
+  const built = rows.map(row => ({
+    buttons: row.map(b => ({
+      id: `b${n++}`,
+      render_data: { label: b.label, visited_label: b.visited, style: b.style },
+      // action.type 1 is Callback — it delivers button_data via INTERACTION_CREATE.
+      // type 2 would be a plain link and would never reach us.
+      action: { type: 1, data: b.data, permission: { type: 2 }, click_limit: 1 },
+      group_id: groupId,
+    })),
   }))
-  const rows: unknown[] = []
-  for (let i = 0; i < built.length; i += perRow) rows.push({ buttons: built.slice(i, i + perRow) })
-  return { content: { rows } }
+  return { content: { rows: built } }
+}
+
+function chunk<T>(items: T[], size: number): T[][] {
+  const out: T[][] = []
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size))
+  return out
 }
 
 export function buildApprovalKeyboard(requestId: string): Record<string, unknown> {
-  return keyboardFrom(
-    `approve:${requestId}`,
+  return keyboardRows(`approve:${requestId}`, [
     [
       { label: '✅ 允许', visited: '已允许', style: 1, data: `approve:${requestId}:allow` },
       { label: '❌ 拒绝', visited: '已拒绝', style: 0, data: `approve:${requestId}:deny` },
     ],
-    2,
-  )
+  ])
 }
 
 export type AskLayout = {
@@ -693,6 +710,10 @@ export type AskLayout = {
    *   'letters'   — buttons say A/B/C; the list must carry the meaning
    */
   mode: 'text' | 'truncated' | 'letters'
+  /** Zero-based index of the page this keyboard shows. */
+  page: number
+  /** How many pages the options span. 1 means no navigation row was added. */
+  pages: number
 }
 
 function rowsFor(longest: number): number {
@@ -705,31 +726,59 @@ function rowsFor(longest: number): number {
  * option past the label ceiling is shortened first, and letters appear only
  * when shortening makes two options indistinguishable.
  */
-export function buildAskKeyboard(questionId: string, options: string[]): AskLayout {
-  const build = (labels: string[], perRow: number) =>
-    keyboardFrom(
-      `ask:${questionId}`,
-      labels.map((label, i) => ({
-        label,
-        visited: `${label} ✓`,
-        style: 1,
-        data: `ask:${questionId}:${i}`,
-      })),
-      perRow,
-    )
-
+function labelsFor(options: string[]): { labels: string[]; mode: AskLayout['mode'] } {
   const longest = Math.max(...options.map(o => o.length))
-  if (longest <= LABEL_CEILING) {
-    return { keyboard: build(options, rowsFor(longest)), mode: 'text' }
-  }
+  if (longest <= LABEL_CEILING) return { labels: options, mode: 'text' }
 
   const short = options.map(o => (o.length <= LABEL_CEILING ? o : `${o.slice(0, LABEL_CEILING - 1)}…`))
-  if (new Set(short).size === short.length) {
-    return { keyboard: build(short, rowsFor(Math.max(...short.map(s => s.length)))), mode: 'truncated' }
+  if (new Set(short).size === short.length) return { labels: short, mode: 'truncated' }
+
+  return { labels: options.map((_, i) => LETTERS[i]), mode: 'letters' }
+}
+
+/**
+ * Lay the options out as a keyboard, paging when they do not fit.
+ *
+ * Long labels take a row each, so six of them would ask for six rows and QQ
+ * rejects the message outright. Rather than cram them two to a row — where a
+ * 20-character label renders as four visible characters — the extra options
+ * move to the next page and the last row becomes 上一页 / 下一页. The option
+ * indexes in button_data stay absolute, so a click means the same thing on
+ * whichever page it happens.
+ */
+export function buildAskKeyboard(questionId: string, options: string[], page = 0): AskLayout {
+  const { labels, mode } = labelsFor(options)
+  const perRow = mode === 'letters' ? Math.min(4, options.length) : rowsFor(Math.max(...labels.map(l => l.length)))
+
+  const spec = (label: string, i: number): ButtonSpec => ({
+    label,
+    visited: `${label} ✓`,
+    style: 1,
+    data: `ask:${questionId}:${i}`,
+  })
+  const numbered = labels.map((label, i) => spec(label, i))
+
+  if (numbered.length <= perRow * MAX_ROWS) {
+    return { keyboard: keyboardRows(`ask:${questionId}`, chunk(numbered, perRow)), mode, page: 0, pages: 1 }
   }
 
-  const letters = options.map((_, i) => LETTERS[i])
-  return { keyboard: build(letters, Math.min(4, options.length)), mode: 'letters' }
+  // One row goes to navigation, so the rest of the page is what is left.
+  const perPage = perRow * (MAX_ROWS - 1)
+  const pages = Math.ceil(numbered.length / perPage)
+  const current = Math.min(Math.max(page, 0), pages - 1)
+
+  const nav: ButtonSpec[] = []
+  const step = (to: number, label: string): ButtonSpec => ({
+    label,
+    visited: label,
+    style: 0,
+    data: `ask:${questionId}:p${to}`,
+  })
+  if (current > 0) nav.push(step(current - 1, '⬅️ 上一页'))
+  if (current < pages - 1) nav.push(step(current + 1, '下一页 ➡️'))
+
+  const rows = chunk(numbered.slice(current * perPage, (current + 1) * perPage), perRow)
+  return { keyboard: keyboardRows(`ask:${questionId}`, [...rows, nav]), mode, page: current, pages }
 }
 
 // --------------------------------------------------------------------- media

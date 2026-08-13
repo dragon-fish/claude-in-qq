@@ -293,7 +293,35 @@ function withCommandLog(text: string): string {
 type Pending<T> = { resolve: (v: T) => void; timer: ReturnType<typeof setTimeout> }
 
 const pendingApprovals = new Map<string, Pending<boolean>>()
-const pendingQuestions = new Map<string, Pending<string> & { options: string[] }>()
+/**
+ * `render` is kept alongside the options because a page turn re-posts the same
+ * question: the layout mode can change with the page, so the body has to be
+ * rebuilt rather than remembered as a finished string.
+ */
+const pendingQuestions = new Map<
+  string,
+  Pending<string> & { options: string[]; render: (mode: AskLayout['mode']) => string }
+>()
+
+/**
+ * Post a question and its keyboard. Called again, with the same id, when the
+ * operator turns a page — the pending promise is untouched, only the message
+ * showing the choices is new.
+ */
+async function postQuestion(
+  user: string,
+  id: string,
+  options: string[],
+  render: (mode: AskLayout['mode']) => string,
+  page = 0,
+): Promise<void> {
+  const layout = buildAskKeyboard(id, options, page)
+  const body =
+    layout.pages > 1
+      ? `${render(layout.mode)}\n\n第 ${layout.page + 1}/${layout.pages} 页`
+      : render(layout.mode)
+  await sendToQQ(user, body, lastInboundMsgId.get(user), layout.keyboard)
+}
 
 function settleApproval(id: string, allow: boolean): boolean {
   const p = pendingApprovals.get(id)
@@ -378,28 +406,30 @@ const qqTools = createSdkMcpServer({
       async ({ question, options }) => {
         const user = requireUser()
         const id = randomId()
-        const { keyboard, mode } = buildAskKeyboard(id, options)
 
-        const lines = [`**${question}**`, '']
-        if (mode === 'letters') {
-          // Buttons carry only a letter, so the list has to carry the meaning.
-          options.forEach((opt, i) => lines.push(`${LETTERS[i]}：${opt}`))
-          lines.push('')
-        } else if (mode === 'truncated') {
-          // Buttons are recognisable but clipped; show the full text once.
-          options.forEach(opt => lines.push(`· ${opt}`))
-          lines.push('')
+        const render = (mode: AskLayout['mode']) => {
+          const lines = [`**${question}**`, '']
+          if (mode === 'letters') {
+            // Buttons carry only a letter, so the list has to carry the meaning.
+            options.forEach((opt, i) => lines.push(`${LETTERS[i]}：${opt}`))
+            lines.push('')
+          } else if (mode === 'truncated') {
+            // Buttons are recognisable but clipped; show the full text once.
+            options.forEach(opt => lines.push(`· ${opt}`))
+            lines.push('')
+          }
+          lines.push('点按钮选择，或直接打字回答')
+          return lines.join('\n')
         }
-        lines.push('点按钮选择，或直接打字回答')
 
-        await sendToQQ(user, lines.join('\n'), lastInboundMsgId.get(user), keyboard)
+        await postQuestion(user, id, options, render)
 
         const answer = await new Promise<string>(resolve => {
           const timer = setTimeout(() => {
             pendingQuestions.delete(id)
             resolve('(操作者未在 15 分钟内回答)')
           }, QUESTION_TIMEOUT_MS)
-          pendingQuestions.set(id, { resolve, timer, options })
+          pendingQuestions.set(id, { resolve, timer, options, render })
         })
 
         return { content: [{ type: 'text' as const, text: answer }] }
@@ -413,6 +443,7 @@ const qqTools = createSdkMcpServer({
 const APPROVAL_REPLY_RE = /^\s*(y|yes|n|no)\s*$/i
 const APPROVE_BUTTON_RE = /^approve:([a-km-z]{5}):(allow|deny)$/
 const ASK_BUTTON_RE = /^ask:([a-km-z]{5}):(\d+)$/
+const PAGE_BUTTON_RE = /^ask:([a-km-z]{5}):p(\d+)$/
 
 async function handleMessage(msg: InboundMessage): Promise<void> {
   const access = loadAccess()
@@ -520,6 +551,19 @@ async function handleButton(openid: string, buttonData: string): Promise<void> {
     return
   }
 
+  const turn = PAGE_BUTTON_RE.exec(buttonData)
+  if (turn) {
+    const q = pendingQuestions.get(turn[1])
+    if (!q) {
+      log(`page turn for unknown or expired question ${turn[1]}`)
+      return
+    }
+    // A new message rather than an edit: QQ has no way to rewrite a keyboard in
+    // place, and the question stays open either way.
+    await postQuestion(openid, turn[1], q.options, q.render, Number(turn[2]))
+    return
+  }
+
   const ask = ASK_BUTTON_RE.exec(buttonData)
   if (ask) {
     const q = pendingQuestions.get(ask[1])
@@ -602,16 +646,15 @@ async function askChoice(
 ): Promise<number> {
   const user = requireUser()
   const id = randomId()
-  const { keyboard, mode } = buildAskKeyboard(id, options)
 
-  await sendToQQ(user, renderBody(mode), lastInboundMsgId.get(user), keyboard)
+  await postQuestion(user, id, options, renderBody)
 
   const answer = await new Promise<string>(resolve => {
     const timer = setTimeout(() => {
       pendingQuestions.delete(id)
       resolve('')
     }, QUESTION_TIMEOUT_MS)
-    pendingQuestions.set(id, { options, resolve, timer })
+    pendingQuestions.set(id, { options, resolve, timer, render: renderBody })
   })
   return options.indexOf(answer)
 }
