@@ -66,6 +66,7 @@ const TOKEN_URL = 'https://bots.qq.com/app/getAppAccessToken'
 /**
  * C2C_MESSAGE_CREATE rides on GROUP_AND_C2C_EVENT (1 << 25); INTERACTION
  * (1 << 26) delivers inline-keyboard clicks. Guild and group intents stay off.
+ * @see https://bot.q.qq.com/wiki/develop/api-v2/dev-prepare/interface-framework/event-emit.html
  */
 const INTENTS = (1 << 25) | (1 << 26)
 
@@ -260,6 +261,8 @@ let msgSeq = 1
 /**
  * Send to a QQ user. Passive when quota allows, active otherwise.
  *
+ * @see https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_openid_messages.post.html
+ *
  * Everything goes out as markdown (msg_type 2). QQ renders the full common
  * subset — bold, italic, inline code, headings, ordered and unordered lists,
  * fenced code, links, even tables — and an inline keyboard only renders on a
@@ -311,6 +314,11 @@ export async function sendToQQ(
 // index 0 and comes back with an id; every later POST quotes that id and
 // increments index; input_state 10 closes it. `input_mode` defaults to append,
 // so each call sends only what is new.
+//
+// Error codes, from that page: 40007 the delivered prefix cannot change,
+// 50001 service internal error (retry), 50002 rate limited (slow down).
+//
+// @see https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_openid_stream_messages.post.html
 
 /**
  * Run before every standalone message, whatever sends it.
@@ -786,6 +794,8 @@ function mediaKind(path: string): number {
  * Two steps rather than one: uploading with `srv_send_msg: true` would have QQ
  * deliver it immediately, but then the message carries no msg_id and cannot use
  * the passive quota. Uploading first and sending second keeps that control.
+ *
+ * @see https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_openid_files.post.html
  */
 export async function sendFile(
   openid: string,
