@@ -69,9 +69,11 @@ const QUESTION_TIMEOUT_MS = 15 * 60 * 1000
  * past to answer, which reads as the past editing itself. Sealing first puts
  * the reply underneath the thing it is replying to, where it happened.
  *
+ * Returns whether there was anything to seal.
+ *
  * Assigned per turn by `runSession`; a no-op between turns.
  */
-let sealStream: () => Promise<void> = async () => {}
+let sealStream: () => Promise<boolean> = async () => false
 
 /**
  * Appended to Claude Code's own system prompt. Without it the agent assumes a
@@ -990,8 +992,8 @@ async function runSession(): Promise<void> {
    */
   let streamedText = false
 
-  async function closeStreamer(): Promise<void> {
-    if (!streamer) return
+  async function closeStreamer(): Promise<boolean> {
+    if (!streamer) return false
     const s = streamer
     streamer = null
     try {
@@ -999,6 +1001,7 @@ async function runSession(): Promise<void> {
     } catch (err) {
       log('failed to close stream:', err)
     }
+    return true
   }
 
   /** Write into the fenced trace block. Newlines are the caller's to place. */
@@ -1147,13 +1150,42 @@ async function main(): Promise<void> {
   }
 }
 
-process.on('SIGINT', () => {
+/**
+ * Leave the conversation in a finished state before going.
+ *
+ * A stream is only over once QQ is told so; killed mid-write, the message
+ * keeps its typing indicator blinking forever, and the operator is left
+ * watching a reply that will never arrive from a process that no longer
+ * exists. Sealing sends that closing frame, and the notice explains the
+ * silence — restarts are frequent here, since the bridge is often what is
+ * being edited.
+ *
+ * Bounded on purpose: launchd escalates to SIGKILL if a job lingers, and a
+ * courtesy message is not worth being killed halfway through sending.
+ */
+const SHUTDOWN_GRACE_MS = 3000
+let shuttingDown = false
+
+async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return
+  shuttingDown = true
+  log(`${signal} received, shutting down`)
+  setTimeout(() => process.exit(0), SHUTDOWN_GRACE_MS).unref()
+  try {
+    // Only when a reply was actually in flight. A restart while idle needs no
+    // apology, and nobody wants a notification for one.
+    if (await sealStream()) {
+      const user = requireUser()
+      await sendToQQ(user, '⏸ claude-in-qq 正在断开连接。', lastInboundMsgId.get(user))
+    }
+  } catch (err) {
+    log('shutdown notice failed:', err)
+  }
   closeGateway()
   process.exit(0)
-})
-process.on('SIGTERM', () => {
-  closeGateway()
-  process.exit(0)
-})
+}
+
+process.on('SIGINT', () => void shutdown('SIGINT'))
+process.on('SIGTERM', () => void shutdown('SIGTERM'))
 
 await main()
