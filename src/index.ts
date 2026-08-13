@@ -842,17 +842,17 @@ class LineStreamer {
 
     // Waiting for the newline is only ever about recognising a MEDIA line, and
     // that is decided by the first few characters. Once the line cannot be one,
-    // release it in small pieces — otherwise a paragraph-long line sits invisible
-    // while a short one appears at once, and the reply arrives in lurches.
+    // release immediately — the transport coalesces on its own clock, so
+    // holding text back here only makes that clock arrive with nothing to
+    // send. Twelve characters was the old threshold, and at typical generation
+    // speed it filled roughly once every quarter second: the reply advanced a
+    // dozen characters at a time, in visible steps, no matter how the
+    // transport was tuned.
     //
-    // Inside a fence there is no MEDIA line to wait for and nothing to gain:
-    // released mid-line, a thinking summary twitches forward a few characters
-    // at a time in a box the eye is already skimming. Whole lines only.
-    if (
-      this.channel === 'prose' &&
-      this.buffer.length >= LineStreamer.CHUNK &&
-      !this.mightBeMedia()
-    ) {
+    // Inside a fence there is nothing to gain either way: released mid-line, a
+    // thinking summary twitches forward a few characters at a time in a box
+    // the eye is already skimming. Whole lines only.
+    if (this.channel === 'prose' && this.buffer && !this.mightBeMedia()) {
       const chunk = this.buffer
       this.buffer = ''
       this.atLineStart = false
@@ -971,7 +971,6 @@ class LineStreamer {
     if (!next.failed) await next.write(`\`\`\`${LineStreamer.TRACE_LANG}\n`)
   }
 
-  private static readonly CHUNK = 12
   private static readonly MEDIA_PREFIX = 'MEDIA:'
 
   /** True while the partial line could still grow into `MEDIA:...`. */
