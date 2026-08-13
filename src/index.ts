@@ -903,8 +903,13 @@ class LineStreamer {
    * a better moment.
    */
   async pushNow(text: string, channel: Channel): Promise<boolean> {
-    if (this.buffer) return false
+    // Order matters. Switching channels flushes whatever is buffered on the
+    // way out, so checking first would refuse exactly the case that needs
+    // this most: a tool called mid-sentence, where the unfinished prose line
+    // is sitting in the buffer with no newline coming to release it. Both the
+    // half-line and the tool name would be held until the tool returned.
     if (channel !== this.channel) await this.switchTo(channel)
+    if (this.buffer) return false
     await this.writeThrough(text)
     return true
   }
