@@ -407,7 +407,12 @@ function mediaKind(path: string): number {
  * deliver it immediately, but then the message carries no msg_id and cannot use
  * the passive quota. Uploading first and sending second keeps that control.
  */
-export async function sendFile(openid: string, path: string, replyTo?: string): Promise<void> {
+export async function sendFile(
+  openid: string,
+  path: string,
+  replyTo?: string,
+  caption?: string,
+): Promise<void> {
   const buf = readFileSync(path)
   if (buf.byteLength > MAX_UPLOAD_BYTES) {
     throw new Error(`文件太大（${Math.round(buf.byteLength / 1024 / 1024)}MB）`)
@@ -432,6 +437,10 @@ export async function sendFile(openid: string, path: string, replyTo?: string): 
 
   const passiveId = claimPassive(replyTo)
   const send: Record<string, unknown> = { msg_type: 7, media: { file_info }, msg_seq: msgSeq++ }
+  // A media message takes plain-text `content` as a caption, so a short note
+  // rides along with the file instead of arriving as a separate message.
+  // Markdown is not rendered here, which is why long prose still goes on its own.
+  if (caption) send.content = caption.slice(0, MAX_CHUNK)
   if (passiveId) send.msg_id = passiveId
 
   const res = await qqFetch(`/v2/users/${openid}/messages`, {

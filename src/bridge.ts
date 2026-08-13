@@ -470,6 +470,9 @@ function commandDeps(user: string): CommandDeps {
  * native attachment. Claude has no way to hand over a file otherwise — it can
  * describe a screenshot or a log, but not give it to you.
  */
+/** Above this, prose is its own message so it keeps markdown rendering. */
+const CAPTION_LIMIT = 200
+
 const MEDIA_LINE_RE = /^[ \t]*MEDIA:[ \t]*(\S.*)$/gm
 
 /** Send a reply, pulling out any MEDIA: lines and uploading those files. */
@@ -484,11 +487,16 @@ async function deliverReply(text: string): Promise<void> {
   })
 
   const remaining = prose.trim()
-  if (remaining) await sendToQQ(user, remaining, replyTo)
 
-  for (const path of paths) {
+  // One file with a short note becomes a single captioned message — the note
+  // belongs to the file. Longer prose goes separately so it keeps its markdown,
+  // which a caption does not render.
+  const asCaption = paths.length === 1 && remaining.length > 0 && remaining.length <= CAPTION_LIMIT
+  if (remaining && !asCaption) await sendToQQ(user, remaining, replyTo)
+
+  for (const [i, path] of paths.entries()) {
     try {
-      await sendFile(user, path, replyTo)
+      await sendFile(user, path, replyTo, asCaption && i === 0 ? remaining : undefined)
       log(`sent file ${path}`)
     } catch (err) {
       log(`failed to send ${path}:`, err)
