@@ -381,7 +381,7 @@ register(
             )
             lines.push('')
           }
-          lines.push('无论哪档，长时间没动静时都会打一个 · 表示还活着')
+          lines.push('点按钮切换')
           return lines.join('\n')
         },
       )

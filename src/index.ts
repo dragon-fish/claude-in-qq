@@ -54,26 +54,19 @@ let permissionMode = ''
  * How much of the work rides along with the answer.
  *
  * `full` is the whole trace — thinking summaries, each tool with its
- * arguments, and what the shell printed back. `balanced` keeps only the
- * heartbeat of it: that thinking is happening, and which tools went by. `off`
- * is the answer alone.
+ * arguments, and what the shell printed back. `balanced` keeps only its
+ * shape: that thinking is happening, and which tools went by. `off` is the
+ * answer alone.
  *
- * Defaults to `full`: a long task that shows nothing for ten minutes is
- * indistinguishable from a hung one, and the trace is what tells them apart.
+ * None of these levels is what tells the operator the agent is alive — QQ
+ * blinks a caret on a message whose stream is still open, and marks the bot
+ * offline when the connection drops. Both are free and neither can lie about
+ * the process being gone. These levels are only about how much detail is
+ * worth the screen.
  */
 type TraceLevel = 'full' | 'balanced' | 'off'
 let traceLevel: TraceLevel = 'full'
 
-/**
- * How long the trace may stay silent before it says something anyway.
- *
- * Nothing is emitted while a tool runs, so a thirty-second command looks
- * exactly like a dead process. A dot every few seconds costs one append and
- * answers the only question being asked: is it still going?
- */
-const HEARTBEAT_MS = 6000
-/** Cleared and rebuilt per session, so a torn-down query leaves none behind. */
-let heartbeatTimer: ReturnType<typeof setInterval> | null = null
 const APPROVAL_TIMEOUT_MS = 30 * 60 * 1000
 const QUESTION_TIMEOUT_MS = 15 * 60 * 1000
 
@@ -900,8 +893,10 @@ class LineStreamer {
   private static readonly TRACE_LANG = 'text'
 
   /**
-   * Write straight through, skipping the line buffer — for a heartbeat, whose
-   * whole purpose is to appear now rather than when a line happens to end.
+   * Write straight through, skipping the line buffer — for text that has to
+   * appear now rather than when a line happens to end. A tool name in
+   * `balanced` mode is one: its line stays open so the next name can be
+   * appended to it, so there is no newline coming to flush it.
    *
    * Refuses when a line is half-written, rather than cutting in: a dot in the
    * middle of a sentence is worse than a late dot, and the next tick will find
@@ -914,19 +909,6 @@ class LineStreamer {
     return true
   }
 
-  /**
-   * Append a mark to a trace block that is already open, or decline.
-   *
-   * Unlike pushNow this never opens one. A heartbeat exists to fill silence,
-   * and switching channels to place it would do the opposite: it would cut the
-   * prose in half and leave a code block containing a single dot between the
-   * two halves.
-   */
-  async pulse(mark: string): Promise<boolean> {
-    if (this.buffer || this.channel !== 'trace') return false
-    await this.writeThrough(mark)
-    return true
-  }
 
   /**
    * A growing message has a maximum size. When QQ says this one is nearly
@@ -1153,7 +1135,6 @@ async function runSession(): Promise<void> {
       streamer ??= newStreamer()
       await streamer.push(text, 'trace')
       traceTail = text
-      lastOutputAt = Date.now()
     } catch (err) {
       // The trace is commentary. Losing a line of it must never take down the
       // turn that was busy producing the actual answer.
@@ -1167,7 +1148,6 @@ async function runSession(): Promise<void> {
       streamer ??= newStreamer()
       if (await streamer.pushNow(text, 'trace')) {
         traceTail = text
-        lastOutputAt = Date.now()
       }
     } catch (err) {
       log('trace push failed:', err)
@@ -1180,13 +1160,6 @@ async function runSession(): Promise<void> {
   let traceStarted = false
   /** In balanced mode, what the running entry is, so tools can accumulate. */
   let lastKind: 'thinking' | 'tools' | null = null
-  /**
-   * When anything was last written — prose included.
-   *
-   * The heartbeat measures silence, and prose streaming out is not silence:
-   * timing only the trace made it fire in the middle of a sentence.
-   */
-  let lastOutputAt = Date.now()
 
   /** End the previous entry cleanly and leave a blank line before the next. */
   async function traceBreak(): Promise<void> {
@@ -1202,16 +1175,6 @@ async function runSession(): Promise<void> {
 
   sealStream = closeStreamer
 
-  if (heartbeatTimer) clearInterval(heartbeatTimer)
-  heartbeatTimer = setInterval(() => {
-    // Only while a reply is actually open, and only once the trace has gone
-    // quiet — a dot next to something that just arrived says nothing.
-    if (traceLevel === 'off' || !streamer) return
-    if (Date.now() - lastOutputAt < HEARTBEAT_MS) return
-    void streamer.pulse('·').then(written => {
-      if (written) lastOutputAt = Date.now()
-    })
-  }, HEARTBEAT_MS)
 
   /** Which content block the deltas currently belong to. */
   let block: string | null = null
@@ -1275,7 +1238,6 @@ async function runSession(): Promise<void> {
         if (delta?.type === 'text_delta') {
           streamer ??= newStreamer()
           streamedText = true
-          lastOutputAt = Date.now()
           // Prose closes the block; a later one starts its own entry list.
           traceStarted = false
           lastKind = null
