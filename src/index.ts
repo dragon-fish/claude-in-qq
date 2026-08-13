@@ -649,6 +649,95 @@ const CAPTION_LIMIT = 200
 
 const MEDIA_LINE_RE = /^MEDIA:[ \t]*(\S.*?)[ \t]*$/gm
 
+// ------------------------------------------------------------- trace summaries
+//
+// A bare tool name says almost nothing: "Bash" three times in a row could be
+// one command retried or three unrelated ones. The arguments are what make the
+// trace readable — and they are also where it could get away from us, since a
+// Read result is an entire file. So each tool gets a deliberate one-line shape,
+// and only the tools whose output is short enough to be worth reading get one.
+
+/** How much of a command or path survives into the trace. */
+const TRACE_ARG_LIMIT = 140
+/** How much of a tool's output does, and over how many lines. */
+const TRACE_OUT_LINES = 4
+const TRACE_OUT_LIMIT = 110
+
+/** Collapse whitespace and clip, so one argument stays one line. */
+function oneLine(value: unknown, limit = TRACE_ARG_LIMIT): string {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim()
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text
+}
+
+/** Paths are usually inside the workdir; the prefix is noise once it repeats. */
+function shortPath(value: unknown): string {
+  const path = String(value ?? '')
+  const rel = workdir && path.startsWith(workdir) ? path.slice(workdir.length + 1) : path
+  return oneLine(rel || path)
+}
+
+/**
+ * The trace line for a tool call, or null to leave it out.
+ *
+ * The bridge's own tools are left out: they exist to talk to the operator, so
+ * narrating "asking you a question" directly above the question is telling
+ * someone what you are about to tell them.
+ */
+function summariseTool(name: string, input: Record<string, any>): string | null {
+  if (name.startsWith('mcp__qq__')) return null
+
+  const arg = (() => {
+    switch (name) {
+      case 'Bash':
+        return oneLine(input.command)
+      case 'Read':
+      case 'Write':
+        return shortPath(input.file_path)
+      case 'Edit': {
+        const delta = String(input.new_string ?? '').length - String(input.old_string ?? '').length
+        return `${shortPath(input.file_path)} ${delta >= 0 ? '+' : '−'}${Math.abs(delta)}`
+      }
+      case 'Grep':
+        return oneLine(input.pattern)
+      case 'Glob':
+        return oneLine(input.pattern)
+      case 'WebFetch':
+        return oneLine(input.url)
+      case 'Task':
+        return oneLine(input.description)
+      default:
+        return ''
+    }
+  })()
+
+  return arg ? `⚙️ ${name}  ${arg}` : `⚙️ ${name}`
+}
+
+/**
+ * The trace lines for a tool's output, or null.
+ *
+ * Only Bash: its output is the point of running it, and it is the one tool
+ * whose result the operator would otherwise have to take on faith. A Read
+ * result is a whole file and a Grep result can be hundreds of matches — those
+ * belong to the agent, not to the trace.
+ */
+function summariseResult(name: string, content: unknown): string | null {
+  if (name !== 'Bash') return null
+  const text = typeof content === 'string'
+    ? content
+    : Array.isArray(content)
+      ? content.map((c: any) => (c?.type === 'text' ? c.text : '')).join('')
+      : ''
+
+  const lines = text.split('\n').filter(l => l.trim())
+  if (!lines.length) return null
+
+  const shown = lines.slice(0, TRACE_OUT_LINES).map(l => `   ${oneLine(l, TRACE_OUT_LIMIT)}`)
+  const hidden = lines.length - TRACE_OUT_LINES
+  if (hidden > 0) shown.push(`   … 另有 ${hidden} 行`)
+  return shown.join('\n')
+}
+
 /** Send a reply, pulling out any MEDIA: lines and uploading those files. */
 async function deliverReply(text: string): Promise<void> {
   const user = requireUser()
@@ -1020,6 +1109,8 @@ async function runSession(): Promise<void> {
 
   /** Which content block the deltas currently belong to. */
   let block: string | null = null
+  /** tool_use id → name, so a result can be matched to the call that made it. */
+  const toolNames = new Map<string, string>()
 
   function newStreamer(): LineStreamer {
     return new LineStreamer(
@@ -1060,7 +1151,6 @@ async function runSession(): Promise<void> {
       if (ev?.type === 'content_block_start') {
         block = ev.content_block?.type ?? null
         if (block === 'thinking' && showThinking) await trace('💭 ')
-        else if (block === 'tool_use' && showTools) await trace(`⚙️ ${ev.content_block.name}\n`)
       } else if (ev?.type === 'content_block_delta') {
         const delta = ev.delta
         if (delta?.type === 'text_delta') {
@@ -1082,9 +1172,13 @@ async function runSession(): Promise<void> {
         block = null
       }
     } else if (m.type === 'assistant') {
-      // The finished message arrives after its deltas, and is only needed when
-      // the stream never got off the ground — then this is where the whole text
-      // goes out the old way.
+      // The finished message arrives after its deltas. Its text is only needed
+      // when the stream never got off the ground — then this is where the whole
+      // thing goes out the old way. Its tool calls, though, are needed every
+      // time: during streaming a tool's input is still arriving in fragments,
+      // and only here is it whole enough to summarise. This still lands after
+      // the thinking that produced it and before the call runs, which is the
+      // order it happened in.
       for (const b of m.message?.content ?? []) {
         if (b.type === 'text' && b.text.trim() && !streamedText) {
           try {
@@ -1092,9 +1186,24 @@ async function runSession(): Promise<void> {
           } catch (err) {
             log('failed to deliver reply:', err)
           }
+        } else if (b.type === 'tool_use') {
+          toolNames.set(b.id, b.name)
+          const line = showTools ? summariseTool(b.name, b.input ?? {}) : null
+          if (line) await trace(`${line}\n`)
         }
       }
       streamedText = false
+    } else if (m.type === 'user') {
+      // Tool results come back as a user turn. Only some are worth showing,
+      // and knowing which needs the name from the call that asked for it.
+      for (const b of m.message?.content ?? []) {
+        if (b.type !== 'tool_result') continue
+        const name = toolNames.get(b.tool_use_id)
+        toolNames.delete(b.tool_use_id)
+        if (!name || !showTools) continue
+        const out = summariseResult(name, b.content)
+        if (out) await trace(`${out}\n`)
+      }
     } else if (m.type === 'result') {
       // The one place the stream closes. A turn can also end without a final
       // assistant message (interrupt, error), and this catches that too rather
@@ -1102,6 +1211,7 @@ async function runSession(): Promise<void> {
       await closeStreamer()
       block = null
       streamedText = false
+      toolNames.clear()
       log(`turn finished: ${m.subtype}, turns=${m.num_turns}`)
     }
   }
