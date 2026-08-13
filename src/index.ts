@@ -915,6 +915,20 @@ class LineStreamer {
   }
 
   /**
+   * Append a mark to a trace block that is already open, or decline.
+   *
+   * Unlike pushNow this never opens one. A heartbeat exists to fill silence,
+   * and switching channels to place it would do the opposite: it would cut the
+   * prose in half and leave a code block containing a single dot between the
+   * two halves.
+   */
+  async pulse(mark: string): Promise<boolean> {
+    if (this.buffer || this.channel !== 'trace') return false
+    await this.writeThrough(mark)
+    return true
+  }
+
+  /**
    * A growing message has a maximum size. When QQ says this one is nearly
    * there, close it and carry on in the next — reopening the fence, because a
    * code block does not survive the message boundary and the trace would
@@ -1139,7 +1153,7 @@ async function runSession(): Promise<void> {
       streamer ??= newStreamer()
       await streamer.push(text, 'trace')
       traceTail = text
-      lastTraceAt = Date.now()
+      lastOutputAt = Date.now()
     } catch (err) {
       // The trace is commentary. Losing a line of it must never take down the
       // turn that was busy producing the actual answer.
@@ -1153,7 +1167,7 @@ async function runSession(): Promise<void> {
       streamer ??= newStreamer()
       if (await streamer.pushNow(text, 'trace')) {
         traceTail = text
-        lastTraceAt = Date.now()
+        lastOutputAt = Date.now()
       }
     } catch (err) {
       log('trace push failed:', err)
@@ -1166,8 +1180,13 @@ async function runSession(): Promise<void> {
   let traceStarted = false
   /** In balanced mode, what the running entry is, so tools can accumulate. */
   let lastKind: 'thinking' | 'tools' | null = null
-  /** When the trace last said anything, for the heartbeat to measure against. */
-  let lastTraceAt = Date.now()
+  /**
+   * When anything was last written — prose included.
+   *
+   * The heartbeat measures silence, and prose streaming out is not silence:
+   * timing only the trace made it fire in the middle of a sentence.
+   */
+  let lastOutputAt = Date.now()
 
   /** End the previous entry cleanly and leave a blank line before the next. */
   async function traceBreak(): Promise<void> {
@@ -1188,8 +1207,10 @@ async function runSession(): Promise<void> {
     // Only while a reply is actually open, and only once the trace has gone
     // quiet — a dot next to something that just arrived says nothing.
     if (traceLevel === 'off' || !streamer) return
-    if (Date.now() - lastTraceAt < HEARTBEAT_MS) return
-    void traceNow('·')
+    if (Date.now() - lastOutputAt < HEARTBEAT_MS) return
+    void streamer.pulse('·').then(written => {
+      if (written) lastOutputAt = Date.now()
+    })
   }, HEARTBEAT_MS)
 
   /** Which content block the deltas currently belong to. */
@@ -1254,6 +1275,7 @@ async function runSession(): Promise<void> {
         if (delta?.type === 'text_delta') {
           streamer ??= newStreamer()
           streamedText = true
+          lastOutputAt = Date.now()
           // Prose closes the block; a later one starts its own entry list.
           traceStarted = false
           lastKind = null
