@@ -332,7 +332,7 @@ register(
   {
     name: 'cwd',
     usage: '/cwd [路径]',
-    summary: '查看或切换工作目录（切换会开新会话）',
+    summary: '查看或切换工作目录（保留上下文）',
     async run(arg, deps) {
       if (!arg) {
         await deps.reply(`当前工作目录：\`${deps.workdir()}\``)
@@ -343,11 +343,13 @@ register(
         await deps.reply(`目录不存在：\`${next}\``)
         return
       }
+      // The query is rebuilt because cwd is fixed at creation, but the session
+      // is kept: moving to another directory is not a reason to forget the
+      // conversation that sent you there. /clear is how you ask for that.
       deps.setWorkdir(next)
-      deps.setSessionId(null)
       deps.restartSession('cwd')
-      deps.noteToAgent(`工作目录已切换为 ${next}，这是一个新会话。之前提到的相对路径不再适用。`)
-      await deps.reply(`📁 已切换到 \`${next}\`，下一条消息开始新会话。`)
+      deps.noteToAgent(`工作目录已切换为 ${next}。对话继续，但之前提到的相对路径要按新目录重新理解。`)
+      await deps.reply(`📁 已切换到 \`${next}\`（上下文保留）`)
     },
   },
 
