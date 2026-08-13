@@ -371,12 +371,16 @@ const STREAM_MAX_CHARS = 4000
 /**
  * Smallest gap between two appends on one stream.
  *
- * Writes arrive per finished line, which for a long reply is a request every
- * fraction of a second. Coalescing them into one update every 300ms costs
- * nothing legible — text updating three times a second reads as continuous —
- * and cuts the request count by an order of magnitude.
+ * Writes arrive per finished line, so an unthrottled reply from a fast model
+ * is dozens of requests a second. A ceiling here makes that rate a constant
+ * rather than a function of how quickly the model happens to generate.
+ *
+ * 300ms was tried first and read as visibly steppy — three updates a second
+ * is enough to follow but not enough to look like writing. At 100ms the text
+ * moves continuously again, and the request rate is still an order of
+ * magnitude below what per-line sending produces.
  */
-const STREAM_THROTTLE_MS = 300
+const STREAM_THROTTLE_MS = 100
 
 export function createStream(openid: string, replyTo?: string): StreamHandle {
   let streamId: string | null = null
@@ -461,8 +465,7 @@ export function createStream(openid: string, replyTo?: string): StreamHandle {
    * A write happens per finished line, so an unthrottled long reply is a
    * hundred-odd requests in a couple of minutes — needless load, and the most
    * likely explanation for the burst of 50001s, which arrived in a cluster
-   * and then never again. Three updates a second still reads as continuous
-   * text; the eye cannot follow faster than that anyway.
+   * and then never again.
    */
   function scheduleFlush(): void {
     if (flushTimer || failed) return
