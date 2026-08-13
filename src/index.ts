@@ -39,6 +39,7 @@ import {
   sendToQQ,
   STATE_DIR,
   syncCommandPanel,
+  onBeforeSend,
   type InboundMessage,
 } from './qq.js'
 
@@ -335,7 +336,6 @@ async function askApproval(toolName: string, input: Record<string, unknown>): Pr
     '点按钮，或回复 y / n',
   ].join('\n')
 
-  await sealStream()
   await sendToQQ(user, body, lastInboundMsgId.get(user), buildApprovalKeyboard(id))
 
   return new Promise<boolean>(resolve => {
@@ -383,7 +383,6 @@ const qqTools = createSdkMcpServer({
         }
         lines.push('点按钮选择，或直接打字回答')
 
-        await sealStream()
         await sendToQQ(user, lines.join('\n'), lastInboundMsgId.get(user), keyboard)
 
         const answer = await new Promise<string>(resolve => {
@@ -597,7 +596,6 @@ async function askChoice(
   const id = randomId()
   const { keyboard, mode } = buildAskKeyboard(id, options)
 
-  await sealStream()
   await sendToQQ(user, renderBody(mode), lastInboundMsgId.get(user), keyboard)
 
   const answer = await new Promise<string>(resolve => {
@@ -754,9 +752,6 @@ async function deliverReply(text: string): Promise<void> {
   const user = requireUser()
   const replyTo = lastInboundMsgId.get(user)
 
-  // Reached only when the stream never carried the text, but a trace block may
-  // still be open above — these are ordinary messages and must land under it.
-  await sealStream()
 
   const paths: string[] = []
   const prose = text.replace(MEDIA_LINE_RE, (_m, p: string) => {
@@ -1264,6 +1259,12 @@ async function main(): Promise<void> {
   permissionMode = state.permission_mode ?? process.env.QQ_PERMISSION_MODE ?? 'auto'
   showThinking = state.show_thinking ?? true
   showTools = state.show_tools ?? true
+
+  // The linearity invariant, installed once: every standalone message closes
+  // the open stream on its way out, whoever sends it and whenever it is added.
+  onBeforeSend(async () => {
+    await sealStream()
+  })
 
   if (!HAS_CREDENTIALS) {
     log('QQ_APP_ID / QQ_CLIENT_SECRET missing — run: bun run onboard.ts')

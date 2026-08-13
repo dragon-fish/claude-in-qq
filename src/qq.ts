@@ -275,6 +275,7 @@ export async function sendToQQ(
   replyTo?: string,
   keyboard?: Record<string, unknown>,
 ): Promise<void> {
+  await beforeSend()
   const chunks = chunkText(text)
 
   for (const [i, chunk] of chunks.entries()) {
@@ -310,6 +311,25 @@ export async function sendToQQ(
 // index 0 and comes back with an id; every later POST quotes that id and
 // increments index; input_state 10 closes it. `input_mode` defaults to append,
 // so each call sends only what is new.
+
+/**
+ * Run before every standalone message, whatever sends it.
+ *
+ * A QQ conversation is strictly linear: a message occupies the position it was
+ * posted at, and nothing that arrives later can appear above it. A stream, on
+ * the other hand, keeps writing into the position it started at. So anything
+ * that posts a new message while a stream is open leaves that stream growing
+ * *above* it — from the reader's side, a message they have already scrolled
+ * past starts editing itself.
+ *
+ * Registering the seal here rather than calling it from each sender makes that
+ * an invariant instead of a habit: a new sender added later cannot forget.
+ */
+let beforeSend: () => Promise<void> = async () => {}
+
+export function onBeforeSend(fn: () => Promise<void>): void {
+  beforeSend = fn
+}
 
 export type StreamHandle = {
   /** Append text. Silently becomes a no-op once the stream has failed. */
@@ -703,6 +723,7 @@ export async function sendFile(
   replyTo?: string,
   caption?: string,
 ): Promise<void> {
+  await beforeSend()
   const buf = readFileSync(path)
   if (buf.byteLength > MAX_UPLOAD_BYTES) {
     throw new Error(`文件太大（${Math.round(buf.byteLength / 1024 / 1024)}MB）`)
