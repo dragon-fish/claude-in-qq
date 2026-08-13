@@ -10,8 +10,10 @@
  * report on it.
  */
 
-import { createSdkMcpServer, query, tool } from '@anthropic-ai/claude-agent-sdk'
+import { createSdkMcpServer, listSessions, query, tool } from '@anthropic-ai/claude-agent-sdk'
 import { z } from 'zod'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import {
   buildApprovalKeyboard,
   buildAskKeyboard,
@@ -32,7 +34,8 @@ import {
   type InboundMessage,
 } from './qq.ts'
 
-const WORKDIR = process.env.QQ_BRIDGE_CWD ?? process.env.HOME!
+/** Mutable: /cwd retargets the agent, which means rebuilding the session. */
+let workdir = process.env.QQ_BRIDGE_CWD ?? process.env.HOME!
 const APPROVAL_TIMEOUT_MS = 30 * 60 * 1000
 const QUESTION_TIMEOUT_MS = 15 * 60 * 1000
 /** Don't narrate every tool call; report at most this often. */
@@ -272,6 +275,10 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
   currentUser = msg.openid
   lastInboundMsgId.set(msg.openid, msg.id)
 
+  // Commands outrank a pending prompt: an open question swallows arbitrary text
+  // as its answer, so /stop would never reach anything if it were checked after.
+  if (await handleCommand(msg.content, msg.openid)) return
+
   // An open approval or question takes precedence: the agent is blocked on it,
   // so this message is the answer rather than a new instruction.
   const short = APPROVAL_REPLY_RE.exec(msg.content)
@@ -330,28 +337,268 @@ async function handleButton(openid: string, buttonData: string): Promise<void> {
   log(`unrecognized button_data: ${buttonData.slice(0, 60)}`)
 }
 
-// ------------------------------------------------------------------ main loop
+// -------------------------------------------------------------- session state
+//
+// The agent session outlives this process. Without persisting its id, every
+// restart — a crash, a deploy, an edit to this file — silently starts a new
+// conversation, and the operator is left talking to someone with amnesia.
 
-async function main(): Promise<void> {
-  if (!HAS_CREDENTIALS) {
-    log('QQ_APP_ID / QQ_CLIENT_SECRET missing — run: bun run onboard.ts')
-    process.exit(1)
+const SESSION_FILE = join(STATE_DIR, 'session.json')
+
+function loadSessionId(): string | null {
+  try {
+    const data = JSON.parse(readFileSync(SESSION_FILE, 'utf8')) as { session_id?: string }
+    return data.session_id ?? null
+  } catch {
+    return null
+  }
+}
+
+function saveSessionId(id: string | null): void {
+  try {
+    mkdirSync(STATE_DIR, { recursive: true })
+    writeFileSync(SESSION_FILE, JSON.stringify({ session_id: id }, null, 2))
+  } catch (err) {
+    log('failed to persist session id:', err)
+  }
+}
+
+// ------------------------------------------------------------------- commands
+
+/** Set when a command needs the query torn down and rebuilt. */
+let restartReason: 'clear' | 'cd' | 'resume' | null = null
+let activeQuery: any = null
+
+const HELP = [
+  '**可用指令**',
+  '`/stop` 打断当前任务',
+  '`/clear` 清空上下文，开始新会话',
+  '`/context` 查看上下文占用',
+  '`/model <名字>` 切换模型（如 `/model sonnet`）',
+  '`/cwd <路径>` 切换工作目录（会开新会话）',
+  '`/resume` 从历史会话里挑一个恢复',
+  '`/status` 查看桥接状态',
+  '`/help` 显示本条',
+  '',
+  '其余消息都直接发给 Claude。',
+].join('\n')
+
+const n = (v: number) => v.toLocaleString('en-US')
+
+/**
+ * Render context usage the way /context does in a terminal: the headline
+ * numbers, then where the tokens actually went. The raw response also carries
+ * grid geometry for drawing squares and a per-tool breakdown — neither survives
+ * being read on a phone.
+ */
+function formatContextUsage(u: any): string {
+  const pct = typeof u.percentage === 'number' ? u.percentage.toFixed(1) : '?'
+  const lines = [
+    '**上下文占用**',
+    `模型：\`${u.model ?? '?'}\``,
+    `已用：${n(u.totalTokens ?? 0)} / ${n(u.maxTokens ?? 0)}　(${pct}%)`,
+  ]
+
+  const cats = (u.categories ?? [])
+    .filter((c: any) => c.tokens > 0)
+    .sort((a: any, b: any) => b.tokens - a.tokens)
+
+  if (cats.length) {
+    lines.push('', '| 类别 | tokens |', '| --- | --- |')
+    for (const c of cats) lines.push(`| ${String(c.name).replace(/\|/g, '｜')} | ${n(c.tokens)} |`)
+  }
+  return lines.join('\n')
+}
+
+/**
+ * Handle a slash command. Returns false when the text is not a command, so it
+ * falls through to the agent.
+ *
+ * Claude Code's own slash commands are parsed by its CLI before a prompt ever
+ * reaches the model, so they cannot arrive this way — these are reimplemented
+ * on top of the SDK's session-control methods.
+ */
+async function handleCommand(text: string, user: string): Promise<boolean> {
+  const m = /^\s*\/([a-z]+)(?:\s+(.*))?$/i.exec(text)
+  if (!m) return false
+  const cmd = m[1].toLowerCase()
+  const arg = (m[2] ?? '').trim()
+
+  const reply = (s: string) => sendToQQ(user, s, lastInboundMsgId.get(user))
+
+  switch (cmd) {
+    case 'help':
+      await reply(HELP)
+      return true
+
+    case 'stop':
+      if (!activeQuery) {
+        await reply('没有正在运行的会话。')
+        return true
+      }
+      await activeQuery.interrupt()
+      await reply('⛔ 已打断。')
+      return true
+
+    case 'clear':
+      saveSessionId(null)
+      restartReason = 'clear'
+      activeQuery?.close()
+      await reply('🧹 已清空上下文，下一条消息开始新会话。')
+      return true
+
+    case 'context': {
+      if (!activeQuery) {
+        await reply('会话尚未启动。')
+        return true
+      }
+      try {
+        await reply(formatContextUsage(await activeQuery.getContextUsage()))
+      } catch (err) {
+        await reply(`查询失败：${err}`)
+      }
+      return true
+    }
+
+    case 'model': {
+      if (!activeQuery) {
+        await reply('会话尚未启动。')
+        return true
+      }
+      try {
+        await activeQuery.setModel(arg || undefined)
+        await reply(arg ? `已切换到 \`${arg}\`` : '已恢复默认模型')
+      } catch (err) {
+        await reply(`切换失败：${err}`)
+      }
+      return true
+    }
+
+    case 'cwd': {
+      if (!arg) {
+        await reply(`当前工作目录：\`${workdir}\``)
+        return true
+      }
+      const next = arg.startsWith('~') ? join(process.env.HOME!, arg.slice(1)) : arg
+      if (!existsSync(next)) {
+        await reply(`目录不存在：\`${next}\``)
+        return true
+      }
+      workdir = next
+      saveSessionId(null)
+      restartReason = 'cd'
+      activeQuery?.close()
+      await reply(`📁 已切换到 \`${next}\`，下一条消息开始新会话。`)
+      return true
+    }
+
+    case 'resume': {
+      // Sessions are per project directory, so this lists what exists under the
+      // current workdir rather than everything on the machine.
+      let sessions
+      try {
+        sessions = await listSessions({ dir: workdir, limit: 6 })
+      } catch (err) {
+        await reply(`读取历史会话失败：${err}`)
+        return true
+      }
+      if (!sessions.length) {
+        await reply(`\`${workdir}\` 下还没有历史会话。`)
+        return true
+      }
+
+      const when = (s: (typeof sessions)[number]) =>
+        new Date(s.lastModified).toLocaleString('zh-CN', {
+          month: 'numeric',
+          day: 'numeric',
+          hour: '2-digit',
+          minute: '2-digit',
+        })
+      const title = (s: (typeof sessions)[number]) =>
+        (s.customTitle ?? s.summary ?? '(无标题)').replace(/\|/g, '｜').slice(0, 40)
+
+      const labels = sessions.map(s => `${when(s)} ${title(s)}`.slice(0, 60))
+
+      const id = randomId()
+      const { keyboard, useLetters } = buildAskKeyboard(id, labels)
+
+      // When the labels fit on the buttons themselves, a table would just
+      // repeat them. It earns its place only once the buttons degrade to letters.
+      const lines = ['**最近的会话**', '']
+      if (useLetters) {
+        lines.push('| | 时间 | 摘要 |', '| --- | --- | --- |')
+        sessions.forEach((s, i) => lines.push(`| ${LETTERS[i]} | ${when(s)} | ${title(s)} |`))
+        lines.push('')
+      }
+      lines.push('点按钮恢复到那个会话')
+
+      // Reuse the question machinery: a selection is the same interaction, and
+      // the resolve callback is where the choice is acted on rather than
+      // returned to a tool.
+      pendingQuestions.set(id, {
+        options: labels,
+        timer: setTimeout(() => pendingQuestions.delete(id), QUESTION_TIMEOUT_MS),
+        resolve: (answer: string) => {
+          const idx = labels.indexOf(answer)
+          if (idx < 0) {
+            void reply('没认出这个选择，已取消。')
+            return
+          }
+          saveSessionId(sessions[idx].sessionId)
+          restartReason = 'resume'
+          activeQuery?.close()
+          void reply(`已切到该会话，下一条消息接着聊。`)
+        },
+      })
+
+      await sendToQQ(user, lines.join('\n'), lastInboundMsgId.get(user), keyboard)
+      return true
+    }
+
+    case 'status': {
+      const access = loadAccess()
+      await reply(
+        [
+          '**桥接状态**',
+          `工作目录：\`${workdir}\``,
+          `会话：\`${loadSessionId() ?? '(新会话)'}\``,
+          `白名单：${access.allowed.length} 人`,
+          `待审批：${pendingApprovals.size}　待回答：${pendingQuestions.size}`,
+        ].join('\n'),
+      )
+      return true
+    }
   }
 
-  await connectGateway({ onMessage: handleMessage, onButton: handleButton })
-  log(`bridge up, workdir=${WORKDIR}, state=${STATE_DIR}`)
+  return false
+}
+
+// ------------------------------------------------------------------ main loop
+
+/** Run one agent session until it ends. Returns when the query closes. */
+async function runSession(): Promise<void> {
+  const resume = loadSessionId()
+  log(resume ? `resuming session ${resume}` : 'starting a new session')
 
   const q = query({
     prompt: queue,
     options: {
       systemPrompt: { type: 'preset', preset: 'claude_code', append: OPERATOR_CONTEXT },
-      cwd: WORKDIR,
+      cwd: workdir,
       permissionMode: 'default',
+      resume: resume ?? undefined,
       // The terminal question tool has no UI here — nobody is watching a
       // terminal. Left enabled it renders into the void and comes back
       // unanswered. mcp__qq__qq_ask is its replacement.
       disallowedTools: ['AskUserQuestion'],
       canUseTool: async (toolName: string, input: Record<string, unknown>) => {
+        // This bridge's own tools only talk to the operator — they touch no
+        // files, run no commands, and reach nothing outside the chat. Gating
+        // them means asking permission to ask a question, which costs two
+        // round trips on a phone to answer one prompt.
+        if (toolName.startsWith('mcp__qq__')) {
+          return { behavior: 'allow' as const, updatedInput: input }
+        }
         const allow = await askApproval(toolName, input)
         return allow
           ? { behavior: 'allow' as const, updatedInput: input }
@@ -360,6 +607,7 @@ async function main(): Promise<void> {
       mcpServers: { qq: qqTools },
     } as any,
   })
+  activeQuery = q
 
   let lastProgressAt = 0
   const pendingTools: string[] = []
@@ -367,7 +615,11 @@ async function main(): Promise<void> {
   for await (const message of q as any) {
     const m = message as any
 
-    if (m.type === 'assistant') {
+    if (m.type === 'system' && m.subtype === 'init') {
+      // Persist immediately: a crash before the first reply should still leave
+      // a resumable session behind.
+      if (m.session_id) saveSessionId(m.session_id)
+    } else if (m.type === 'assistant') {
       for (const block of m.message?.content ?? []) {
         if (block.type === 'text' && block.text.trim()) {
           try {
@@ -399,6 +651,34 @@ async function main(): Promise<void> {
       lastProgressAt = 0
       log(`turn finished: ${m.subtype}, turns=${m.num_turns}`)
     }
+  }
+}
+
+async function main(): Promise<void> {
+  if (!HAS_CREDENTIALS) {
+    log('QQ_APP_ID / QQ_CLIENT_SECRET missing — run: bun run onboard.ts')
+    process.exit(1)
+  }
+
+  await connectGateway({ onMessage: handleMessage, onButton: handleButton })
+  log(`bridge up, workdir=${workdir}, state=${STATE_DIR}`)
+
+  // The session is rebuilt rather than the process restarted: /clear and /cwd
+  // both need a fresh query, and a crashed query should not take the QQ
+  // connection down with it.
+  while (true) {
+    try {
+      await runSession()
+    } catch (err) {
+      log('session ended with error:', err)
+    }
+    activeQuery = null
+    if (restartReason) {
+      log(`rebuilding session after /${restartReason}`)
+      restartReason = null
+      continue
+    }
+    await new Promise(r => setTimeout(r, 1000))
   }
 }
 
