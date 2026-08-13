@@ -1,5 +1,6 @@
 {
   "compilerOptions": {
+    "tsBuildInfoFile": "node_modules/.cache/tsconfig.tsbuildinfo",
     "target": "ESNext",
     "module": "ESNext",
     "moduleResolution": "Bundler",
