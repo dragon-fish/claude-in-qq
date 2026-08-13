@@ -150,6 +150,31 @@ class MessageQueue implements AsyncIterable<SDKUserMessage> {
 
 const queue = new MessageQueue()
 
+/**
+ * Facts the agent has no way to observe.
+ *
+ * Slash commands are handled entirely by the bridge — the agent never sees the
+ * command or its output — so a command with a side effect leaves it holding a
+ * stale picture: interrupted mid-task and unaware, or reasoning about a working
+ * directory that changed underneath it. These notes ride along with the next
+ * real message rather than as their own turn, which would make the agent
+ * respond to an event instead of to the person.
+ */
+const pendingNotices: string[] = []
+
+function noteToAgent(text: string): void {
+  pendingNotices.push(text)
+  log(`queued notice: ${text}`)
+}
+
+/** Wrap queued notices around the operator's message, then clear them. */
+function withNotices(text: string): string {
+  if (!pendingNotices.length) return text
+  const notes = pendingNotices.join('\n')
+  pendingNotices.length = 0
+  return `<system-note>\n${notes}\n</system-note>\n\n${text}`
+}
+
 // ------------------------------------------------------------------ approvals
 
 type Pending<T> = { resolve: (v: T) => void; timer: ReturnType<typeof setTimeout> }
@@ -348,7 +373,7 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
     }
   }
 
-  const text = [msg.content, ...notes].filter(Boolean).join('\n')
+  const text = withNotices([msg.content, ...notes].filter(Boolean).join('\n'))
   if (blocks.length) {
     // Image first, then the words about it — the order the person sent them in.
     queue.push([...blocks, { type: 'text', text: text || '(图片)' }])
@@ -482,6 +507,7 @@ function commandDeps(user: string): CommandDeps {
     },
     sessionId: loadSessionId,
     setSessionId: saveSessionId,
+    noteToAgent,
     permissionMode: () => permissionMode,
     setPermissionMode: mode => {
       permissionMode = mode

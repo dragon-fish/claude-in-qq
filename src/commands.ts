@@ -37,6 +37,11 @@ export type CommandDeps = {
   restartSession(reason: string): void
   sessionId(): string | null
   setSessionId(id: string | null): void
+  /**
+   * Tell the agent something it cannot observe. Delivered with the next real
+   * message, since commands happen entirely outside its view.
+   */
+  noteToAgent(text: string): void
   permissionMode(): string
   setPermissionMode(mode: string): void
   counts(): { allowed: number; approvals: number; questions: number }
@@ -114,6 +119,10 @@ register(
       const q = await requireQuery(deps)
       if (!q) return
       await q.interrupt()
+      deps.noteToAgent(
+        '操作者打断了你上一个任务，它没有完成。不要假设之前的步骤已经生效；' +
+          '如果需要，先确认当前状态再继续。',
+      )
       await deps.reply('⛔ 已打断。')
     },
   },
@@ -231,6 +240,7 @@ register(
         try {
           await q.setPermissionMode(value)
           deps.setPermissionMode(value)
+          deps.noteToAgent(`权限模式已切换为 ${value}，工具调用被批准或拦截的方式随之改变。`)
           await deps.reply(`权限模式已切到 \`${value}\``)
         } catch (err) {
           await deps.reply(`切换失败：${err}`)
@@ -312,6 +322,7 @@ register(
 
       deps.setSessionId(sessions[idx].sessionId)
       deps.restartSession('resume')
+      deps.noteToAgent('操作者从历史记录中恢复了这个会话，中间可能隔了很久。')
       await deps.reply('已切到该会话，下一条消息接着聊。')
     },
   },
@@ -333,6 +344,7 @@ register(
       deps.setWorkdir(next)
       deps.setSessionId(null)
       deps.restartSession('cwd')
+      deps.noteToAgent(`工作目录已切换为 ${next}，这是一个新会话。之前提到的相对路径不再适用。`)
       await deps.reply(`📁 已切换到 \`${next}\`，下一条消息开始新会话。`)
     },
   },
