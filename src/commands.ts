@@ -46,9 +46,9 @@ export type CommandDeps = {
   recordCommand(name: string, args: string): void
   permissionMode(): string
   setPermissionMode(mode: string): void
-  /** Which parts of the work are shown alongside the answer. */
-  verbose(): { thinking: boolean; tools: boolean }
-  setVerbose(v: { thinking: boolean; tools: boolean }): void
+  /** How much of the work is shown alongside the answer. */
+  verbose(): 'full' | 'balanced' | 'off'
+  setVerbose(level: 'full' | 'balanced' | 'off'): void
   counts(): { allowed: number; approvals: number; questions: number }
 }
 
@@ -342,59 +342,51 @@ register(
 
   {
     name: 'verbose',
-    usage: '/verbose [full|think|tools|off]',
-    summary: '回复里是否附带思考与工具调用',
+    usage: '/verbose [full|balanced|off]',
+    summary: '回复里附带多少过程',
     async run(arg, deps) {
-      // Both on by default: a long task that shows nothing reads as a hang.
       // The trace rides inside the same streamed message as the answer, in a
       // code block QQ folds past fifteen lines, so it costs no extra message —
       // only screen. This is the switch for when that screen is the problem.
       const levels = [
-        { value: 'full', label: 'full 思考+工具', thinking: true, tools: true },
-        { value: 'think', label: 'think 只要思考', thinking: true, tools: false },
-        { value: 'tools', label: 'tools 只要工具', thinking: false, tools: true },
-        { value: 'off', label: 'off 只要答案', thinking: false, tools: false },
-      ]
+        { value: 'full', label: 'full 完整过程', desc: '思考全文、每次调用的参数、命令输出' },
+        { value: 'balanced', label: 'balanced 只报进度', desc: '思考中……／调用了哪些工具' },
+        { value: 'off', label: 'off 只要答案', desc: '什么过程都不显示' },
+      ] as const
       const current = deps.verbose()
-      const name = (v: { thinking: boolean; tools: boolean }) =>
-        levels.find(l => l.thinking === v.thinking && l.tools === v.tools)?.value ?? '?'
 
-      const apply = async (hit: (typeof levels)[number]) => {
-        deps.setVerbose({ thinking: hit.thinking, tools: hit.tools })
-        await deps.reply(`已切到 \`${hit.value}\``)
+      const apply = async (value: (typeof levels)[number]['value']) => {
+        deps.setVerbose(value)
+        await deps.reply(`已切到 \`${value}\``)
       }
 
       if (arg) {
-        const hit = levels.find(l => l.value.toLowerCase() === arg.toLowerCase())
+        const hit = levels.find(l => l.value === arg.toLowerCase())
         if (!hit) {
           await deps.reply(`未知取值 \`${arg}\`，可选：${levels.map(l => l.value).join('、')}`)
           return
         }
-        await apply(hit)
+        await apply(hit.value)
         return
       }
 
       const idx = await deps.askChoice(
         levels.map(l => l.label),
         mode => {
-          const lines = [`**回复详略**（当前 \`${name(current)}\`）`, '']
+          const lines = [`**回复详略**（当前 \`${current}\`）`, '']
           if (mode !== 'text') {
             lines.push('| | 取值 | 显示 |', '| --- | --- | --- |')
             levels.forEach((l, i) =>
-              lines.push(
-                `| ${mode === 'letters' ? 'ABCDEFGH'[i] : '·'} | ${l.value} | ${cell(
-                  [l.thinking && '思考', l.tools && '工具调用'].filter(Boolean).join(' + ') || '只有答案',
-                )} |`,
-              ),
+              lines.push(`| ${mode === 'letters' ? 'ABCDEFGH'[i] : '·'} | ${l.value} | ${cell(l.desc)} |`),
             )
             lines.push('')
           }
-          lines.push('点按钮切换')
+          lines.push('无论哪档，长时间没动静时都会打一个 · 表示还活着')
           return lines.join('\n')
         },
       )
       if (idx < 0) return
-      await apply(levels[idx])
+      await apply(levels[idx].value)
     },
   },
 

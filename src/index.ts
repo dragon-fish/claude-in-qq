@@ -51,13 +51,29 @@ import {
 let workdir = ''
 let permissionMode = ''
 /**
- * Whether the reply carries the work as well as the answer. Both default on:
- * a long task that shows nothing for ten minutes reads as a hang, and the
- * trace is what distinguishes the two. Off is one /verbose away when it turns
- * out to be noise.
+ * How much of the work rides along with the answer.
+ *
+ * `full` is the whole trace — thinking summaries, each tool with its
+ * arguments, and what the shell printed back. `balanced` keeps only the
+ * heartbeat of it: that thinking is happening, and which tools went by. `off`
+ * is the answer alone.
+ *
+ * Defaults to `full`: a long task that shows nothing for ten minutes is
+ * indistinguishable from a hung one, and the trace is what tells them apart.
  */
-let showThinking = true
-let showTools = true
+type TraceLevel = 'full' | 'balanced' | 'off'
+let traceLevel: TraceLevel = 'full'
+
+/**
+ * How long the trace may stay silent before it says something anyway.
+ *
+ * Nothing is emitted while a tool runs, so a thirty-second command looks
+ * exactly like a dead process. A dot every few seconds costs one append and
+ * answers the only question being asked: is it still going?
+ */
+const HEARTBEAT_MS = 6000
+/** Cleared and rebuilt per session, so a torn-down query leaves none behind. */
+let heartbeatTimer: ReturnType<typeof setInterval> | null = null
 const APPROVAL_TIMEOUT_MS = 30 * 60 * 1000
 const QUESTION_TIMEOUT_MS = 15 * 60 * 1000
 
@@ -546,8 +562,7 @@ type BridgeState = {
   session_id?: string | null
   workdir?: string
   permission_mode?: string
-  show_thinking?: boolean
-  show_tools?: boolean
+  trace_level?: TraceLevel
 }
 
 function loadState(): BridgeState {
@@ -632,11 +647,10 @@ function commandDeps(user: string): CommandDeps {
       permissionMode = mode
       patchState({ permission_mode: mode })
     },
-    verbose: () => ({ thinking: showThinking, tools: showTools }),
-    setVerbose: v => {
-      showThinking = v.thinking
-      showTools = v.tools
-      patchState({ show_thinking: v.thinking, show_tools: v.tools })
+    verbose: () => traceLevel,
+    setVerbose: level => {
+      traceLevel = level as TraceLevel
+      patchState({ trace_level: level as TraceLevel })
     },
     counts: () => ({
       allowed: loadAccess().allowed.length,
@@ -886,6 +900,21 @@ class LineStreamer {
   private static readonly TRACE_LANG = 'text'
 
   /**
+   * Write straight through, skipping the line buffer — for a heartbeat, whose
+   * whole purpose is to appear now rather than when a line happens to end.
+   *
+   * Refuses when a line is half-written, rather than cutting in: a dot in the
+   * middle of a sentence is worse than a late dot, and the next tick will find
+   * a better moment.
+   */
+  async pushNow(text: string, channel: Channel): Promise<boolean> {
+    if (this.buffer) return false
+    if (channel !== this.channel) await this.switchTo(channel)
+    await this.writeThrough(text)
+    return true
+  }
+
+  /**
    * A growing message has a maximum size. When QQ says this one is nearly
    * there, close it and carry on in the next — reopening the fence, because a
    * code block does not survive the message boundary and the trace would
@@ -1110,9 +1139,23 @@ async function runSession(): Promise<void> {
       streamer ??= newStreamer()
       await streamer.push(text, 'trace')
       traceTail = text
+      lastTraceAt = Date.now()
     } catch (err) {
       // The trace is commentary. Losing a line of it must never take down the
       // turn that was busy producing the actual answer.
+      log('trace push failed:', err)
+    }
+  }
+
+  /** Write into the trace immediately, without waiting for a line to end. */
+  async function traceNow(text: string): Promise<void> {
+    try {
+      streamer ??= newStreamer()
+      if (await streamer.pushNow(text, 'trace')) {
+        traceTail = text
+        lastTraceAt = Date.now()
+      }
+    } catch (err) {
       log('trace push failed:', err)
     }
   }
@@ -1121,6 +1164,10 @@ async function runSession(): Promise<void> {
   let traceTail = ''
   /** Whether the block already holds an entry. */
   let traceStarted = false
+  /** In balanced mode, what the running entry is, so tools can accumulate. */
+  let lastKind: 'thinking' | 'tools' | null = null
+  /** When the trace last said anything, for the heartbeat to measure against. */
+  let lastTraceAt = Date.now()
 
   /** End the previous entry cleanly and leave a blank line before the next. */
   async function traceBreak(): Promise<void> {
@@ -1135,6 +1182,15 @@ async function runSession(): Promise<void> {
   }
 
   sealStream = closeStreamer
+
+  if (heartbeatTimer) clearInterval(heartbeatTimer)
+  heartbeatTimer = setInterval(() => {
+    // Only while a reply is actually open, and only once the trace has gone
+    // quiet — a dot next to something that just arrived says nothing.
+    if (traceLevel === 'off' || !streamer) return
+    if (Date.now() - lastTraceAt < HEARTBEAT_MS) return
+    void traceNow('·')
+  }, HEARTBEAT_MS)
 
   /** Which content block the deltas currently belong to. */
   let block: string | null = null
@@ -1179,10 +1235,19 @@ async function runSession(): Promise<void> {
       const ev = m.event
       if (ev?.type === 'content_block_start') {
         block = ev.content_block?.type ?? null
-        if (block === 'thinking' && showThinking) {
+        if (block === 'thinking' && traceLevel === 'full') {
           await traceBreak()
           await trace('💭 ')
           traceStarted = true
+          lastKind = 'thinking'
+        } else if (block === 'thinking' && traceLevel === 'balanced' && lastKind !== 'thinking') {
+          // One line per stretch of thinking, not per block: several in a row
+          // say nothing more than the first, and the point here is only that
+          // something is happening.
+          await traceBreak()
+          await trace('💭 思考中……\n')
+          traceStarted = true
+          lastKind = 'thinking'
         }
       } else if (ev?.type === 'content_block_delta') {
         const delta = ev.delta
@@ -1191,19 +1256,20 @@ async function runSession(): Promise<void> {
           streamedText = true
           // Prose closes the block; a later one starts its own entry list.
           traceStarted = false
+          lastKind = null
           try {
             await streamer.push(delta.text)
           } catch (err) {
             log('stream push failed:', err)
           }
-        } else if (delta?.type === 'thinking_delta' && showThinking) {
+        } else if (delta?.type === 'thinking_delta' && traceLevel === 'full') {
           await trace(delta.thinking)
         }
       } else if (ev?.type === 'content_block_stop') {
         // A thinking summary may or may not end its own last line, and the
         // trace only flushes whole lines — without this the last thought can
         // sit in the buffer until something else happens to end one.
-        if (block === 'thinking' && showThinking) await traceEndLine()
+        if (block === 'thinking' && traceLevel === 'full') await traceEndLine()
         block = null
       }
     } else if (m.type === 'assistant') {
@@ -1223,11 +1289,27 @@ async function runSession(): Promise<void> {
           }
         } else if (b.type === 'tool_use') {
           toolNames.set(b.id, b.name)
-          const line = showTools ? summariseTool(b.name, b.input ?? {}) : null
-          if (line) {
-            await traceBreak()
-            await trace(`${line}\n`)
-            traceStarted = true
+          if (traceLevel === 'full') {
+            const line = summariseTool(b.name, b.input ?? {})
+            if (line) {
+              await traceBreak()
+              await trace(`${line}\n`)
+              traceStarted = true
+              lastKind = 'tools'
+            }
+          } else if (traceLevel === 'balanced' && !b.name.startsWith('mcp__qq__')) {
+            // Names accumulate along one line — a stream can only append, so
+            // the line is built as it goes rather than rewritten at the end.
+            // Written straight through: without a newline to end it, a
+            // buffered write would sit invisible until the next entry.
+            if (lastKind === 'tools') {
+              await traceNow(`、${b.name}`)
+            } else {
+              await traceBreak()
+              await traceNow(`⚙️ ${b.name}`)
+              traceStarted = true
+              lastKind = 'tools'
+            }
           }
         }
       }
@@ -1239,7 +1321,7 @@ async function runSession(): Promise<void> {
         if (b.type !== 'tool_result') continue
         const name = toolNames.get(b.tool_use_id)
         toolNames.delete(b.tool_use_id)
-        if (!name || !showTools) continue
+        if (!name || traceLevel !== 'full') continue
         const out = summariseResult(name, b.content)
         if (out) await trace(`${out}\n`)
       }
@@ -1252,6 +1334,7 @@ async function runSession(): Promise<void> {
       streamedText = false
       traceStarted = false
       traceTail = ''
+      lastKind = null
       toolNames.clear()
       log(`turn finished: ${m.subtype}, turns=${m.num_turns}`)
     }
@@ -1262,8 +1345,7 @@ async function main(): Promise<void> {
   const state = loadState()
   workdir = state.workdir ?? process.env.QQ_BRIDGE_CWD ?? process.env.HOME!
   permissionMode = state.permission_mode ?? process.env.QQ_PERMISSION_MODE ?? 'auto'
-  showThinking = state.show_thinking ?? true
-  showTools = state.show_tools ?? true
+  traceLevel = state.trace_level ?? 'full'
 
   // The linearity invariant, installed once: every standalone message closes
   // the open stream on its way out, whoever sends it and whenever it is added.
