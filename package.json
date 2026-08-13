@@ -10,7 +10,8 @@
     "onboard": "bun run src/onboard.ts",
     "pair": "bun run src/pair.ts",
     "typecheck": "tsc --noEmit",
-    "notify": "bun run src/notify.ts"
+    "notify": "bun run src/notify.ts",
+    "panel": "bun run src/panel.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.229",

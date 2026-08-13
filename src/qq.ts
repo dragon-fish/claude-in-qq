@@ -299,6 +299,100 @@ export async function sendToQQ(
   }
 }
 
+// --------------------------------------------------------------- command panel
+//
+// The panel is what QQ shows when the operator taps the "/" affordance. Tapping
+// an entry types its name into the input box rather than sending it, so a name
+// of "/status" arrives here as an ordinary slash command and needs no special
+// handling on the way in.
+//
+// Panels are per-application and capped at 20, so this syncs rather than
+// creates: an existing panel carrying our remark is updated in place. Creating
+// one per restart would exhaust the allowance in a fortnight.
+
+const PANEL_REMARK = 'claude-in-qq'
+const PANEL_NAME_MAX = 14
+const PANEL_DESC_MAX = 30
+
+export type PanelEntry = { name: string; desc: string }
+
+/** QQ counts a CJK character as two. Truncate on that budget, not on length. */
+function fitWidth(s: string, max: number): string {
+  let width = 0
+  let out = ''
+  for (const ch of s) {
+    const w = /[⺀-鿿豈-﫿＀-￯]/.test(ch) ? 2 : 1
+    if (width + w > max) return `${out.slice(0, -1)}…`
+    width += w
+    out += ch
+  }
+  return out
+}
+
+/**
+ * Create or update the C2C command panel. Returns the panel id.
+ *
+ * `version` is bumped on every update because QQ uses it to decide whether
+ * clients need to refetch; leaving it fixed leaves stale panels on phones.
+ */
+export async function syncCommandPanel(entries: PanelEntry[]): Promise<string> {
+  const items = entries.slice(0, 20).map(e => ({
+    name: fitWidth(e.name, PANEL_NAME_MAX),
+    desc: fitWidth(e.desc, PANEL_DESC_MAX),
+    type: 'command',
+  }))
+
+  const listed = await qqFetch('/v2/panels?scope=c2c')
+  if (!listed.ok) throw new Error(`查询面板失败 ${listed.status}: ${(await listed.text()).slice(0, 200)}`)
+  // The list comes back under `records`, not `panels`; getting this wrong makes
+  // every sync look like a first sync and burns through the 20-panel allowance.
+  const { records = [] } = (await listed.json()) as {
+    records?: { panel_id: string; panel?: { remark?: string; version?: number } }[]
+  }
+  const mine = records.find(p => p.panel?.remark === PANEL_REMARK)
+
+  const panel = {
+    items,
+    remark: PANEL_REMARK,
+    version: (mine?.panel?.version ?? 0) + 1,
+  }
+
+  const res = mine
+    ? await qqFetch(`/v2/panels/${mine.panel_id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ scope: 'c2c', panel }),
+      })
+    : await qqFetch('/v2/panels', {
+        method: 'POST',
+        body: JSON.stringify({ scope: 'c2c', target_type: 'all', panel }),
+      })
+
+  if (!res.ok) throw new Error(`${mine ? '更新' : '创建'}面板失败 ${res.status}: ${(await res.text()).slice(0, 300)}`)
+  const body = (await res.json()) as { panel_id?: string }
+  return body.panel_id ?? mine!.panel_id
+}
+
+/** List existing C2C panels, for inspection and cleanup. */
+export async function listCommandPanels(): Promise<
+  { panel_id: string; remark?: string; items: number }[]
+> {
+  const res = await qqFetch('/v2/panels?scope=c2c')
+  if (!res.ok) throw new Error(`查询面板失败 ${res.status}`)
+  const { records = [] } = (await res.json()) as {
+    records?: { panel_id: string; panel?: { remark?: string; items?: unknown[] } }[]
+  }
+  return records.map(p => ({
+    panel_id: p.panel_id,
+    remark: p.panel?.remark,
+    items: p.panel?.items?.length ?? 0,
+  }))
+}
+
+export async function deleteCommandPanel(panelId: string): Promise<void> {
+  const res = await qqFetch(`/v2/panels/${panelId}`, { method: 'DELETE' })
+  if (!res.ok) throw new Error(`删除面板失败 ${res.status}: ${(await res.text()).slice(0, 200)}`)
+}
+
 // ------------------------------------------------------------------ keyboards
 //
 // Buttons split their row evenly, so the label budget shrinks as the row fills:

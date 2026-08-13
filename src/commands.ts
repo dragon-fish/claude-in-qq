@@ -62,6 +62,11 @@ export function register(...commands: Command[]): void {
   for (const c of commands) registry.set(c.name, c)
 }
 
+/** Registration order, which is the order /help and the QQ command panel show. */
+export function allCommands(): Command[] {
+  return [...registry.values()]
+}
+
 /** Format a number with thousands separators. */
 const n = (v: number) => v.toLocaleString('en-US')
 
