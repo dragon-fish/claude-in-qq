@@ -368,23 +368,20 @@ const STREAM_TAIL_MARGIN = 512
  */
 const STREAM_MAX_CHARS = 4000
 
-/**
- * Smallest gap between two appends on one stream.
+/*
+ * There is deliberately no throttle here.
  *
- * Writes arrive per finished line, so an unthrottled reply from a fast model
- * is dozens of requests a second. A ceiling here makes that rate a constant
- * rather than a function of how quickly the model happens to generate.
+ * Appends are chained, so the next request is not issued until the previous
+ * one returns — the send rate is already pinned at one per round trip, which
+ * measured 363ms against QQ. Three intervals were tried on top of that (300,
+ * 100, 22ms) and none changed the request count, because none of them was
+ * ever the binding constraint.
  *
- * Tuned down by eye: 300ms was plainly steppy, 100ms still read worse than
- * no throttle at all. This is a floor on the gap between two requests, not a
- * fixed cadence — when a round trip takes longer than the interval, the next
- * batch simply goes out when the previous one lands.
- *
- * QQ documents a per-bot ceiling far above this, so the remaining reason to
- * throttle is not the limit but the shape: it keeps the request rate a
- * property of the transport rather than of how fast the model generates.
+ * What a throttle did change was the size of each step: coalescing a whole
+ * round trip's worth of text made the reply advance in visible jumps of
+ * ~27 characters instead of the ~12 the buffer hands over on its own. Same
+ * frequency, twice the stride, and it read as stuttering.
  */
-const STREAM_THROTTLE_MS = 22
 
 export function createStream(openid: string, replyTo?: string): StreamHandle {
   let streamId: string | null = null
@@ -405,12 +402,6 @@ export function createStream(openid: string, replyTo?: string): StreamHandle {
   let nearlyFull = false
   /** Log the reported capacity once per stream, not once per append. */
   let sawRemaining = false
-  /** Written but not yet sent, waiting for the throttle window to close. */
-  let pending = ''
-  let flushTimer: ReturnType<typeof setTimeout> | null = null
-  /** True while a request is in flight, so batches never queue behind it. */
-  let sending = false
-  let lastSentAt = 0
 
   /** Round-trip samples, so the append rate can be attributed rather than guessed. */
   let sentCount = 0
@@ -476,49 +467,6 @@ export function createStream(openid: string, replyTo?: string): StreamHandle {
     if (full.length >= STREAM_MAX_CHARS) nearlyFull = true
   }
 
-  /**
-   * Appends are coalesced on a timer rather than sent per write.
-   *
-   * A write happens per finished line, so an unthrottled long reply is a
-   * hundred-odd requests in a couple of minutes — needless load, and the most
-   * likely explanation for the burst of 50001s, which arrived in a cluster
-   * and then never again.
-   */
-  function scheduleFlush(): void {
-    if (flushTimer || sending || failed) return
-    const since = Date.now() - lastSentAt
-    flushTimer = setTimeout(
-      () => {
-        flushTimer = null
-        flushPending()
-      },
-      Math.max(0, STREAM_THROTTLE_MS - since),
-    )
-  }
-
-  function flushPending(): void {
-    if (!pending || failed || sending) return
-    const chunk = pending
-    pending = ''
-    sending = true
-    chain = chain
-      .then(async () => {
-        await send(false, chunk)
-        lastSentAt = Date.now()
-      })
-      .catch(err => {
-        failed = true
-        log('stream write threw:', err)
-      })
-      .finally(() => {
-        sending = false
-        // Anything written while that request was in flight goes next, spaced
-        // from it by the same interval — so a slow round trip degrades into
-        // "send the next batch when this one lands" instead of a queue that
-        // grows faster than it drains.
-        if (pending) scheduleFlush()
-      })
-  }
 
   return {
     get live() {
@@ -533,17 +481,13 @@ export function createStream(openid: string, replyTo?: string): StreamHandle {
     write(text: string) {
       if (!text || failed) return chain
       full += text
-      pending += text
-      scheduleFlush()
+      chain = chain.then(() => send(false, text)).catch(err => {
+        failed = true
+        log('stream write threw:', err)
+      })
       return chain
     },
     end() {
-      // Whatever is still waiting on the timer goes first, in order.
-      if (flushTimer) {
-        clearTimeout(flushTimer)
-        flushTimer = null
-      }
-      flushPending()
       chain = chain
         .then(async () => {
           // Nothing was ever sent, so there is no stream to close.
