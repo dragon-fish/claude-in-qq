@@ -845,7 +845,11 @@ class LineStreamer {
     // the line-by-line inspection below — and must not get it, or a trace that
     // quoted a MEDIA line would send the file.
     if (this.channel === 'trace') {
-      if (text.trim()) await this.writeThrough(text)
+      // A thinking summary quoting a fence would close the block it is inside
+      // and hand the rest of the turn to the markdown parser. The full-width
+      // backtick reads the same at a glance and parses as nothing. Fences the
+      // streamer writes itself bypass this and stay real.
+      if (text.trim()) await this.writeThrough(text.replaceAll('`', '｀'))
       return
     }
 
