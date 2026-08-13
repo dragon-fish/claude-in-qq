@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "defaultMode": "auto",
+    "allow": [
+      "mcp__qq__qq_reply"
+    ],
+    "ask": [
+      "Bash(rm *)",
+      "Bash(sudo *)",
+      "Bash(git push *)"
+    ]
+  }
+}
