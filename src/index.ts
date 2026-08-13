@@ -21,6 +21,7 @@ import {
   type AskLayout,
   closeGateway,
   connectGateway,
+  drainRelayed,
   dropExpiredPending,
   fetchImage,
   HAS_CREDENTIALS,
@@ -198,20 +199,39 @@ const xmlAttr = (v: string) => v.replace(/&/g, '&amp;').replace(/</g, '&lt;').re
  * person.
  */
 function withCommandLog(text: string): string {
-  if (!commandLog.length) return text
+  const relayed = drainRelayed()
+  if (!commandLog.length && !relayed.length) return text
 
-  const entries = commandLog.map(c => {
-    const at = new Date(c.at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
-    const attrs = `name="${xmlAttr(c.name)}"${c.args ? ` args="${xmlAttr(c.args)}"` : ''} time="${at}"`
-    return c.note ? `<command ${attrs}>\n${c.note}\n</command>` : `<command ${attrs} />`
-  })
-  const n = commandLog.length
-  commandLog.length = 0
+  const hhmm = (at: number) =>
+    new Date(at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+
+  const lines: string[] = []
+
+  if (commandLog.length) {
+    lines.push(
+      `操作者在此期间执行了 ${commandLog.length} 条斜杠指令。你看不到指令本身及其输出，以下是摘要：`,
+    )
+    for (const c of commandLog) {
+      const attrs = `name="${xmlAttr(c.name)}"${c.args ? ` args="${xmlAttr(c.args)}"` : ''} time="${hhmm(c.at)}"`
+      lines.push(c.note ? `<command ${attrs}>\n${c.note}\n</command>` : `<command ${attrs} />`)
+    }
+    commandLog.length = 0
+  }
+
+  if (relayed.length) {
+    lines.push(
+      `本机另有 ${relayed.length} 条消息借这条 QQ 通道发给了操作者。不是你发的，你也不知道操作者作何反应；` +
+        `若对方接下来提到你没印象的事，多半指的是这个：`,
+    )
+    for (const r of relayed) {
+      const attrs = `from="${xmlAttr(r.from)}"${r.cwd ? ` cwd="${xmlAttr(r.cwd)}"` : ''} time="${hhmm(r.at)}"`
+      lines.push(`<relayed ${attrs}>\n${r.text}\n</relayed>`)
+    }
+  }
 
   return [
     '<harness-reminder>',
-    `操作者在此期间执行了 ${n} 条斜杠指令。你看不到指令本身及其输出，以下是摘要：`,
-    ...entries,
+    ...lines,
     '</harness-reminder>',
     '',
     text,

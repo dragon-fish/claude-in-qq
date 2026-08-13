@@ -31,7 +31,7 @@ sleep 1
 # column, so a bun under a long home path shows up as "/Users/name" and never
 # matches. `pgrep -f` is no good either — it also matches any shell whose
 # command line merely mentions the path, including the one used to kill it.
-running=$(ps -axo pid=,args= | awk '$2 ~ /bun$/ && index($0, "src/bridge.ts") {print}')
+running=$(ps -axo pid=,args= | awk '$2 ~ /bun$/ && index($0, "src/index.ts") {print}')
 if [ -n "$running" ]; then
   echo "! 有手动启动的 bridge 在跑，先停掉它："
   echo "$running"

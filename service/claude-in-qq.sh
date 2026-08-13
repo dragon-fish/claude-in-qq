@@ -8,7 +8,7 @@
 # means every restart is also a size check.
 #
 # Everything else is exec'd away, so bun — not this shell — is the process
-# launchd supervises, and SIGTERM reaches the signal handlers in bridge.ts.
+# launchd supervises, and SIGTERM reaches the signal handlers in index.ts.
 
 set -eu
 
@@ -22,7 +22,7 @@ MAX_BYTES=5242880 # 5 MiB, one generation kept
 # The executable is read from `args` rather than `comm`, which macOS truncates —
 # a bun under a long home path shows up as "/Users/name" and never matches. This
 # script cannot match itself: its own argv[0] is /bin/sh.
-if ps -axo pid=,args= | awk '$2 ~ /bun$/ && index($0, "src/bridge.ts")' | grep -q .; then
+if ps -axo pid=,args= | awk '$2 ~ /bun$/ && index($0, "src/index.ts")' | grep -q .; then
   exit 0
 fi
 
@@ -44,4 +44,4 @@ rotate "$STATE_DIR/bridge.log"
 rotate "$STATE_DIR/launchd.log"
 
 cd "$ROOT"
-exec "$HOME/.bun/bin/bun" run src/bridge.ts
+exec "$HOME/.bun/bin/bun" run src/index.ts

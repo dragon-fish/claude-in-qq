@@ -6,7 +6,15 @@
  * wires it to the agent.
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -179,6 +187,46 @@ setInterval(() => {
 
 /** Newest inbound msg_id per sender, so mid-task pushes can still ride passive quota. */
 export const lastInboundMsgId = new Map<string, string>()
+
+// -------------------------------------------------------------- relayed notes
+//
+// `notify` runs as its own process and cannot reach the bridge's memory, so it
+// leaves a note on disk instead. The bridge folds it into the next message it
+// sends the agent, which is how the agent learns that a message it did not
+// write went out over its own channel — otherwise the operator refers back to
+// something the agent has no record of.
+
+const RELAY_FILE = join(STATE_DIR, 'relayed.jsonl')
+
+export type RelayedNote = { at: number; from: string; cwd: string; text: string }
+
+export function appendRelayed(note: RelayedNote): void {
+  mkdirSync(STATE_DIR, { recursive: true })
+  appendFileSync(RELAY_FILE, `${JSON.stringify(note)}\n`)
+}
+
+/** Read and clear pending notes. Renames first so a concurrent append is not lost. */
+export function drainRelayed(): RelayedNote[] {
+  if (!existsSync(RELAY_FILE)) return []
+  const taken = `${RELAY_FILE}.draining`
+  try {
+    renameSync(RELAY_FILE, taken)
+    const notes = readFileSync(taken, 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .flatMap(line => {
+        try {
+          return [JSON.parse(line) as RelayedNote]
+        } catch {
+          return []
+        }
+      })
+    unlinkSync(taken)
+    return notes
+  } catch {
+    return []
+  }
+}
 
 // ------------------------------------------------------------------- outbound
 

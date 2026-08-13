@@ -5,10 +5,11 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "start": "bun run src/bridge.ts",
+    "start": "bun run src/index.ts",
     "onboard": "bun run src/onboard.ts",
     "pair": "bun run src/pair.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "notify": "bun run src/notify.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.229",
