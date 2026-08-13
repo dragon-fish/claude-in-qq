@@ -22,7 +22,8 @@ CLAUDE.md、skills、MCP，跑在真实的文件系统上。需要审批的工�
   链接、表格
 - **审批**：工具调用弹按钮，点「允许」或「拒绝」。默认 `auto` 模式，只有模型判定有风险的操作才问
 - **提问**：Claude 需要你拿主意时会推一组按钮出来，等同于 TUI 里的 AskUserQuestion
-- **斜杠指令**：`/help` `/stop` `/clear` `/context` `/model` `/mode` `/resume` `/cwd` `/status`
+- **斜杠指令**：`/help` `/stop` `/clear` `/context` `/model` `/mode` `/resume` `/cwd` `/status`。
+  跑一次 `bun run panel` 就把它们注册进 QQ 的指令面板，在聊天里点「/」直接选，不用记
 - **图片进出**：发图给它看；它用 `MEDIA:/绝对路径` 把文件（截图、报表、日志）发回来。一条消息只能带
   一个附件，所以多个文件它会打包成 zip——手机 QQ 能直接预览 zip 里的图，不用解压
 - **不掉线**：会话 ID 落盘，重启机器后接着上次的上下文聊
@@ -54,6 +55,7 @@ src/index.ts ──── Claude Agent SDK ──── Claude Code（订阅额�
 | `src/commands.ts` | 斜杠指令注册表                                  |
 | `src/notify.ts`   | 单向通知入口，不经过主进程                      |
 | `src/onboard.ts`  | 扫码配置                                        |
+| `src/panel.ts`    | 把斜杠指令注册进 QQ 指令面板                    |
 | `src/pair.ts`     | 白名单管理，只能在本机跑                        |
 | `service/`        | 常驻服务（macOS launchd）                       |
 
@@ -196,8 +198,10 @@ skills/install.sh --uninstall   # 卸
 
 ## 已知风险
 
-- **扫码用的 `/lite/create_bind_task` 和 `/lite/poll_bind_result` 不在腾讯公开文档里**，随时可能变。
-  变了就退回手工注册应用，把 `QQ_APP_ID` / `QQ_CLIENT_SECRET` 写进 `.env`，这条路径仍然可用
+- **扫码接入本身是官方给 agent 开的通道**（见[第三方 agent 接入](https://bot.q.qq.com/wiki/agent-qqbot/)），
+  但官方只公开了 SDK `@tencent-connect/qqbot-connector`，底下的 `/lite/create_bind_task` 和
+  `/lite/poll_bind_result` 仍未文档化——本项目直接调的是它们。哪天变了就退回手工注册应用，把
+  `QQ_APP_ID` / `QQ_CLIENT_SECRET` 写进 `.env`，这条路径一直可用
 - **两种配额，互不影响**：回复携带 `msg_id` 是被动消息，额度按**每条入站消息**计——你发一句，针对它
   一小时内可回 4 条，所以你主动说话总能收到回复。其余都是主动消息，1000 条/天，长任务的进度播报因此
   是节流的
