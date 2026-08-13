@@ -749,14 +749,24 @@ class LineStreamer {
       this.atLineStart = true
       await this.emit(rest, wasAtStart)
     }
-    await this.writeFence()
+    await this.writeFence(next === 'trace')
     this.channel = next
   }
 
-  /** Emit a ``` on its own line, adding the newline it needs to be one. */
-  private async writeFence(): Promise<void> {
-    await this.writeThrough(`${this.atStreamLineStart ? '' : '\n'}\`\`\`\n`)
+  /**
+   * Emit a fence on its own line, adding the newline it needs to be one.
+   *
+   * The opening one is tagged `text`: left untagged, QQ guesses a language and
+   * syntax-highlights a paragraph of prose — `if` and `while` come out purple,
+   * and one apostrophe turns the rest of the thought into an unterminated
+   * string. A language that has no keywords renders it as what it is.
+   */
+  private async writeFence(open: boolean): Promise<void> {
+    const lead = this.atStreamLineStart ? '' : '\n'
+    await this.writeThrough(`${lead}\`\`\`${open ? LineStreamer.TRACE_LANG : ''}\n`)
   }
+
+  private static readonly TRACE_LANG = 'text'
 
   /**
    * A growing message has a maximum size. When QQ says this one is nearly
@@ -779,7 +789,7 @@ class LineStreamer {
     if (this.channel !== 'trace') return
     const next = this.open()
     this.stream = next
-    if (!next.failed) await next.write('```\n')
+    if (!next.failed) await next.write(`\`\`\`${LineStreamer.TRACE_LANG}\n`)
   }
 
   private static readonly CHUNK = 12
@@ -808,7 +818,7 @@ class LineStreamer {
     // an answer — would otherwise leave the fence open and swallow whatever the
     // next message renders beneath it.
     if (this.channel === 'trace') {
-      await this.writeFence()
+      await this.writeFence(false)
       this.channel = 'prose'
     }
     await this.stream?.end()
@@ -846,10 +856,16 @@ class LineStreamer {
     // quoted a MEDIA line would send the file.
     if (this.channel === 'trace') {
       // A thinking summary quoting a fence would close the block it is inside
-      // and hand the rest of the turn to the markdown parser. The full-width
-      // backtick reads the same at a glance and parses as nothing. Fences the
-      // streamer writes itself bypass this and stay real.
-      if (text.trim()) await this.writeThrough(text.replaceAll('`', '｀'))
+      // and hand the rest of the turn to the markdown parser — and a fence is
+      // a line-level rule, so a backslash in front of it changes nothing.
+      //
+      // Only a run of them is dangerous, and only the run has to break: a lone
+      // backtick inside a fence is already literal. Keeping the first one and
+      // widening the rest leaves `foo` untouched and ``` unable to close
+      // anything. Fences the streamer writes itself bypass this and stay real.
+      if (text.trim()) {
+        await this.writeThrough(text.replace(/`{2,}/g, m => `\`${'｀'.repeat(m.length - 1)}`))
+      }
       return
     }
 
