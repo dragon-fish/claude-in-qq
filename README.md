@@ -1,9 +1,9 @@
-# claude-in-qq
+# Claude in QQ
 
 把 QQ 私聊变成 Claude Code 的遥控器。手机上发一句话，本机的 Claude Code 就开始干活——用你真实的
 CLAUDE.md、skills、MCP，跑在真实的文件系统上。需要审批的工具调用变成 QQ 里的按钮，点一下放行。
 
-不是聊天机器人，也不是借 CC 订阅跑别的 agent。是 Claude Code 本身，换了个前端。
+不是聊天机器人，也不是借 CC 订阅跑别的 agent。基于 QQ 官方 bot 平台。
 
 ## 能做什么
 
@@ -34,24 +34,59 @@ src/index.ts ──── Claude Agent SDK ──── Claude Code（订阅额�
 关键在于 SDK **拥有**这个会话，而不是往别人的会话里推消息。所以常驻、审批中继、斜杠指令都只是普通
 函数调用，不需要一个开着的终端。
 
-| 文件 | 职责 |
-| --- | --- |
-| `src/index.ts` | 主循环：消息进 SDK、事件出 QQ、审批与提问的中继 |
-| `src/qq.ts` | 协议层，只认 QQ 不认 Claude |
-| `src/commands.ts` | 斜杠指令注册表 |
-| `src/notify.ts` | 单向通知入口，不经过主进程 |
-| `src/onboard.ts` | 扫码配置 |
-| `src/pair.ts` | 白名单管理，只能在本机跑 |
-| `service/` | launchd 常驻 |
+
+| 文件              | 职责                                            |
+| ------------------- | ------------------------------------------------- |
+| `src/index.ts`    | 主循环：消息进 SDK、事件出 QQ、审批与提问的中继 |
+| `src/qq.ts`       | 协议层，只认 QQ 不认 Claude                     |
+| `src/commands.ts` | 斜杠指令注册表                                  |
+| `src/notify.ts`   | 单向通知入口，不经过主进程                      |
+| `src/onboard.ts`  | 扫码配置                                        |
+| `src/pair.ts`     | 白名单管理，只能在本机跑                        |
+| `service/`        | launchd 常驻                                    |
 
 ## 上手
 
+> 这一节写给可能替人安装的 agent。装它是一串确定的命令，但**其中两步只能由人完成**——扫码要拿手机，
+> 授权要有人在键盘前——遇到时请停下来交给用户，不要试图绕过。
+
+**前置条件**（缺哪个先解决哪个，不要边装边猜）：
+
+| 要求 | 检查 | 缺了会怎样 |
+| --- | --- | --- |
+| macOS | `uname` 得是 `Darwin` | 服务那步用的是 launchd，Linux 需自行改写为 systemd |
+| bun | `bun --version` | 全部脚本都靠它跑 |
+| Claude Code 已登录 | `claude --version`，且能正常对话 | SDK 复用本机订阅凭据，没登录就没有额度 |
+| 网络能到 `api.anthropic.com` | 视所在地区可能需要代理 | 服务起得来但每次对话都失败 |
+
+### 1. 装依赖
+
 ```bash
 bun install
-bun run onboard          # 扫码，腾讯侧自动建应用并加好友
 ```
 
-扫码的人自动进白名单。之后再有人给 bot 发消息，只会拿到一个配对码，**必须有人在这台机器上批准**：
+### 2. 配置 bot 👤 需要用户
+
+```bash
+bun run onboard
+```
+
+它会打印一个 `q.qq.com` 的链接，以及同一链接的二维码。**这个链接必须在手机 QQ 里打开**，两种方式等价：
+
+- 用手机 QQ 扫终端里的二维码
+- 或者把链接**复制给用户**，让他在 QQ 里发给自己（发给「我的电脑」或任意好友都行），再点开
+
+后一种对 agent 更实用：终端二维码在手机上、在 App 界面里往往扫不了，而链接是纯文本，怎么都能传。
+非交互式运行时 `onboard` 干脆只打印一行 `CONNECT_URL: ...`，把它原样交给用户即可。
+
+用户在手机上确认后，腾讯侧会自动创建 bot 应用、下发凭据、并把 bot 加为好友。凭据落在
+`~/.claude/channels/qq/.env`（600）。
+
+打开链接的那个 QQ 号自动进白名单，所以正常情况下**用户点完就已经可以聊天了**，不需要再走第 3 步。
+
+### 3. 给别人授权（可选）👤 需要用户
+
+之后再有人给 bot 发消息，只会拿到一个配对码，必须有人在这台机器上批准：
 
 ```bash
 bun run pair             # 看白名单和待配对
@@ -59,21 +94,37 @@ bun run pair <code>      # 批准
 ```
 
 这条路径故意不走 QQ：白名单成员同时拥有批准工具调用的权限，让一条聊天消息就能授权，白名单就形同虚设。
+**agent 不应替用户做这个决定**——这是在授予某人操作这台电脑的权力。
 
-装成常驻服务：
+### 4. 装成常驻服务
 
 ```bash
-service/install.sh       # 从交互式 shell 跑，它要读你真实的 PATH 和代理
+service/install.sh
 ```
 
-plist 由脚本现场生成，不进仓库——一份能用的 plist 必然带着这台机器的绝对路径、PATH 和可能含内网域名的
-`no_proxy`。
+**必须从交互式 shell 跑**：它要读用户真实的 `PATH` 和代理设置，写进 plist——launchd 不读任何 shell
+配置文件，这些变量不显式传就没有。plist 由脚本现场生成而不进仓库，因为一份能用的 plist 必然带着这台
+机器的绝对路径和可能含内网域名的 `no_proxy`。
+
+装完确认它真的起来了：
 
 ```bash
-launchctl kickstart -k gui/$UID/local.claude-in-qq    # 重启
+launchctl print gui/$UID/local.claude-in-qq | grep -E 'state|runs'
+```
+
+日常操作：
+
+```bash
+launchctl kickstart -k gui/$UID/local.claude-in-qq    # 重启（改完代码用这个）
 launchctl bootout   gui/$UID/local.claude-in-qq       # 停止并卸载
 tail -f ~/.claude/channels/qq/bridge.log              # 日志
 ```
+
+### 装完怎么验
+
+让用户在 QQ 私聊里给 bot 发一句话，看是否有回复。日志里出现 `gateway connected` 和 `ready` 才算通。
+
+如果 QQ 显示 bot 离线：在线状态就是本进程的网关连接，进程没起来它就是离线。先看日志。
 
 ## 捎话
 

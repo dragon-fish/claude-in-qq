@@ -4,3 +4,7 @@ node_modules/
 .DS_Store
 service/*.plist
 *.tsbuildinfo
+
+# build artifacts
+claude-in-qq
+claude-in-qq-*
