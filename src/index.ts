@@ -21,6 +21,8 @@ import {
   type AskLayout,
   closeGateway,
   connectGateway,
+  createStream,
+  type StreamHandle,
   drainRelayed,
   dropExpiredPending,
   fetchImage,
@@ -79,10 +81,13 @@ Write for a phone: lead with the outcome and keep it to a few lines. Long
 replies are split across several QQ messages, which is unpleasant to read.
 
 To hand over a file — a screenshot, a chart, a log, anything they should have
-rather than read a description of — put a line of exactly MEDIA:/absolute/path
-in your reply. It is sent as a native QQ attachment and the line itself is
-removed, so write the sentence around it as if the file were already attached.
-Images they send you arrive as images; you can look at them directly.
+rather than read a description of — put MEDIA:/absolute/path on a line of its
+own, starting at column zero with nothing before or after it. It is sent as a
+native QQ attachment and the line itself is removed, so write the sentence
+around it as if the file were already attached. Anything indented, or with text
+beside it, is left alone as ordinary writing — which is how you quote this
+format when explaining it rather than using it. Images they send you arrive as
+images; you can look at them directly.
 
 QQ allows one attachment per message, so every MEDIA line is another message
 and another buzz in their pocket. One or two files, send them as they are.
@@ -610,7 +615,7 @@ function commandDeps(user: string): CommandDeps {
 /** Above this, prose is its own message so it keeps markdown rendering. */
 const CAPTION_LIMIT = 200
 
-const MEDIA_LINE_RE = /^[ \t]*MEDIA:[ \t]*(\S.*)$/gm
+const MEDIA_LINE_RE = /^MEDIA:[ \t]*(\S.*?)[ \t]*$/gm
 
 /** Send a reply, pulling out any MEDIA: lines and uploading those files. */
 async function deliverReply(text: string): Promise<void> {
@@ -636,9 +641,136 @@ async function deliverReply(text: string): Promise<void> {
       await sendFile(user, path, replyTo, asCaption && i === 0 ? remaining : undefined)
       log(`sent file ${path}`)
     } catch (err) {
+      // Logged, not reported: the operator asked for a file, not for an
+      // explanation of why a line they never wrote did not work.
       log(`failed to send ${path}:`, err)
-      await sendToQQ(user, `发送 \`${path}\` 失败：${err}`, replyTo)
     }
+  }
+}
+
+/**
+ * Turns the token stream into whole lines, because a line is the smallest unit
+ * that can be judged.
+ *
+ * A MEDIA line has to be recognised before any of it is sent — once "MEDIA:/tmp"
+ * is on screen it cannot be taken back — and markdown that is split mid-token
+ * renders as literal asterisks until the closing one arrives. Whole lines avoid
+ * both, and read better than characters appearing one at a time.
+ */
+class LineStreamer {
+  private buffer = ''
+  private stream: StreamHandle | null = null
+  /** Text that missed the stream and has to go out as an ordinary message. */
+  private overflow = ''
+
+  constructor(
+    private readonly open: () => StreamHandle,
+    private readonly sendMedia: (path: string) => Promise<void>,
+    private readonly sendText: (text: string) => Promise<void>,
+  ) {}
+
+  /**
+   * Whether `buffer` starts at the beginning of a line, and so might still turn
+   * out to be a MEDIA line.
+   */
+  private atLineStart = true
+
+  async push(delta: string): Promise<void> {
+    this.buffer += delta
+
+    const cut = this.buffer.lastIndexOf('\n')
+    if (cut >= 0) {
+      const complete = this.buffer.slice(0, cut + 1)
+      this.buffer = this.buffer.slice(cut + 1)
+      const wasAtStart = this.atLineStart
+      this.atLineStart = true
+      await this.emit(complete, wasAtStart)
+    }
+
+    // Waiting for the newline is only ever about recognising a MEDIA line, and
+    // that is decided by the first few characters. Once the line cannot be one,
+    // release it in small pieces — otherwise a paragraph-long line sits invisible
+    // while a short one appears at once, and the reply arrives in lurches.
+    if (this.buffer.length >= LineStreamer.CHUNK && !this.mightBeMedia()) {
+      const chunk = this.buffer
+      this.buffer = ''
+      this.atLineStart = false
+      await this.emit(chunk, false)
+    }
+  }
+
+  private static readonly CHUNK = 12
+  private static readonly MEDIA_PREFIX = 'MEDIA:'
+
+  /** True while the partial line could still grow into `MEDIA:...`. */
+  private mightBeMedia(): boolean {
+    if (!this.atLineStart) return false
+    const t = this.buffer
+    if (!t) return true
+    return (
+      t.startsWith(LineStreamer.MEDIA_PREFIX) ||
+      LineStreamer.MEDIA_PREFIX.startsWith(t.slice(0, LineStreamer.MEDIA_PREFIX.length))
+    )
+  }
+
+  /** Flush the trailing partial line, close the stream, and post any overflow. */
+  async finish(): Promise<void> {
+    if (this.buffer) {
+      const rest = this.buffer
+      const wasAtStart = this.atLineStart
+      this.buffer = ''
+      await this.emit(rest, wasAtStart)
+    }
+    await this.stream?.end()
+    this.stream = null
+    if (this.overflow.trim()) {
+      const rest = this.overflow
+      this.overflow = ''
+      await this.sendText(rest.trim())
+    }
+  }
+
+  private async emit(text: string, firstLineIsStart: boolean): Promise<void> {
+    let prose = ''
+    // Only a real line start can be a MEDIA line. A fragment released mid-line
+    // has already been ruled out, and re-testing it would let text that merely
+    // begins with "MEDIA:" after a break be mistaken for one.
+    let lineStart = firstLineIsStart
+    const flush = async () => {
+      const chunk = prose
+      prose = ''
+      if (!chunk.trim()) return
+      this.stream ??= this.open()
+      if (this.stream.failed) {
+        // Out of passive quota, or QQ refused. Hold it back rather than drop it;
+        // finish() posts it as a normal message so nothing is lost and nothing
+        // already on screen gets repeated.
+        this.overflow += chunk
+        return
+      }
+      await this.stream.write(chunk)
+    }
+
+    // Keeping the newline with its line, so a split never loses one.
+    for (const line of text.split(/(?<=\n)/)) {
+      const media = lineStart
+        ? /^MEDIA:[ \t]*(\S.*?)[ \t]*$/.exec(line.replace(/\n$/, ''))
+        : null
+      lineStart = line.endsWith('\n')
+      if (!media) {
+        prose += line
+        continue
+      }
+      // A file interrupts the stream: the text before it is finished and sent,
+      // the attachment goes out, and what follows starts a new one. That is what
+      // puts the picture where the writing referred to it, instead of stacking
+      // every image after the prose has ended.
+      await flush()
+      await this.stream?.end()
+      this.stream = null
+      await this.sendMedia(media[1])
+    }
+    await flush()
   }
 }
 
@@ -664,6 +796,9 @@ async function runSession(): Promise<void> {
       // terminal. Left enabled it renders into the void and comes back
       // unanswered. mcp__qq__qq_ask is its replacement.
       disallowedTools: ['AskUserQuestion'],
+      // Needed for streamed replies: without it the SDK only reports finished
+      // assistant messages, and there is nothing to stream.
+      includePartialMessages: true,
       canUseTool: async (toolName: string, input: Record<string, unknown>) => {
         // This bridge's own tools only talk to the operator — they touch no
         // files, run no commands, and reach nothing outside the chat. Gating
@@ -684,6 +819,47 @@ async function runSession(): Promise<void> {
 
   let lastProgressAt = 0
   const pendingTools: string[] = []
+  let streamer: LineStreamer | null = null
+
+  /**
+   * Close the open stream. Returns whether the reply was already delivered —
+   * once a streamer exists it owns the whole reply, falling back to ordinary
+   * messages internally, so the finished assistant message must not be sent
+   * again on top of it.
+   */
+  async function closeStreamer(): Promise<boolean> {
+    if (!streamer) return false
+    const s = streamer
+    streamer = null
+    try {
+      await s.finish()
+    } catch (err) {
+      log('failed to close stream:', err)
+    }
+    return true
+  }
+
+  function newStreamer(): LineStreamer {
+    return new LineStreamer(
+      () => {
+        const user = requireUser()
+        return createStream(user, lastInboundMsgId.get(user))
+      },
+      async path => {
+        try {
+          const user = requireUser()
+          await sendFile(user, path, lastInboundMsgId.get(user))
+          log(`sent file ${path}`)
+        } catch (err) {
+          log(`failed to send ${path}:`, err)
+        }
+      },
+      async text => {
+        const user = requireUser()
+        await sendToQQ(user, text, lastInboundMsgId.get(user))
+      },
+    )
+  }
 
   for await (const message of q as any) {
     const m = message as any
@@ -692,9 +868,24 @@ async function runSession(): Promise<void> {
       // Persist immediately: a crash before the first reply should still leave
       // a resumable session behind.
       if (m.session_id) saveSessionId(m.session_id)
+    } else if (m.type === 'stream_event') {
+      const ev = m.event
+      if (ev?.type === 'content_block_delta' && ev.delta?.type === 'text_delta') {
+        streamer ??= newStreamer()
+        try {
+          await streamer.push(ev.delta.text)
+        } catch (err) {
+          log('stream push failed:', err)
+        }
+      }
     } else if (m.type === 'assistant') {
+      // The finished message arrives after its deltas. If the stream carried it,
+      // there is nothing left to send; if it never got off the ground, this is
+      // where the whole text goes out the old way.
+      const streamed = await closeStreamer()
       for (const block of m.message?.content ?? []) {
         if (block.type === 'text' && block.text.trim()) {
+          if (streamed) continue
           try {
             await deliverReply(block.text.trim())
           } catch (err) {
@@ -719,6 +910,9 @@ async function runSession(): Promise<void> {
         }
       }
     } else if (m.type === 'result') {
+      // A turn can end without a final assistant message (interrupt, error), so
+      // the stream is closed here too rather than left hanging half-written.
+      await closeStreamer()
       pendingTools.length = 0
       lastProgressAt = 0
       log(`turn finished: ${m.subtype}, turns=${m.num_turns}`)

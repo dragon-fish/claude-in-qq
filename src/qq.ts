@@ -299,6 +299,113 @@ export async function sendToQQ(
   }
 }
 
+// ------------------------------------------------------------------ streaming
+//
+// A streamed reply is one QQ message that keeps growing, rather than a series of
+// messages. That matters for more than looks: a long answer used to be chopped
+// into 1500-character posts, each spending one of the four passive replies an
+// inbound message is worth. Streamed, the whole answer costs one.
+//
+// The protocol is a handshake then appends: the first POST carries msg_id and
+// index 0 and comes back with an id; every later POST quotes that id and
+// increments index; input_state 10 closes it. `input_mode` defaults to append,
+// so each call sends only what is new.
+
+export type StreamHandle = {
+  /** Append text. Silently becomes a no-op once the stream has failed. */
+  write(text: string): Promise<void>
+  /** Close the stream. Safe to call when nothing was ever written. */
+  end(): Promise<void>
+  /** True once QQ has accepted a first chunk — i.e. the reply is on screen. */
+  readonly live: boolean
+  /** True if QQ rejected something; the caller should fall back to sendToQQ. */
+  readonly failed: boolean
+}
+
+export function createStream(openid: string, replyTo?: string): StreamHandle {
+  let streamId: string | null = null
+  let index = 0
+  let full = ''
+  /** Serializes the appends: QQ orders by `index`, so they must not interleave. */
+  let chain: Promise<void> = Promise.resolve()
+
+  // Every chunk repeats the same msg_id and msg_seq — the reference request in
+  // the docs does, and dropping msg_id after the first chunk earns a 500. That
+  // also means streaming is only ever a *reply*: with no inbound message to
+  // answer, there is nothing to open a stream against, so this reports failure
+  // immediately and the caller sends the ordinary way.
+  const passiveId = claimPassive(replyTo)
+  const seq = msgSeq++
+  let failed = !passiveId
+
+  async function send(closing: boolean, delta: string): Promise<void> {
+    if (failed) return
+    // Append while generating, replace once at the end.
+    //
+    // Replacing every time would resend the whole reply with every line — the
+    // traffic grows with the square of the length, and the requests get slower
+    // exactly as the answer gets longer. Appending sends each line once.
+    //
+    // The closing replace is a reconciliation: it states the finished text in
+    // full, so what ended up on the screen is checked against what was meant.
+    // A mismatch surfaces as 40007 rather than as a reply quietly missing a
+    // paragraph. It cannot repair a lost chunk — replace demands that the new
+    // text begin with what was already delivered — but it does make the loss
+    // visible in the log.
+    const res = await qqFetch(`/v2/users/${openid}/stream_messages`, {
+      method: 'POST',
+      body: JSON.stringify({
+        input_mode: closing ? 'replace' : 'append',
+        input_state: closing ? 10 : 1,
+        index: index++,
+        content_type: 'markdown',
+        content_raw: closing ? full : delta,
+        msg_id: passiveId,
+        msg_seq: seq,
+        ...(streamId ? { stream_msg_id: streamId } : {}),
+      }),
+    })
+    if (!res.ok) {
+      failed = true
+      log(`stream ${streamId ? 'append' : 'open'} failed [${res.status}]:`, (await res.text()).slice(0, 200))
+      return
+    }
+    const data = (await res.json()) as { id?: string; remain_msg_len?: number }
+    if (!streamId && data.id) streamId = data.id
+  }
+
+  return {
+    get live() {
+      return streamId !== null && !failed
+    },
+    get failed() {
+      return failed
+    },
+    write(text: string) {
+      if (!text || failed) return chain
+      full += text
+      chain = chain.then(() => send(false, text)).catch(err => {
+        failed = true
+        log('stream write threw:', err)
+      })
+      return chain
+    },
+    end() {
+      chain = chain
+        .then(async () => {
+          // Nothing was ever sent, so there is no stream to close.
+          if (!streamId || failed) return
+          await send(true, '')
+        })
+        .catch(err => {
+          failed = true
+          log('stream end threw:', err)
+        })
+      return chain
+    },
+  }
+}
+
 // --------------------------------------------------------------- command panel
 //
 // The panel is what QQ shows when the operator taps the "/" affordance. Tapping
