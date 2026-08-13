@@ -15,6 +15,9 @@ import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
+/** How much meaning the buttons carry on their own; see buildAskKeyboard. */
+export type AskMode = 'text' | 'truncated' | 'letters'
+
 export type CommandDeps = {
   /** Send a message to the operator. */
   reply(text: string): Promise<void>
@@ -25,7 +28,7 @@ export type CommandDeps = {
    * `renderBody` is called with whether the buttons degraded to letters, so a
    * caller can add a table only when the buttons no longer carry the meaning.
    */
-  askChoice(options: string[], renderBody: (useLetters: boolean) => string): Promise<number>
+  askChoice(options: string[], renderBody: (mode: AskMode) => string): Promise<number>
   /** The live query, or null before the first message starts a session. */
   query(): any | null
   workdir(): string
@@ -181,13 +184,13 @@ register(
       }
 
       const labels = models.map(m => m.displayName || m.value)
-      const idx = await deps.askChoice(labels, useLetters => {
+      const idx = await deps.askChoice(labels, mode => {
         const lines = ['**可用模型**', '']
-        if (useLetters) {
+        // The table only earns its place when the buttons stop being readable.
+        if (mode !== 'text') {
+          const label = mode === 'letters' ? (i: number) => 'ABCDEFGH'[i] : (i: number) => labels[i]
           lines.push('| | 模型 | 说明 |', '| --- | --- | --- |')
-          models.forEach((m, i) =>
-            lines.push(`| ${'ABCDEFGH'[i]} | ${cell(labels[i], 20)} | ${cell(m.description)} |`),
-          )
+          models.forEach((m, i) => lines.push(`| ${label(i)} | ${cell(labels[i], 20)} | ${cell(m.description)} |`))
           lines.push('')
         }
         lines.push('点按钮切换，或 `/model default` 恢复默认')
@@ -235,12 +238,14 @@ register(
       const title = (s: any) => cell(s.customTitle ?? s.summary ?? '(无标题)')
       const labels = sessions.map(s => `${when(s)} ${title(s)}`.slice(0, 60))
 
-      const idx = await deps.askChoice(labels, useLetters => {
-        // When labels fit on the buttons, a table would just repeat them.
+      const idx = await deps.askChoice(labels, mode => {
+        // When the labels fit on the buttons, a table would just repeat them.
         const lines = ['**最近的会话**', '']
-        if (useLetters) {
+        if (mode !== 'text') {
           lines.push('| | 时间 | 摘要 |', '| --- | --- | --- |')
-          sessions.forEach((s, i) => lines.push(`| ${'ABCDEFGH'[i]} | ${when(s)} | ${title(s)} |`))
+          sessions.forEach((s, i) =>
+            lines.push(`| ${mode === 'letters' ? 'ABCDEFGH'[i] : '·'} | ${when(s)} | ${title(s)} |`),
+          )
           lines.push('')
         }
         lines.push('点按钮恢复到那个会话')

@@ -12,12 +12,13 @@
 
 import { createSdkMcpServer, query, tool } from '@anthropic-ai/claude-agent-sdk'
 import { z } from 'zod'
-import { dispatch, type CommandDeps } from './commands.ts'
+import { dispatch, type CommandDeps } from './commands.js'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   buildApprovalKeyboard,
   buildAskKeyboard,
+  type AskLayout,
   closeGateway,
   connectGateway,
   dropExpiredPending,
@@ -221,13 +222,16 @@ const qqTools = createSdkMcpServer({
       async ({ question, options }) => {
         const user = requireUser()
         const id = randomId()
-        const { keyboard, useLetters } = buildAskKeyboard(id, options)
+        const { keyboard, mode } = buildAskKeyboard(id, options)
 
         const lines = [`**${question}**`, '']
-        if (useLetters) {
-          // Buttons only carry the letter at this length, so the text must
-          // carry the meaning or the choice is unreadable on a phone.
+        if (mode === 'letters') {
+          // Buttons carry only a letter, so the list has to carry the meaning.
           options.forEach((opt, i) => lines.push(`${LETTERS[i]}：${opt}`))
+          lines.push('')
+        } else if (mode === 'truncated') {
+          // Buttons are recognisable but clipped; show the full text once.
+          options.forEach(opt => lines.push(`· ${opt}`))
           lines.push('')
         }
         lines.push('点按钮选择，或直接打字回答')
@@ -379,13 +383,13 @@ let activeQuery: any = null
  */
 async function askChoice(
   options: string[],
-  renderBody: (useLetters: boolean) => string,
+  renderBody: (mode: AskLayout['mode']) => string,
 ): Promise<number> {
   const user = requireUser()
   const id = randomId()
-  const { keyboard, useLetters } = buildAskKeyboard(id, options)
+  const { keyboard, mode } = buildAskKeyboard(id, options)
 
-  await sendToQQ(user, renderBody(useLetters), lastInboundMsgId.get(user), keyboard)
+  await sendToQQ(user, renderBody(mode), lastInboundMsgId.get(user), keyboard)
 
   const answer = await new Promise<string>(resolve => {
     const timer = setTimeout(() => {

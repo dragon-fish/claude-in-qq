@@ -287,21 +287,52 @@ export function buildApprovalKeyboard(requestId: string): Record<string, unknown
   )
 }
 
-export function buildAskKeyboard(
-  questionId: string,
-  options: string[],
-): { keyboard: Record<string, unknown>; useLetters: boolean } {
-  const longest = Math.max(...options.map(o => o.length))
-  const useLetters = longest > LABEL_CEILING
-  const perRow = useLetters ? Math.min(4, options.length) : longest <= 3 ? 4 : longest <= 8 ? 2 : 1
+export type AskLayout = {
+  keyboard: Record<string, unknown>
+  /**
+   * How much meaning the buttons carry by themselves:
+   *   'text'      — full option text is on the button; the message needs no list
+   *   'truncated' — shortened but still recognisable; list the full text
+   *   'letters'   — buttons say A/B/C; the list must carry the meaning
+   */
+  mode: 'text' | 'truncated' | 'letters'
+}
 
-  const specs = options.map((opt, i) => ({
-    label: useLetters ? LETTERS[i] : opt,
-    visited: useLetters ? `${LETTERS[i]} ✓` : `${opt} ✓`,
-    style: 1,
-    data: `ask:${questionId}:${i}`,
-  }))
-  return { keyboard: keyboardFrom(`ask:${questionId}`, specs, perRow), useLetters }
+function rowsFor(longest: number): number {
+  return longest <= 3 ? 4 : longest <= 8 ? 2 : 1
+}
+
+/**
+ * A button that reads "重写" is worth more than one that reads "B", so letters
+ * are the last resort rather than the response to any option being long. An
+ * option past the label ceiling is shortened first, and letters appear only
+ * when shortening makes two options indistinguishable.
+ */
+export function buildAskKeyboard(questionId: string, options: string[]): AskLayout {
+  const build = (labels: string[], perRow: number) =>
+    keyboardFrom(
+      `ask:${questionId}`,
+      labels.map((label, i) => ({
+        label,
+        visited: `${label} ✓`,
+        style: 1,
+        data: `ask:${questionId}:${i}`,
+      })),
+      perRow,
+    )
+
+  const longest = Math.max(...options.map(o => o.length))
+  if (longest <= LABEL_CEILING) {
+    return { keyboard: build(options, rowsFor(longest)), mode: 'text' }
+  }
+
+  const short = options.map(o => (o.length <= LABEL_CEILING ? o : `${o.slice(0, LABEL_CEILING - 1)}…`))
+  if (new Set(short).size === short.length) {
+    return { keyboard: build(short, rowsFor(Math.max(...short.map(s => s.length)))), mode: 'truncated' }
+  }
+
+  const letters = options.map((_, i) => LETTERS[i])
+  return { keyboard: build(letters, Math.min(4, options.length)), mode: 'letters' }
 }
 
 // -------------------------------------------------------------------- gateway

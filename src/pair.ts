@@ -12,7 +12,7 @@
  *   bun run pair remove <id>  revoke an openid
  */
 
-import { dropExpiredPending, loadAccess, saveAccess } from './qq.ts'
+import { dropExpiredPending, loadAccess, saveAccess } from './qq.js'
 
 const [, , ...args] = process.argv
 const cmd = (args[0] ?? '').trim()
