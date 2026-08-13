@@ -417,7 +417,17 @@ export function createStream(openid: string, replyTo?: string): StreamHandle {
     })
     if (!res.ok) {
       failed = true
-      log(`stream ${streamId ? 'append' : 'open'} failed [${res.status}]:`, (await res.text()).slice(0, 200))
+      // The length is the point of this line. QQ will not say how large a
+      // streamed message may grow — remain_msg_len is always 0 — and then
+      // answers 50001 once it has had enough. Recording how much was in it
+      // each time this happens is the only way to find the real ceiling and
+      // set STREAM_MAX_CHARS under it, so the stream rolls to a new message
+      // deliberately instead of being cut off and falling back to chunks.
+      log(
+        `stream ${streamId ? 'append' : 'open'} failed [${res.status}] at ${full.length} chars, ` +
+          `chunk ${index}:`,
+        (await res.text()).slice(0, 200),
+      )
       return
     }
     const data = (await res.json()) as { id?: string; remain_msg_len?: number }
