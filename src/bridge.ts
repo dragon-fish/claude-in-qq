@@ -22,6 +22,7 @@ import {
   closeGateway,
   connectGateway,
   dropExpiredPending,
+  fetchImage,
   HAS_CREDENTIALS,
   isAllowed,
   lastInboundMsgId,
@@ -31,6 +32,7 @@ import {
   PAIRING_TTL_MS,
   randomId,
   saveAccess,
+  sendFile,
   sendToQQ,
   STATE_DIR,
   type InboundMessage,
@@ -69,6 +71,12 @@ own message rendered.
 Write for a phone: lead with the outcome and keep it to a few lines. Long
 replies are split across several QQ messages, which is unpleasant to read.
 
+To hand over a file — a screenshot, a chart, a log, anything they should have
+rather than read a description of — put a line of exactly MEDIA:/absolute/path
+in your reply. It is sent as a native QQ attachment and the line itself is
+removed, so write the sentence around it as if the file were already attached.
+Images they send you arrive as images; you can look at them directly.
+
 To ask them something, call mcp__qq__qq_ask with your question and 2-8 short
 options. It renders as tappable buttons and blocks until they answer, and they
 can also reply in their own words. Use it for a real fork — an ambiguous
@@ -96,9 +104,14 @@ function requireUser(): string {
 // query() consumes an AsyncIterable, so inbound QQ messages are pushed into
 // this queue and pulled by the SDK as the conversation advances.
 
+/** A text block or an inline image, the two shapes an inbound QQ message takes. */
+type ContentBlock =
+  | { type: 'text'; text: string }
+  | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } }
+
 type SDKUserMessage = {
   type: 'user'
-  message: { role: 'user'; content: string }
+  message: { role: 'user'; content: string | ContentBlock[] }
   parent_tool_use_id: null
   session_id?: string
 }
@@ -107,10 +120,10 @@ class MessageQueue implements AsyncIterable<SDKUserMessage> {
   private waiting: ((m: SDKUserMessage) => void)[] = []
   private buffered: SDKUserMessage[] = []
 
-  push(text: string): void {
+  push(content: string | ContentBlock[]): void {
     const msg: SDKUserMessage = {
       type: 'user',
-      message: { role: 'user', content: text },
+      message: { role: 'user', content },
       parent_tool_use_id: null,
     }
     const next = this.waiting.shift()
@@ -306,12 +319,37 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
     return
   }
 
-  const parts = [msg.content]
+  // Images are fetched and inlined: a CDN link is something Claude cannot see,
+  // and QQ's links expire. Anything that is not an image still goes as a URL,
+  // which is all a non-image attachment can usefully be.
+  const blocks: ContentBlock[] = []
+  const notes: string[] = []
+
   for (const att of msg.attachments) {
     if (!att.url) continue
-    parts.push(`[${att.content_type?.includes('image') ? '图片' : '文件'}] ${att.url}`)
+    const isImage = att.content_type?.includes('image') || /\.(jpe?g|png|gif|webp)$/i.test(att.url)
+    if (!isImage) {
+      notes.push(`[文件] ${att.filename ?? ''} ${att.url}`.trim())
+      continue
+    }
+    const image = await fetchImage(att.url, att.content_type)
+    if (image) {
+      blocks.push({
+        type: 'image',
+        source: { type: 'base64', media_type: image.mediaType, data: image.data },
+      })
+    } else {
+      notes.push(`[图片下载失败] ${att.url}`)
+    }
   }
-  queue.push(parts.join('\n'))
+
+  const text = [msg.content, ...notes].filter(Boolean).join('\n')
+  if (blocks.length) {
+    // Image first, then the words about it — the order the person sent them in.
+    queue.push([...blocks, { type: 'text', text: text || '(图片)' }])
+  } else {
+    queue.push(text)
+  }
 }
 
 async function handleButton(openid: string, buttonData: string): Promise<void> {
@@ -427,6 +465,38 @@ function commandDeps(user: string): CommandDeps {
 
 // ------------------------------------------------------------------ main loop
 
+/**
+ * A line of exactly `MEDIA:/absolute/path` asks for that file to be sent as a
+ * native attachment. Claude has no way to hand over a file otherwise — it can
+ * describe a screenshot or a log, but not give it to you.
+ */
+const MEDIA_LINE_RE = /^[ \t]*MEDIA:[ \t]*(\S.*)$/gm
+
+/** Send a reply, pulling out any MEDIA: lines and uploading those files. */
+async function deliverReply(text: string): Promise<void> {
+  const user = requireUser()
+  const replyTo = lastInboundMsgId.get(user)
+
+  const paths: string[] = []
+  const prose = text.replace(MEDIA_LINE_RE, (_m, p: string) => {
+    paths.push(p.trim())
+    return ''
+  })
+
+  const remaining = prose.trim()
+  if (remaining) await sendToQQ(user, remaining, replyTo)
+
+  for (const path of paths) {
+    try {
+      await sendFile(user, path, replyTo)
+      log(`sent file ${path}`)
+    } catch (err) {
+      log(`failed to send ${path}:`, err)
+      await sendToQQ(user, `发送 \`${path}\` 失败：${err}`, replyTo)
+    }
+  }
+}
+
 /** Run one agent session until it ends. Returns when the query closes. */
 async function runSession(): Promise<void> {
   const resume = loadSessionId()
@@ -475,8 +545,7 @@ async function runSession(): Promise<void> {
       for (const block of m.message?.content ?? []) {
         if (block.type === 'text' && block.text.trim()) {
           try {
-            const user = requireUser()
-            await sendToQQ(user, block.text.trim(), lastInboundMsgId.get(user))
+            await deliverReply(block.text.trim())
           } catch (err) {
             log('failed to deliver reply:', err)
           }

@@ -335,6 +335,112 @@ export function buildAskKeyboard(questionId: string, options: string[]): AskLayo
   return { keyboard: build(letters, Math.min(4, options.length)), mode: 'letters' }
 }
 
+// --------------------------------------------------------------------- media
+
+/** Anthropic rejects images past ~5MB; fetching more than this is wasted work. */
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024
+
+const IMAGE_MEDIA_TYPES: Record<string, string> = {
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  png: 'image/png',
+  gif: 'image/gif',
+  webp: 'image/webp',
+}
+
+/**
+ * Fetch an inbound image and return it base64-encoded, or null when it cannot
+ * be used. QQ's CDN links are short-lived and unauthenticated to the model, so
+ * passing the URL through would leave Claude unable to see what was sent.
+ */
+export async function fetchImage(
+  url: string,
+  contentType?: string,
+): Promise<{ data: string; mediaType: string } | null> {
+  try {
+    const res = await fetch(url)
+    if (!res.ok) {
+      log(`image fetch failed [${res.status}]`)
+      return null
+    }
+
+    const buf = Buffer.from(await res.arrayBuffer())
+    if (buf.byteLength > MAX_IMAGE_BYTES) {
+      log(`image too large (${buf.byteLength} bytes), skipping`)
+      return null
+    }
+
+    // Trust the response header first, then the URL's extension; QQ often
+    // serves images from extensionless paths.
+    const header = (contentType ?? res.headers.get('content-type') ?? '').split(';')[0].trim()
+    const ext = new URL(url).pathname.split('.').pop()?.toLowerCase() ?? ''
+    const mediaType = header.startsWith('image/')
+      ? header
+      : (IMAGE_MEDIA_TYPES[ext] ?? 'image/jpeg')
+
+    return { data: buf.toString('base64'), mediaType }
+  } catch (err) {
+    log('image fetch error:', err)
+    return null
+  }
+}
+
+/** QQ media kinds for the upload endpoint. */
+const MEDIA_IMAGE = 1
+const MEDIA_VIDEO = 2
+const MEDIA_FILE = 4
+
+/** Uploads are capped well below the API limit; a huge file is a mistake, not a message. */
+const MAX_UPLOAD_BYTES = 30 * 1024 * 1024
+
+function mediaKind(path: string): number {
+  const ext = path.split('.').pop()?.toLowerCase() ?? ''
+  if (ext in IMAGE_MEDIA_TYPES) return MEDIA_IMAGE
+  if (['mp4', 'mov', 'avi', 'mkv'].includes(ext)) return MEDIA_VIDEO
+  return MEDIA_FILE
+}
+
+/**
+ * Send a local file as a native QQ attachment.
+ *
+ * Two steps rather than one: uploading with `srv_send_msg: true` would have QQ
+ * deliver it immediately, but then the message carries no msg_id and cannot use
+ * the passive quota. Uploading first and sending second keeps that control.
+ */
+export async function sendFile(openid: string, path: string, replyTo?: string): Promise<void> {
+  const buf = readFileSync(path)
+  if (buf.byteLength > MAX_UPLOAD_BYTES) {
+    throw new Error(`文件太大（${Math.round(buf.byteLength / 1024 / 1024)}MB）`)
+  }
+
+  const kind = mediaKind(path)
+  const body: Record<string, unknown> = {
+    file_type: kind,
+    srv_send_msg: false,
+    file_data: buf.toString('base64'),
+  }
+  if (kind === MEDIA_FILE) body.file_name = path.split('/').pop()
+
+  const upload = await qqFetch(`/v2/users/${openid}/files`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+  if (!upload.ok) throw new Error(`上传失败 ${upload.status}: ${(await upload.text()).slice(0, 200)}`)
+
+  const { file_info } = (await upload.json()) as { file_info?: string }
+  if (!file_info) throw new Error('上传响应里没有 file_info')
+
+  const passiveId = claimPassive(replyTo)
+  const send: Record<string, unknown> = { msg_type: 7, media: { file_info }, msg_seq: msgSeq++ }
+  if (passiveId) send.msg_id = passiveId
+
+  const res = await qqFetch(`/v2/users/${openid}/messages`, {
+    method: 'POST',
+    body: JSON.stringify(send),
+  })
+  if (!res.ok) throw new Error(`发送失败 ${res.status}: ${(await res.text()).slice(0, 200)}`)
+}
+
 // -------------------------------------------------------------------- gateway
 
 export type InboundMessage = {
