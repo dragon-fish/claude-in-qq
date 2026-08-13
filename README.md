@@ -54,7 +54,7 @@ src/index.ts ──── Claude Agent SDK ──── Claude Code（订阅额�
 | `src/notify.ts`   | 单向通知入口，不经过主进程                      |
 | `src/onboard.ts`  | 扫码配置                                        |
 | `src/pair.ts`     | 白名单管理，只能在本机跑                        |
-| `service/`        | launchd 常驻                                    |
+| `service/`        | 常驻服务（macOS launchd）                       |
 
 ## 上手
 
@@ -65,7 +65,6 @@ src/index.ts ──── Claude Agent SDK ──── Claude Code（订阅额�
 
 | 要求 | 检查 | 缺了会怎样 |
 | --- | --- | --- |
-| macOS | `uname` 得是 `Darwin` | 服务那步用的是 launchd，Linux 需自行改写为 systemd |
 | bun | `bun --version` | 全部脚本都靠它跑 |
 | Claude Code 已登录 | `claude --version`，且能正常对话 | SDK 复用本机订阅凭据，没登录就没有额度 |
 | 网络能到 `api.anthropic.com` | 视所在地区可能需要代理 | 服务起得来但每次对话都失败 |
@@ -109,6 +108,10 @@ bun run pair <code>      # 批准
 
 ### 4. 装成常驻服务
 
+不装也能用，但进程活在启动它的那个终端里，关掉就没了。
+
+作者用 macOS，所以仓库里带的是一份开箱即用的 launchd 脚本：
+
 ```bash
 service/install.sh
 ```
@@ -130,6 +133,22 @@ launchctl kickstart -k gui/$UID/local.claude-in-qq    # 重启（改完代码用
 launchctl bootout   gui/$UID/local.claude-in-qq       # 停止并卸载
 tail -f ~/.claude/channels/qq/bridge.log              # 日志
 ```
+
+#### 不是 macOS 的话
+
+没有现成脚本，但也不必照搬。读一遍 `service/install.sh` 和 `service/claude-in-qq.sh`——它们做的事
+很直白——然后按本机 init 系统的惯例重写一份（Linux 上大概是 systemd user unit 加
+`loginctl enable-linger`）。需要保证的是这几件事，它们跟平台无关：
+
+| 要保证 | 因为 |
+| --- | --- |
+| 开机自启、崩溃后重启 | 否则它只是个手动启动的进程，和不装服务没区别 |
+| 显式传 `PATH` | init 系统不读 shell 配置。少了它，Claude 在 QQ 里跑任何命令都是 command not found，而错误信息不会告诉你是 PATH 的问题 |
+| 显式传代理变量 | 同上。部分地区直连 `api.anthropic.com` 不通，而失败长得像登录问题 |
+| 只跑一个实例 | 两个进程会抢同一条 QQ 网关连接，消息落到最后重连成功的那个 |
+| 日志轮转 | 崩溃循环会把同一段栈写满磁盘 |
+
+启动脚本本身已经做了单例检查和日志轮转，所以移植时主要是换掉服务定义那一层。
 
 ### 装完怎么验
 
