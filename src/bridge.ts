@@ -136,6 +136,18 @@ class MessageQueue implements AsyncIterable<SDKUserMessage> {
     else this.buffered.push(msg)
   }
 
+  /**
+   * Abandon the waiters left behind by a closed session.
+   *
+   * `waiting` is shared across iterators, so a torn-down query leaves its
+   * resolve function at the head of the queue. The next message would be handed
+   * to that orphan — delivered into an iterator nobody reads — and silently
+   * lost. Buffered messages are kept: those have not been claimed by anyone.
+   */
+  detachWaiters(): void {
+    this.waiting.length = 0
+  }
+
   async *[Symbol.asyncIterator](): AsyncIterator<SDKUserMessage> {
     while (true) {
       const buffered = this.buffered.shift()
@@ -405,6 +417,7 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
   }
 
   const text = withCommandLog([msg.content, ...notes].filter(Boolean).join('\n'))
+  log(`inbound from ${msg.openid.slice(0, 8)}: ${msg.content.slice(0, 60)}${blocks.length ? ` (+${blocks.length} 图)` : ''}`)
   if (blocks.length) {
     // Image first, then the words about it — the order the person sent them in.
     queue.push([...blocks, { type: 'text', text: text || '(图片)' }])
@@ -597,6 +610,9 @@ async function deliverReply(text: string): Promise<void> {
 
 /** Run one agent session until it ends. Returns when the query closes. */
 async function runSession(): Promise<void> {
+  // The previous session's iterator may still be parked on this queue.
+  queue.detachWaiters()
+
   const resume = loadSessionId()
   log(resume ? `resuming session ${resume}` : 'starting a new session')
 
