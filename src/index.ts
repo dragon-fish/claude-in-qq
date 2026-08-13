@@ -428,6 +428,16 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
   currentUser = msg.openid
   lastInboundMsgId.set(msg.openid, msg.id)
 
+  // A stream is bound to the inbound message it replies to and cannot be moved
+  // to a newer one. Left open while the operator says something else, the reply
+  // goes on growing inside a message that now sits above their words — from
+  // their side, a message they already read is editing itself while they watch.
+  //
+  // Every inbound path gets this, not just the one that reaches the agent: a
+  // slash command is answered from here and never touches the queue, and its
+  // answer landing under a still-growing reply looks exactly as wrong.
+  await sealStream()
+
   // Commands outrank a pending prompt: an open question swallows arbitrary text
   // as its answer, so /stop would never reach anything if it were checked after.
   if (await dispatch(msg.content, commandDeps(msg.openid))) return
@@ -481,12 +491,6 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
   const text = withCommandLog([msg.content, ...notes].filter(Boolean).join('\n'))
   log(`inbound from ${msg.openid.slice(0, 8)}: ${msg.content.slice(0, 60)}${blocks.length ? ` (+${blocks.length} 图)` : ''}`)
 
-  // A stream is bound to the inbound message it replies to and cannot be
-  // moved to a newer one. Left open while the operator says something else,
-  // the reply keeps growing inside a message that now sits above their words —
-  // from their side, something they already read is editing itself. Sealing
-  // here means whatever the agent says next answers from below.
-  await sealStream()
   if (blocks.length) {
     // Image first, then the words about it — the order the person sent them in.
     queue.push([...blocks, { type: 'text', text: text || '(图片)' }])
@@ -1105,11 +1109,29 @@ async function runSession(): Promise<void> {
     try {
       streamer ??= newStreamer()
       await streamer.push(text, 'trace')
+      traceTail = text
     } catch (err) {
       // The trace is commentary. Losing a line of it must never take down the
       // turn that was busy producing the actual answer.
       log('trace push failed:', err)
     }
+  }
+
+  /** The last text written to the trace, so newlines are never doubled. */
+  let traceTail = ''
+  /** Whether the block already holds an entry. */
+  let traceStarted = false
+
+  /** End the previous entry cleanly and leave a blank line before the next. */
+  async function traceBreak(): Promise<void> {
+    if (!traceStarted) return
+    if (!traceTail.endsWith('\n')) await trace('\n')
+    await trace('\n')
+  }
+
+  /** Close the current entry's last line without opening a gap after it. */
+  async function traceEndLine(): Promise<void> {
+    if (traceStarted && !traceTail.endsWith('\n')) await trace('\n')
   }
 
   sealStream = closeStreamer
@@ -1157,12 +1179,18 @@ async function runSession(): Promise<void> {
       const ev = m.event
       if (ev?.type === 'content_block_start') {
         block = ev.content_block?.type ?? null
-        if (block === 'thinking' && showThinking) await trace('💭 ')
+        if (block === 'thinking' && showThinking) {
+          await traceBreak()
+          await trace('💭 ')
+          traceStarted = true
+        }
       } else if (ev?.type === 'content_block_delta') {
         const delta = ev.delta
         if (delta?.type === 'text_delta') {
           streamer ??= newStreamer()
           streamedText = true
+          // Prose closes the block; a later one starts its own entry list.
+          traceStarted = false
           try {
             await streamer.push(delta.text)
           } catch (err) {
@@ -1172,10 +1200,10 @@ async function runSession(): Promise<void> {
           await trace(delta.thinking)
         }
       } else if (ev?.type === 'content_block_stop') {
-        // A thinking summary carries no trailing newline of its own, and the
-        // trace only flushes whole lines — without this the last thought sits
-        // in the buffer until something else happens to end a line.
-        if (block === 'thinking' && showThinking) await trace('\n')
+        // A thinking summary may or may not end its own last line, and the
+        // trace only flushes whole lines — without this the last thought can
+        // sit in the buffer until something else happens to end one.
+        if (block === 'thinking' && showThinking) await traceEndLine()
         block = null
       }
     } else if (m.type === 'assistant') {
@@ -1196,7 +1224,11 @@ async function runSession(): Promise<void> {
         } else if (b.type === 'tool_use') {
           toolNames.set(b.id, b.name)
           const line = showTools ? summariseTool(b.name, b.input ?? {}) : null
-          if (line) await trace(`${line}\n`)
+          if (line) {
+            await traceBreak()
+            await trace(`${line}\n`)
+            traceStarted = true
+          }
         }
       }
       streamedText = false
@@ -1218,6 +1250,8 @@ async function runSession(): Promise<void> {
       await closeStreamer()
       block = null
       streamedText = false
+      traceStarted = false
+      traceTail = ''
       toolNames.clear()
       log(`turn finished: ${m.subtype}, turns=${m.num_turns}`)
     }
