@@ -1,15 +1,17 @@
 {
-  "name": "claude-channel-qq",
+  "name": "claude-qq-bridge",
   "version": "0.0.1",
-  "description": "QQ channel for Claude Code — drive your local session from QQ private chat, with remote tool approval.",
+  "description": "Drive Claude Code from QQ private chat — remote tool approval, session control, scan-to-configure.",
   "type": "module",
   "private": true,
   "scripts": {
-    "start": "bun run server.ts"
+    "start": "bun run src/bridge.ts",
+    "onboard": "bun run src/onboard.ts",
+    "pair": "bun run src/pair.ts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.229",
-    "@modelcontextprotocol/sdk": "^1.0.0",
     "qrcode": "^1.5.4",
     "zod": "^3.23.0"
   },

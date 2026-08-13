@@ -267,7 +267,7 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
     log(`pairing code ${code} issued for ${msg.openid}`)
     await sendToQQ(
       msg.openid,
-      `你还没有获得授权。\n配对码：${code}\n请在本机运行：bun run pair.ts ${code}\n（10 分钟内有效）`,
+      `你还没有获得授权。\n配对码：${code}\n请在本机运行：bun run pair ${code}\n（10 分钟内有效）`,
       msg.id,
     )
     return
