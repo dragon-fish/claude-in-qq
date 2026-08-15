@@ -128,12 +128,23 @@ export function randomId(len = 5): string {
 let accessToken = ''
 let tokenExpiresAt = 0
 
+/**
+ * No request to QQ may hang forever. A send is awaited inside the turn that
+ * produced it, so a socket that never answers freezes that turn, and every
+ * message queued behind it, until the session is rebuilt by hand.
+ */
+const REQUEST_TIMEOUT_MS = 30_000
+
+/** An upload carries megabytes of base64 and legitimately takes longer. */
+const UPLOAD_TIMEOUT_MS = 120_000
+
 async function ensureToken(): Promise<string> {
   if (accessToken && Date.now() < tokenExpiresAt - 60_000) return accessToken
   const res = await fetch(TOKEN_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ appId: APP_ID, clientSecret: CLIENT_SECRET }),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   })
   if (!res.ok) throw new Error(`token request failed: ${res.status} ${await res.text()}`)
   const data = (await res.json()) as { access_token?: string; expires_in?: number }
@@ -143,10 +154,15 @@ async function ensureToken(): Promise<string> {
   return accessToken
 }
 
-async function qqFetch(path: string, init: RequestInit = {}): Promise<Response> {
+async function qqFetch(
+  path: string,
+  init: RequestInit = {},
+  timeoutMs = REQUEST_TIMEOUT_MS,
+): Promise<Response> {
   const token = await ensureToken()
   return fetch(`${API_BASE}${path}`, {
     ...init,
+    signal: AbortSignal.timeout(timeoutMs),
     headers: {
       Authorization: `QQBot ${token}`,
       'Content-Type': 'application/json',
@@ -804,7 +820,7 @@ export async function fetchImage(
   contentType?: string,
 ): Promise<{ data: string; mediaType: string } | null> {
   try {
-    const res = await fetch(url)
+    const res = await fetch(url, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
     if (!res.ok) {
       log(`image fetch failed [${res.status}]`)
       return null
@@ -875,10 +891,11 @@ export async function sendFile(
   }
   if (kind === MEDIA_FILE) body.file_name = path.split('/').pop()
 
-  const upload = await qqFetch(`/v2/users/${openid}/files`, {
-    method: 'POST',
-    body: JSON.stringify(body),
-  })
+  const upload = await qqFetch(
+    `/v2/users/${openid}/files`,
+    { method: 'POST', body: JSON.stringify(body) },
+    UPLOAD_TIMEOUT_MS,
+  )
   if (!upload.ok) throw new Error(`上传失败 ${upload.status}: ${(await upload.text()).slice(0, 200)}`)
 
   const { file_info } = (await upload.json()) as { file_info?: string }
