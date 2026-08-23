@@ -204,32 +204,6 @@ register(
   },
 
   {
-    name: 'restart',
-    usage: '/restart [延迟毫秒]',
-    summary: '重启进程，加载改过的代码',
-    async run(arg, deps) {
-      const raw = arg.trim()
-      const delay = raw === '' ? 1500 : Number(raw)
-      if (!Number.isFinite(delay) || delay < 0) {
-        await deps.reply(`「${raw}」不是一个毫秒数。`)
-        return
-      }
-      // Written into the plist by service/install.sh. Absent means nobody is
-      // watching, and exiting is just exiting — say so rather than promising
-      // a return that will not happen.
-      const label = process.env.QQ_SERVICE_LABEL
-      await deps.reply(
-        label
-          ? `♻️ ${delay}ms 后退出，${label} 会把它拉回来，这个会话接着上。`
-          : `♻️ ${delay}ms 后退出。没有服务看着这个进程，它不会自己回来，得手动起。`,
-      )
-      // After the reply, so the delay is the message clearing the network
-      // rather than the reply racing the exit.
-      setTimeout(() => process.exit(0), delay)
-    },
-  },
-
-  {
     name: 'context',
     usage: '/context',
     summary: '查看上下文占用',

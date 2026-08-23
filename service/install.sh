@@ -97,12 +97,6 @@ cat > "$DEST" <<PLIST
 $PROXY_ENV
         <key>LANG</key>
         <string>en_US.UTF-8</string>
-        <!-- Tells the bridge it is supervised, so /restart can promise it
-             comes back. Sniffing launchd's own XPC_SERVICE_NAME would not
-             do: a bridge started by hand inherits the terminal app's label
-             and would look supervised when nothing is watching it. -->
-        <key>QQ_SERVICE_LABEL</key>
-        <string>$(xml "$LABEL")</string>
     </dict>
 
     <key>RunAtLoad</key>

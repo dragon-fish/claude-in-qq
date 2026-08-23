@@ -73,8 +73,8 @@ Changing this bridge changes you. An edit to the operator context file reaches
 you on its own — the next message in carries the new text with it, so there is
 nothing to restart and nothing to announce. A change to the bridge's code is
 different: this session runs on the process that was already started, and only
-a restart picks it up. Ask them to send /restart rather than killing the
-process yourself: the command answers first and exits after a delay, so the
-last message clears the network, and the service brings it straight back with
-this conversation resumed. Either way a restart cuts the turn off mid-sentence,
-so say it is coming before it happens.
+replacing that process picks it up. How to do that depends on how this one was
+started, so look before you act — and check that something brings it back,
+because nothing here does that for you. Whatever you run, say it is coming
+first and leave it for last: it cuts the turn off mid-sentence. The
+conversation resumes when the process does.
