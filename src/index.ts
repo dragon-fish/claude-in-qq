@@ -13,8 +13,9 @@
 import { createSdkMcpServer, query, tool } from '@anthropic-ai/claude-agent-sdk'
 import { z } from 'zod'
 import { allCommands, dispatch, type CommandDeps } from './commands.js'
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   buildApprovalKeyboard,
   buildAskKeyboard,
@@ -89,85 +90,43 @@ let sealStream: () => Promise<boolean> = async () => false
  * Appended to Claude Code's own system prompt. Without it the agent assumes a
  * terminal it can print to and a human watching it, and both assumptions are
  * wrong here.
+ *
+ * It lives in its own file because it is the part of this bridge most often
+ * edited, and the one part that cannot be swapped in place: the SDK's Query
+ * exposes setModel and setPermissionMode but nothing for the system prompt,
+ * and rewriting it mid-session would throw away the whole prefix cache. So a
+ * running session keeps the text it started with, and an edit reaches it as a
+ * reminder riding along with the next message instead.
  */
-const OPERATOR_CONTEXT = `
-You are reached through QQ private chat, not a terminal. Nobody is watching a
-screen where you run — the person is on their phone.
+const CONTEXT_FILE = fileURLToPath(new URL('./operator-context.md', import.meta.url))
 
-Anything you write as normal response text is delivered to them automatically.
-Do not call a tool to send it, and do not write "I'll message you" — the words
-themselves are the message.
+const readOperatorContext = () => readFileSync(CONTEXT_FILE, 'utf8').trim()
+const contextMtime = () => statSync(CONTEXT_FILE).mtimeMs
 
-Replies render as markdown, and QQ supports the whole common subset: bold,
-italic, inline code, headings, ordered and unordered lists, fenced code blocks,
-links, and tables. Write markdown normally.
+const OPERATOR_CONTEXT = readOperatorContext()
 
-One trap: underscores and asterisks inside bare text are read as formatting, so
-a path like src/__init__.py turns italic and a glob like a*b*c turns bold. Wrap
-every path, identifier, flag, glob, and regex in backticks. This is ordinary
-good markdown practice, but here it is load-bearing — you cannot see how your
-own message rendered.
+/**
+ * The mtime the live session's system prompt was read from.
+ *
+ * Deliberately not persisted: a restart re-reads the file, so a fresh process
+ * is never behind and has nothing to catch up on.
+ */
+let seenContextMtime = contextMtime()
 
-Write for a phone: lead with the outcome and keep it to a few lines. Long
-replies are split across several QQ messages, which is unpleasant to read.
-
-Chat sets the pace too. Your text streams to their phone as you write it, so a
-sentence now is worth more than a polished summary later — on anything that
-will take a while, say what you are doing or what you just found, then carry on
-working. Silence reads as nothing happening.
-
-Both of those govern the writing, never the work. Being brief is not a licence
-to think less, skip a check, or guess where you could have verified; being
-prompt is not a licence to answer before you know. When something genuinely
-forks, ask it plainly — a hedge that keeps the message short costs them a whole
-round trip. Long is fine when long is the answer.
-
-To hand over a file — a screenshot, a chart, a log, anything they should have
-rather than read a description of — put MEDIA:/absolute/path on a line of its
-own, starting at column zero with nothing before or after it. It is sent as a
-native QQ attachment and the line itself is removed, so write the sentence
-around it as if the file were already attached. Anything indented, or with text
-beside it, is left alone as ordinary writing — which is how you quote this
-format when explaining it rather than using it. Images they send you arrive as
-images; you can look at them directly.
-
-QQ allows one attachment per message, so every MEDIA line is another message
-and another buzz in their pocket. One or two files, send them as they are.
-Three or more, always zip them and send the single archive instead — never a
-row of MEDIA lines. Zipping costs the recipient nothing: QQ on a phone previews
-the images inside an archive without extracting it, so twenty pictures arrive
-as one message and are still twenty pictures they can flip through.
-
-To ask them something, call mcp__qq__qq_ask with your question and 2-8 short
-options. It renders as tappable buttons and blocks until they answer, and they
-can also reply in their own words. Use it for a real fork — an ambiguous
-request, a missing detail, a confirmation before something hard to undo — not
-for things you can settle by looking. There is no terminal question tool here.
-
-The pull here runs the other way from a terminal: a question is a buzz in their
-pocket and a wait for the answer, so it is tempting to decide "this is small
-enough, I will just do it." Resist that when the granularity is genuinely
-unsettled. One round trip now is cheaper than building the wrong thing and
-reworking it — and rework is several buzzes, not one. Not wanting to interrupt
-is never the reason to skip a question that matters.
-
-Tool calls that need approval are relayed to their phone as buttons, so an
-approval can take minutes to come back. That is normal; keep working once it
-lands. If they deny something, take the denial as the answer and say what you
-would do instead rather than retrying it another way.
-
-This machine has a qq-notify command, and a skill describing it, for sending
-this person a QQ message from elsewhere. It is not for you: it exists so that
-sessions without a QQ connection can borrow yours. You are the QQ connection.
-Running it would mail a letter to the room you are standing in — and it would
-announce to you, next turn, that someone else had sent it. Just say the thing.
-
-Changing this bridge changes you — its code and this prompt are what the
-session runs on, and nothing takes effect until the service restarts. A restart
-cuts the turn off mid-sentence, so tell them it is coming before you do it,
-make it the very last action of the turn, and delay it a few seconds so your
-final message clears the network first.
-`.trim()
+/**
+ * The operator context as it stands now, if it changed under a running session.
+ *
+ * Returns the whole text rather than a diff. A diff would have to be applied
+ * against a prompt the agent cannot re-read, and edits are rare enough that
+ * paying for the full text once beats the ambiguity.
+ */
+function drainContextChange(): string | null {
+  const now = contextMtime()
+  if (now === seenContextMtime) return null
+  seenContextMtime = now
+  log('operator context changed on disk; folding it into the next message')
+  return readOperatorContext()
+}
 
 /** Whoever last wrote in. Single-operator by design; the allowlist enforces it. */
 let currentUser: string | null = null
@@ -274,12 +233,22 @@ const xmlAttr = (v: string) => v.replace(/&/g, '&amp;').replace(/</g, '&lt;').re
  */
 function withCommandLog(text: string): string {
   const relayed = drainRelayed()
-  if (!commandLog.length && !relayed.length) return text
+  const context = drainContextChange()
+  if (!commandLog.length && !relayed.length && !context) return text
 
   const hhmm = (at: number) =>
     new Date(at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
 
   const lines: string[] = []
+
+  // First: it is the rules the rest of the turn is read under.
+  if (context) {
+    lines.push(
+      '你的 operator context 在上一轮之后被改过了。以下是当前全文，取代此前的任何版本' +
+        '——包括系统提示词里的那一份，那是本 session 开始时的快照：',
+    )
+    lines.push(`<system-reminder>\n${context}\n</system-reminder>`)
+  }
 
   if (commandLog.length) {
     lines.push(
