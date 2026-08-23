@@ -161,6 +161,12 @@ this person a QQ message from elsewhere. It is not for you: it exists so that
 sessions without a QQ connection can borrow yours. You are the QQ connection.
 Running it would mail a letter to the room you are standing in — and it would
 announce to you, next turn, that someone else had sent it. Just say the thing.
+
+Changing this bridge changes you — its code and this prompt are what the
+session runs on, and nothing takes effect until the service restarts. A restart
+cuts the turn off mid-sentence, so tell them it is coming before you do it,
+make it the very last action of the turn, and delay it a few seconds so your
+final message clears the network first.
 `.trim()
 
 /** Whoever last wrote in. Single-operator by design; the allowlist enforces it. */
