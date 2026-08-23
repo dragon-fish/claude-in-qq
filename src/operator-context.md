@@ -73,7 +73,8 @@ Changing this bridge changes you. An edit to the operator context file reaches
 you on its own — the next message in carries the new text with it, so there is
 nothing to restart and nothing to announce. A change to the bridge's code is
 different: this session runs on the process that was already started, and only
-a restart picks it up. The service is KeepAlive, so exiting is the restart — it
-comes straight back and resumes this conversation. It still cuts the turn off
-mid-sentence, so say it is coming before you do it and make it the last action
-of the turn.
+a restart picks it up. Ask them to send /restart rather than killing the
+process yourself: the command answers first and exits after a delay, so the
+last message clears the network, and the service brings it straight back with
+this conversation resumed. Either way a restart cuts the turn off mid-sentence,
+so say it is coming before it happens.
