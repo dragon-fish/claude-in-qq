@@ -33,7 +33,7 @@ harness 本身：同一套工具、同样的 skills 和 hooks、一样的权限�
   所以长任务不会把答案埋掉，也不额外花消息条数。`/verbose` 可切三档：完整过程 / 只报进度 / 只要答案
 - **审批**：工具调用弹按钮，点「允许」或「拒绝」。默认 `auto` 模式，只有模型判定有风险的操作才问
 - **提问**：Claude 需要你拿主意时会推一组按钮出来，等同于 TUI 里的 AskUserQuestion
-- **斜杠指令**：`/help` `/stop` `/clear` `/context` `/usage` `/model` `/mode` `/verbose` `/resume` `/cwd` `/status`。
+- **斜杠指令**：`/help` `/stop` `/clear` `/context` `/usage` `/model` `/mode` `/verbose` `/resume` `/cwd` `/status` `/version`。
   启动时自动注册进 QQ 的指令面板，在聊天里点「/」直接选，不用记也不用手动同步。
   常用的另有手打别名（`/cl` `/new` → `/clear`，`/cd` → `/cwd`，`/ctx` → `/context` 等，`/help` 里列全）；
   别名不进面板，撞上正式命令名时正式的优先

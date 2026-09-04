@@ -11,9 +11,11 @@
  */
 
 import { listSessions } from '@anthropic-ai/claude-agent-sdk'
-import { existsSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 /** How much meaning the buttons carry on their own; see buildAskKeyboard. */
 export type AskMode = 'text' | 'truncated' | 'letters'
@@ -172,6 +174,61 @@ export function formatUsage(u: any): string {
   const cost = u.session?.total_cost_usd
   if (typeof cost === 'number' && cost > 0) lines.push('', `本次会话：$${cost.toFixed(2)}`)
   return lines.join('\n')
+}
+
+// -------------------------------------------------------------------- version
+
+/** Where this process's own code lives — not workdir, which /cwd moves. */
+const SRC_DIR = dirname(fileURLToPath(import.meta.url))
+
+/**
+ * Read once, at load. This describes the code the running process was started
+ * from, which is the whole point: reading it per call would report whatever is
+ * on disk now, and "did the restart actually pick up my edit" is exactly the
+ * question this command exists to answer.
+ */
+const BUILD = (() => {
+  const repo = join(SRC_DIR, '..')
+  const git = (...args: string[]) => {
+    try {
+      // stderr is dropped: outside a repo git is loud, and a missing version
+      // string is not worth a stack trace in the log at every boot.
+      return execFileSync('git', ['-C', repo, ...args], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim()
+    } catch {
+      return ''
+    }
+  }
+  return {
+    commit: git('rev-parse', '--short', 'HEAD'),
+    branch: git('rev-parse', '--abbrev-ref', 'HEAD'),
+    date: git('log', '-1', '--format=%cd', '--date=format:%Y-%m-%d %H:%M'),
+    dirty: git('status', '--porcelain') !== '',
+  }
+})()
+
+/** The SDK actually installed, which is not necessarily the range in package.json. */
+const SDK_VERSION = (() => {
+  try {
+    const p = join(SRC_DIR, '..', 'node_modules', '@anthropic-ai', 'claude-agent-sdk', 'package.json')
+    return JSON.parse(readFileSync(p, 'utf8')).version as string
+  } catch {
+    return ''
+  }
+})()
+
+/** How long this process has been up, in words. */
+function uptimeWords(): string {
+  const s = Math.floor(process.uptime())
+  if (s < 60) return `${s} 秒`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m} 分钟`
+  const h = Math.floor(m / 60)
+  if (h < 24) return m % 60 ? `${h} 小时 ${m % 60} 分` : `${h} 小时`
+  const d = Math.floor(h / 24)
+  return h % 24 ? `${d} 天 ${h % 24} 小时` : `${d} 天`
 }
 
 // ------------------------------------------------------------------- commands
@@ -387,7 +444,7 @@ register(
 
   {
     name: 'verbose',
-    aliases: ['v'],
+    aliases: ['vb'],
     usage: '/verbose [full|balanced|off]',
     summary: '回复里附带多少过程',
     async run(arg, deps) {
@@ -556,6 +613,27 @@ register(
           `待审批：${c.approvals}　待回答：${c.questions}`,
         ].join('\n'),
       )
+    },
+  },
+
+  {
+    name: 'version',
+    aliases: ['v', 'ver'],
+    usage: '/version',
+    summary: '当前跑的是哪个版本',
+    async run(_arg, deps) {
+      const lines = ['**版本**']
+      if (BUILD.commit) {
+        const dirty = BUILD.dirty ? '（启动时有未提交改动）' : ''
+        lines.push(`提交：\`${BUILD.commit}\`${dirty}`)
+        if (BUILD.branch) lines.push(`分支：\`${BUILD.branch}\``)
+        if (BUILD.date) lines.push(`提交于：${BUILD.date}`)
+      } else {
+        lines.push('拿不到 git 信息：不在仓库里，或者 git 不可用。')
+      }
+      if (SDK_VERSION) lines.push(`Agent SDK：\`${SDK_VERSION}\``)
+      lines.push(`已运行：${uptimeWords()}`)
+      await deps.reply(lines.join('\n'))
     },
   },
 )
