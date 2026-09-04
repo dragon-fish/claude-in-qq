@@ -349,27 +349,30 @@ register(
       } catch {
         // Not worth failing the listing over; the header just omits it.
       }
-      // The live id can be a wire id while the row that covers it is an alias
-      // ('sonnet' → 'claude-sonnet-5'), which is what resolvedModel bridges.
-      const isLive = (m: any) => !!live && (m.value === live || m.resolvedModel === live)
+      // Context usage reports a canonical id while the rows carry suffixed
+      // ones — 'claude-opus-5' against 'claude-opus-5[1m]' — so the bracketed
+      // tail comes off before comparing, or nothing ever matches.
+      const bare = (s: string | undefined) => s?.replace(/\[[^\]]*\]$/, '')
+      const wanted = bare(live ?? undefined)
+      // Several rows can resolve to one model: 'default' and 'opus[1m]' both
+      // land on Opus. Only the first is marked — they name the same thing, and
+      // two markers would pose a question that has no answer.
+      const liveIndex = wanted
+        ? models.findIndex(m => bare(m.value) === wanted || bare(m.resolvedModel) === wanted)
+        : -1
       // Prefer the display name: it is what the buttons say, and a raw wire id
       // in the header would not visibly match any of them.
-      const current = models.find(isLive)?.displayName ?? live
+      const current = models[liveIndex]?.displayName ?? live
 
-      const labels = models.map(m => m.displayName || m.value)
-      // Marked in the body rather than on the labels — a label is also what an
-      // answer is matched against, and how its width picks the button layout.
-      const idx = await deps.askChoice(labels, mode => {
-        const lines = [current ? `**可用模型**（当前 \`${current}\`）` : '**可用模型**', '']
-        // The table only earns its place when the buttons stop being readable.
-        if (mode !== 'text') {
-          const label = mode === 'letters' ? (i: number) => 'ABCDEFGH'[i] : (i: number) => labels[i]
-          lines.push('| | 模型 | 说明 |', '| --- | --- | --- |')
-          models.forEach((m, i) =>
-            lines.push(`| ${label(i)} | ${cell(labels[i], 20)}${isLive(m) ? ' ●' : ''} | ${cell(m.description)} |`),
-          )
-          lines.push('')
-        }
+      // Marked on the label itself. The body cannot carry it: a table there
+      // repeats the buttons verbatim once they truncate, which is most of the
+      // time, and pushes the descriptions off a phone screen.
+      const labels = models.map((m, i) => {
+        const name = m.displayName || m.value
+        return i === liveIndex ? `🟢 ${name}` : name
+      })
+      const idx = await deps.askChoice(labels, () => {
+        const lines = [current ? `**可用模型**（当前 ${current}）` : '**可用模型**', '']
         lines.push('点按钮切换，或 `/model default` 恢复默认')
         return lines.join('\n')
       })
