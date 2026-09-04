@@ -282,14 +282,33 @@ register(
         return
       }
 
+      // supportedModels() says what is available, never what is in use. The
+      // live id only surfaces on context usage, so it costs a second call.
+      let live: string | null = null
+      try {
+        live = (await q.getContextUsage())?.model ?? null
+      } catch {
+        // Not worth failing the listing over; the header just omits it.
+      }
+      // The live id can be a wire id while the row that covers it is an alias
+      // ('sonnet' → 'claude-sonnet-5'), which is what resolvedModel bridges.
+      const isLive = (m: any) => !!live && (m.value === live || m.resolvedModel === live)
+      // Prefer the display name: it is what the buttons say, and a raw wire id
+      // in the header would not visibly match any of them.
+      const current = models.find(isLive)?.displayName ?? live
+
       const labels = models.map(m => m.displayName || m.value)
+      // Marked in the body rather than on the labels — a label is also what an
+      // answer is matched against, and how its width picks the button layout.
       const idx = await deps.askChoice(labels, mode => {
-        const lines = ['**可用模型**', '']
+        const lines = [current ? `**可用模型**（当前 \`${current}\`）` : '**可用模型**', '']
         // The table only earns its place when the buttons stop being readable.
         if (mode !== 'text') {
           const label = mode === 'letters' ? (i: number) => 'ABCDEFGH'[i] : (i: number) => labels[i]
           lines.push('| | 模型 | 说明 |', '| --- | --- | --- |')
-          models.forEach((m, i) => lines.push(`| ${label(i)} | ${cell(labels[i], 20)} | ${cell(m.description)} |`))
+          models.forEach((m, i) =>
+            lines.push(`| ${label(i)} | ${cell(labels[i], 20)}${isLive(m) ? ' ●' : ''} | ${cell(m.description)} |`),
+          )
           lines.push('')
         }
         lines.push('点按钮切换，或 `/model default` 恢复默认')
