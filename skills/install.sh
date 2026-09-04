@@ -1,25 +1,36 @@
 #!/bin/sh
 #
-# Make `qq-notify` reachable from any Claude Code session on this machine:
+# Make this repo's skills reachable from any Claude Code session on this
+# machine, plus the qq-notify command itself:
 #
-#   ~/.local/bin/qq-notify        the command itself
-#   ~/.claude/skills/qq-notify    the skill that teaches sessions to use it
+#   ~/.local/bin/qq-notify        the command
+#   ~/.claude/skills/<name>       one symlink per directory under skills/
 #
-# Both are symlinks into this repo, so editing the source is enough — there is
-# no second copy to keep in sync. Independent of service/install.sh: sending
-# notifications does not require running the bridge as a service.
+# All of them are symlinks into this repo, so editing the source is enough —
+# there is no second copy to keep in sync. Adding a skill means adding a
+# directory here; this script needs no edit. Independent of service/install.sh:
+# neither notifications nor skills require running the bridge as a service.
 #
 #   skills/install.sh             install / repair
-#   skills/install.sh --uninstall remove both links
+#   skills/install.sh --uninstall remove the links
 
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN="$HOME/.local/bin/qq-notify"
-SKILL="$HOME/.claude/skills/qq-notify"
+SKILL_DIR="$HOME/.claude/skills"
+
+# Every directory under skills/ is a skill. Printed one per line so the loops
+# below stay readable when a name ever contains something surprising.
+skills() {
+  for d in "$ROOT"/skills/*/; do
+    [ -d "$d" ] || continue
+    basename "$d"
+  done
+}
 
 if [ "${1:-}" = "--uninstall" ]; then
-  for link in "$BIN" "$SKILL"; do
+  for link in "$BIN" $(skills | sed "s|^|$SKILL_DIR/|"); do
     if [ -L "$link" ]; then
       rm "$link"
       echo "已移除 $link"
@@ -29,21 +40,23 @@ if [ "${1:-}" = "--uninstall" ]; then
 fi
 
 # Refuse to clobber a real file or someone else's skill of the same name.
-for link in "$BIN" "$SKILL"; do
+for link in "$BIN" $(skills | sed "s|^|$SKILL_DIR/|"); do
   if [ -e "$link" ] && [ ! -L "$link" ]; then
     echo "! $link 已存在且不是软链，先自行处理" >&2
     exit 1
   fi
 done
 
-mkdir -p "$HOME/.local/bin" "$HOME/.claude/skills"
+mkdir -p "$HOME/.local/bin" "$SKILL_DIR"
 chmod +x "$ROOT/src/notify.ts"
 ln -sfn "$ROOT/src/notify.ts" "$BIN"
-ln -sfn "$ROOT/skills/qq-notify" "$SKILL"
 
 echo "已安装:"
 echo "  $BIN -> $ROOT/src/notify.ts"
-echo "  $SKILL -> $ROOT/skills/qq-notify"
+for name in $(skills); do
+  ln -sfn "$ROOT/skills/$name" "$SKILL_DIR/$name"
+  echo "  $SKILL_DIR/$name -> $ROOT/skills/$name"
+done
 
 case ":$PATH:" in
   *":$HOME/.local/bin:"*) ;;
