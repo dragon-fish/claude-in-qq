@@ -364,15 +364,12 @@ register(
       // in the header would not visibly match any of them.
       const current = models[liveIndex]?.displayName ?? live
 
-      // Marked on the label itself. The body cannot carry it: a table there
-      // repeats the buttons verbatim once they truncate, which is most of the
-      // time, and pushes the descriptions off a phone screen.
-      const labels = models.map((m, i) => {
-        const name = m.displayName || m.value
-        return i === liveIndex ? `🟢 ${name}` : name
-      })
+      const labels = models.map(m => m.displayName || m.value)
       const idx = await deps.askChoice(labels, () => {
-        const lines = [current ? `**可用模型**（当前 ${current}）` : '**可用模型**', '']
+        // Three lines and the buttons. A table here repeats the buttons
+        // verbatim once they truncate, which is most of the time.
+        const lines = ['**可用模型**']
+        if (current) lines.push(`当前：\`${current}\``)
         lines.push('点按钮切换，或 `/model default` 恢复默认')
         return lines.join('\n')
       })
