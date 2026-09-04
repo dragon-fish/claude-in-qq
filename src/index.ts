@@ -1299,14 +1299,18 @@ async function runSession(): Promise<void> {
           await trace('💭 ')
           traceStarted = true
           lastKind = 'thinking'
-        } else if (block === 'thinking' && traceLevel === 'balanced' && lastKind !== 'thinking') {
-          // One line per stretch of thinking, not per block: several in a row
-          // say nothing more than the first, and the point here is only that
-          // something is happening.
-          await traceBreak()
-          await trace('💭 思考中……\n')
-          traceStarted = true
-          lastKind = 'thinking'
+        } else if (block === 'thinking' && traceLevel === 'balanced') {
+          // One entry per stretch of thinking, not per block. The line is left
+          // open and extended in place, so a long stretch reads as one thing
+          // still going rather than as a stack of identical lines.
+          if (lastKind === 'thinking') {
+            await traceNow('仍在思考……')
+          } else {
+            await traceEndLine()
+            await traceNow('💭 思考中……')
+            traceStarted = true
+            lastKind = 'thinking'
+          }
         }
       } else if (ev?.type === 'content_block_delta') {
         const delta = ev.delta
@@ -1364,7 +1368,7 @@ async function runSession(): Promise<void> {
             if (lastKind === 'tools') {
               await traceNow(`、${b.name}`)
             } else {
-              await traceBreak()
+              await traceEndLine()
               await traceNow(`⚙️ ${b.name}`)
               traceStarted = true
               lastKind = 'tools'
