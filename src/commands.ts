@@ -54,15 +54,28 @@ export type CommandDeps = {
 
 export type Command = {
   name: string
+  /**
+   * Extra names that reach this command when typed. Deliberately kept out of
+   * the QQ command panel: that panel is capped at 20 entries, and an alias is
+   * a shortcut for fingers, not a second row to scroll past.
+   */
+  aliases?: string[]
   usage: string
   summary: string
   run(arg: string, deps: CommandDeps): Promise<void>
 }
 
 const registry = new Map<string, Command>()
+/** Alias → command. Held apart from `registry` so a real name always wins. */
+const aliasMap = new Map<string, Command>()
 
 export function register(...commands: Command[]): void {
-  for (const c of commands) registry.set(c.name, c)
+  for (const c of commands) {
+    registry.set(c.name, c)
+    // First claim on a word keeps it. Two commands wanting the same alias is a
+    // mistake in the table below, not something to settle by registration order.
+    for (const a of c.aliases ?? []) if (!aliasMap.has(a)) aliasMap.set(a, c)
+  }
 }
 
 /** Registration order, which is the order /help and the QQ command panel show. */
@@ -166,11 +179,17 @@ export function formatUsage(u: any): string {
 register(
   {
     name: 'help',
+    aliases: ['h'],
     usage: '/help',
     summary: '显示本条',
     async run(_arg, deps) {
       const lines = ['**可用指令**']
-      for (const c of registry.values()) lines.push(`\`${c.usage}\` ${c.summary}`)
+      for (const c of registry.values()) {
+        // The command panel lists real names only, so this is where an alias
+        // becomes findable at all.
+        const alt = c.aliases?.length ? `　别名 ${c.aliases.map(a => `\`/${a}\``).join(' ')}` : ''
+        lines.push(`\`${c.usage}\` ${c.summary}${alt}`)
+      }
       lines.push('', '其余消息都直接发给 Claude。')
       await deps.reply(lines.join('\n'))
     },
@@ -178,6 +197,7 @@ register(
 
   {
     name: 'stop',
+    aliases: ['cancel'],
     usage: '/stop',
     summary: '打断当前任务',
     async run(_arg, deps) {
@@ -194,6 +214,7 @@ register(
 
   {
     name: 'clear',
+    aliases: ['cl', 'new'],
     usage: '/clear',
     summary: '清空上下文，开始新会话',
     async run(_arg, deps) {
@@ -205,6 +226,7 @@ register(
 
   {
     name: 'context',
+    aliases: ['ctx'],
     usage: '/context',
     summary: '查看上下文占用',
     async run(_arg, deps) {
@@ -220,6 +242,7 @@ register(
 
   {
     name: 'model',
+    aliases: ['models'],
     usage: '/model [名字|default]',
     summary: '不带参数则列出可选模型',
     async run(arg, deps) {
@@ -286,6 +309,7 @@ register(
 
   {
     name: 'mode',
+    aliases: ['perm'],
     usage: '/mode [模式]',
     summary: '不带参数则列出权限模式',
     async run(arg, deps) {
@@ -342,6 +366,7 @@ register(
 
   {
     name: 'verbose',
+    aliases: ['v'],
     usage: '/verbose [full|balanced|off]',
     summary: '回复里附带多少过程',
     async run(arg, deps) {
@@ -392,6 +417,7 @@ register(
 
   {
     name: 'usage',
+    aliases: ['quota'],
     usage: '/usage',
     summary: '套餐额度：5 小时 / 7 天窗口用了多少，何时重置',
     async run(_arg, deps) {
@@ -416,6 +442,7 @@ register(
 
   {
     name: 'resume',
+    aliases: ['r'],
     usage: '/resume',
     summary: '从历史会话里挑一个恢复',
     async run(_arg, deps) {
@@ -468,6 +495,7 @@ register(
 
   {
     name: 'cwd',
+    aliases: ['cd'],
     usage: '/cwd [路径]',
     summary: '查看或切换工作目录（保留上下文）',
     async run(arg, deps) {
@@ -492,6 +520,7 @@ register(
 
   {
     name: 'status',
+    aliases: ['st'],
     usage: '/status',
     summary: '查看桥接状态',
     async run(_arg, deps) {
@@ -517,7 +546,10 @@ register(
 export async function dispatch(text: string, deps: CommandDeps): Promise<boolean> {
   const m = /^\s*\/([a-z]+)(?:\s+([\s\S]*))?$/i.exec(text)
   if (!m) return false
-  const cmd = registry.get(m[1].toLowerCase())
+  // Real names resolve first, so an alias colliding with one is dead weight
+  // rather than a way to shadow the command it collides with.
+  const key = m[1].toLowerCase()
+  const cmd = registry.get(key) ?? aliasMap.get(key)
   if (!cmd) return false
 
   const arg = (m[2] ?? '').trim()
