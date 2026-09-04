@@ -186,9 +186,11 @@ register(
       const lines = ['**可用指令**']
       for (const c of registry.values()) {
         // The command panel lists real names only, so this is where an alias
-        // becomes findable at all.
-        const alt = c.aliases?.length ? `　别名 ${c.aliases.map(a => `\`/${a}\``).join(' ')}` : ''
-        lines.push(`\`${c.usage}\` ${c.summary}${alt}`)
+        // becomes findable at all. Bulleted because a long entry wraps on a
+        // phone, and without the bullet the tail of one command reads as the
+        // start of the next.
+        const alt = c.aliases?.length ? ` (${c.aliases.map(a => `\`/${a}\``).join(', ')})` : ''
+        lines.push(`- \`${c.usage}\`${alt} — ${c.summary}`)
       }
       lines.push('', '其余消息都直接发给 Claude。')
       await deps.reply(lines.join('\n'))
