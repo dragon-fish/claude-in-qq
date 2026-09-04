@@ -1053,15 +1053,48 @@ class LineStreamer {
     if (!chunk) return
     if (this.stream?.full) await this.rollStream()
     this.stream ??= this.open()
+    // QQ ends a stream from its own side, and has more than one way to say so:
+    // 40034020 is a documented time limit, seen once at ten minutes, and
+    // 40034019 reports the guide simply over. Carry on in a fresh message
+    // rather than holding the rest back until finish() — that wait is what
+    // reads as the bridge having hung mid-sentence.
+    if (this.stream.failed) await this.reopen()
     this.atStreamLineStart = chunk.endsWith('\n')
     if (this.stream.failed) {
-      // Out of passive quota, or QQ refused. Hold it back rather than drop it;
-      // finish() posts it as a normal message so nothing is lost and nothing
-      // already on screen gets repeated.
+      // Out of passive quota, so there is no new stream to be had. Hold it
+      // back rather than drop it; finish() posts it as a normal message so
+      // nothing is lost and nothing already on screen gets repeated.
       this.overflow += chunk
       return
     }
     await this.stream.write(chunk)
+    // The write that trips the failure is already counted in the stream's own
+    // `full`, but it never left the process. Treating it as delivered is how a
+    // line goes missing across the seam between two messages.
+    if (this.stream.failed) {
+      await this.reopen()
+      if (!this.stream.failed) await this.stream.write(chunk)
+      // Checked again, because the replacement can fail on its own first write
+      // just as easily — or be born failed once passive quota is gone. The
+      // chunk still has to land somewhere, and overflow is the last place left.
+      if (this.stream.failed) this.overflow += chunk
+    }
+  }
+
+  /**
+   * Replace a stream QQ has ended with its successor.
+   *
+   * rollStream only reopens on the trace channel, where the fence has to be
+   * reinstated; on prose it leaves the slot empty for the next write to fill
+   * lazily, which is too late for a caller that is about to read `failed`.
+   *
+   * Passive quota is what keeps this from looping: four uses per inbound
+   * message, and once they are gone `open()` hands back a stream that has
+   * already failed, which falls through to overflow exactly as before.
+   */
+  private async reopen(): Promise<void> {
+    await this.rollStream()
+    this.stream ??= this.open()
   }
 
   private async emit(text: string, firstLineIsStart: boolean): Promise<void> {
