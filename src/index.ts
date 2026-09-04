@@ -293,7 +293,18 @@ const pendingApprovals = new Map<string, Pending<boolean>>()
  */
 const pendingQuestions = new Map<
   string,
-  Pending<string> & { options: string[]; render: (mode: AskLayout['mode']) => string }
+  Pending<string> & {
+    options: string[]
+    render: (mode: AskLayout['mode']) => string
+    /**
+     * True when only a button press may answer this. A command that lists
+     * choices is not waiting on the operator — the agent is not blocked, and
+     * the next thing typed is far more likely to be a new instruction than a
+     * late answer. Claiming it strands both: the choice matches nothing and
+     * the sentence never reaches the agent.
+     */
+    buttonsOnly?: boolean
+  }
 >()
 
 /**
@@ -483,9 +494,14 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
     return
   }
 
-  if (pendingQuestions.size > 0) {
-    const id = pendingQuestions.keys().next().value as string
-    const q = pendingQuestions.get(id)!
+  // Only a question that is genuinely waiting on words may claim this message.
+  // One raised by a command keeps its buttons live and lets the text through,
+  // so `/model` followed by an unrelated sentence answers neither — the
+  // sentence reaches the agent, and the buttons stay clickable until they
+  // time out. Passing an argument stays possible the obvious way: /model sonnet.
+  const answering = [...pendingQuestions.entries()].find(([, q]) => !q.buttonsOnly)
+  if (answering) {
+    const [id, q] = answering
     const letter = /^\s*([A-Za-z])\s*$/.exec(msg.content)
     let answer = msg.content
     if (letter) {
@@ -636,6 +652,7 @@ let activeQuery: any = null
 async function askChoice(
   options: string[],
   renderBody: (mode: AskLayout['mode']) => string,
+  buttonsOnly = false,
 ): Promise<number> {
   const user = requireUser()
   const id = randomId()
@@ -647,7 +664,7 @@ async function askChoice(
       pendingQuestions.delete(id)
       resolve('')
     }, QUESTION_TIMEOUT_MS)
-    pendingQuestions.set(id, { options, resolve, timer, render: renderBody })
+    pendingQuestions.set(id, { options, resolve, timer, render: renderBody, buttonsOnly })
   })
   return options.indexOf(answer)
 }
@@ -656,7 +673,7 @@ async function askChoice(
 function commandDeps(user: string): CommandDeps {
   return {
     reply: text => sendToQQ(user, text, lastInboundMsgId.get(user)),
-    askChoice,
+    askChoice: (options, render) => askChoice(options, render, true),
     query: () => activeQuery,
     workdir: () => workdir,
     setWorkdir: path => {
