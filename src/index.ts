@@ -1058,7 +1058,7 @@ class LineStreamer {
     // 40034019 reports the guide simply over. Carry on in a fresh message
     // rather than holding the rest back until finish() — that wait is what
     // reads as the bridge having hung mid-sentence.
-    if (this.stream.failed) await this.reopen()
+    if (this.stream.failed && !this.stream.exhausted) await this.reopen()
     this.atStreamLineStart = chunk.endsWith('\n')
     if (this.stream.failed) {
       // Out of passive quota, so there is no new stream to be had. Hold it
@@ -1072,8 +1072,10 @@ class LineStreamer {
     // `full`, but it never left the process. Treating it as delivered is how a
     // line goes missing across the seam between two messages.
     if (this.stream.failed) {
-      await this.reopen()
-      if (!this.stream.failed) await this.stream.write(chunk)
+      if (!this.stream.exhausted) {
+        await this.reopen()
+        if (!this.stream.failed) await this.stream.write(chunk)
+      }
       // Checked again, because the replacement can fail on its own first write
       // just as easily — or be born failed once passive quota is gone. The
       // chunk still has to land somewhere, and overflow is the last place left.

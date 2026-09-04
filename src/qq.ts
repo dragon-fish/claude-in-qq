@@ -373,6 +373,14 @@ export type StreamHandle = {
   /** True if QQ rejected something; the caller should fall back to sendToQQ. */
   readonly failed: boolean
   /**
+   * True when QQ says this inbound message's stream guide is over (40034019).
+   * Distinct from `failed`: a stream that merely ran out of time (40034020)
+   * can be continued in a fresh one, but once the guide is closed every new
+   * stream against the same msg_id is refused too — retrying then produces a
+   * string of two-character messages instead of a reply.
+   */
+  readonly exhausted: boolean
+  /**
    * True once QQ reports this message is nearly out of room. The caller should
    * close it and open another rather than write into a message that will start
    * rejecting appends — one growing message still has a maximum length, and a
@@ -414,6 +422,13 @@ const STREAM_MAX_CHARS = 4000
  * genuinely down.
  */
 const STREAM_RETRIES = 2
+
+/**
+ * "流式引导已经结束" — QQ will not open another stream against this inbound
+ * message. Observed after the bridge's own shutdown had already sent the
+ * closing replace while output was still arriving.
+ */
+const STREAM_GUIDE_OVER = 40034019
 const STREAM_RETRY_BASE_MS = 300
 
 /*
@@ -448,6 +463,8 @@ export function createStream(openid: string, replyTo?: string): StreamHandle {
   let failed = !passiveId
   /** Distinct from `full`, which is the accumulated text this stream has sent. */
   let nearlyFull = false
+  /** Set when QQ refuses further streams against this msg_id entirely. */
+  let exhausted = false
   /** Log the reported capacity once per stream, not once per append. */
   let sawRemaining = false
 
@@ -502,6 +519,13 @@ export function createStream(openid: string, replyTo?: string): StreamHandle {
       body = (await res.text()).slice(0, 200)
       if (res.status < 500 || attempt >= STREAM_RETRIES) {
         failed = true
+        // 40034019 is about the msg_id, not this particular stream, so it is
+        // the one refusal a replacement cannot get around.
+        try {
+          if ((JSON.parse(body) as { code?: number }).code === STREAM_GUIDE_OVER) exhausted = true
+        } catch {
+          // Body was not the documented JSON; treat it as an ordinary failure.
+        }
         log(
           `stream ${streamId ? 'append' : 'open'} failed [${res.status}] at ${full.length} chars, ` +
             `index ${myIndex}, ${attempt + 1} attempt(s):`,
@@ -535,6 +559,9 @@ export function createStream(openid: string, replyTo?: string): StreamHandle {
     },
     get failed() {
       return failed
+    },
+    get exhausted() {
+      return exhausted
     },
     get full() {
       return nearlyFull
