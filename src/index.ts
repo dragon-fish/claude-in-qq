@@ -867,6 +867,18 @@ class LineStreamer {
   private channel: Channel = 'prose'
   /** Whether the last text handed to the stream ended a line. */
   private atStreamLineStart = true
+  /**
+   * Blank lines held back rather than sent, because QQ rejects a message whose
+   * content is only whitespace. They are prepended to the next write that has
+   * something in it.
+   *
+   * Do not go back to dropping them. A run of newlines can arrive as a flush of
+   * its own — the closing ``` ends a delta, the newlines start the next one —
+   * and discarding it welds the text on either side together: a closing fence
+   * and the line after it come out as ````, which swallows the rest of the
+   * reply into the code block.
+   */
+  private pendingBlank = ''
 
   constructor(
     private readonly open: () => StreamHandle,
@@ -945,6 +957,9 @@ class LineStreamer {
         await this.writeThrough(`${this.atStreamLineStart ? '' : '\n'}\`\`\`${this.proseFence}\n`)
       }
     }
+    // Blank lines do not carry across a fence; the fence writers place their
+    // own newlines.
+    this.pendingBlank = ''
     this.channel = next
   }
 
@@ -1045,6 +1060,8 @@ class LineStreamer {
       this.buffer = ''
       await this.emit(rest, wasAtStart)
     }
+    // Trailing blank lines are not worth a message of their own.
+    this.pendingBlank = ''
     // A turn that ends mid-trace — interrupted, or one that never got round to
     // an answer — would otherwise leave the fence open and swallow whatever the
     // next message renders beneath it.
@@ -1148,8 +1165,13 @@ class LineStreamer {
     const flush = async () => {
       const chunk = prose
       prose = ''
-      if (!chunk.trim()) return
-      await this.writeThrough(chunk)
+      if (!chunk) return
+      if (!chunk.trim()) {
+        this.pendingBlank += chunk
+        return
+      }
+      await this.writeThrough(this.pendingBlank + chunk)
+      this.pendingBlank = ''
     }
 
     // Keeping the newline with its line, so a split never loses one.
@@ -1173,6 +1195,8 @@ class LineStreamer {
       await this.stream?.end()
       this.stream = null
       this.atStreamLineStart = true
+      // Whatever was being held belonged to the text before the attachment.
+      this.pendingBlank = ''
       await this.sendMedia(media[1])
     }
     await flush()
