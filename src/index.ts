@@ -74,17 +74,45 @@ const QUESTION_TIMEOUT_MS = 15 * 60 * 1000
 /**
  * End the turn's growing message, so whatever comes next starts a new one.
  *
- * Anything sent mid-turn as its own message — an approval prompt, a question
- * with buttons — lands *below* a stream that is still open above it. Keep
- * writing and the text grows into a message the operator has already scrolled
- * past to answer, which reads as the past editing itself. Sealing first puts
- * the reply underneath the thing it is replying to, where it happened.
+ * For a standalone message that is its own utterance rather than part of the
+ * reply — a slash command's answer, a file, the shutdown notice. Those follow
+ * what was said; leaving the stream open would have the reply above go on
+ * growing after them. Cards with buttons are not in this group and deliberately
+ * do not seal: see `beforeSend` in qq.ts.
  *
  * Returns whether there was anything to seal.
  *
  * Assigned per turn by `runSession`; a no-op between turns.
  */
 let sealStream: () => Promise<boolean> = async () => false
+
+/**
+ * An inbound message is waiting to enter the conversation, and the stream open
+ * above it should be sealed once it does.
+ *
+ * Deliberately not sealed on arrival. A queued message does not reach the model
+ * when it is typed — Claude Code folds it in at the next tool-result boundary,
+ * or at the end of the turn if no tool runs before then — and until that
+ * happens the reply above is still answering the message before it. Cutting on
+ * arrival severs a sentence mid-word, and the two halves then read as two
+ * separate replies, neither of which answers the message now sitting between
+ * them. That destroys the ordering the cut was meant to preserve.
+ *
+ * A bubble that goes on growing above the operator's words is the accepted
+ * cost. It is one reply, still finishing what it had already started saying.
+ *
+ * Only armed when a stream is actually open, and cleared by `sealStream` so a
+ * seal from any cause settles it. Both matter: left armed with nothing to cut,
+ * it would fire on the *next* reply instead, severing that one at its first
+ * tool result over a message it was already answering.
+ */
+let sealPending = false
+
+/**
+ * Whether a stream is open right now. Assigned per turn by `runSession`;
+ * between turns there is nothing open, so the default is the honest answer.
+ */
+let streamOpen: () => boolean = () => false
 
 /**
  * Appended to Claude Code's own system prompt. Without it the agent assumes a
@@ -472,14 +500,16 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
   lastInboundMsgId.set(msg.openid, msg.id)
 
   // A stream is bound to the inbound message it replies to and cannot be moved
-  // to a newer one. Left open while the operator says something else, the reply
-  // goes on growing inside a message that now sits above their words — from
-  // their side, a message they already read is editing itself while they watch.
+  // to a newer one, so the reply above goes on growing over the operator's
+  // words until it is sealed. Arm the seal rather than performing it: see
+  // `sealPending` for why the cut belongs at the moment the message actually
+  // enters the conversation and not at the moment it arrives.
   //
-  // Every inbound path gets this, not just the one that reaches the agent: a
-  // slash command is answered from here and never touches the queue, and its
-  // answer landing under a still-growing reply looks exactly as wrong.
-  await sealStream()
+  // Paths that never reach the agent need no special case. A slash command is
+  // answered from here with an ordinary message, and every ordinary message
+  // seals on its way out through the `onBeforeSend` invariant — so its answer
+  // still lands below, and below a reply that was left whole.
+  sealPending = streamOpen()
 
   // Commands outrank a pending prompt: an open question swallows arbitrary text
   // as its answer, so /stop would never reach anything if it were checked after.
@@ -1269,6 +1299,17 @@ async function runSession(): Promise<void> {
   let streamedText = false
 
   async function closeStreamer(): Promise<boolean> {
+    // Settled either way: with no stream open there is nothing left for a
+    // pending seal to wait for, and leaving it armed would cut the *next*
+    // reply at its first tool result for no reason.
+    sealPending = false
+    // The trace block does not survive the stream that held it. Whatever opens
+    // next starts on an empty one, so the bookkeeping that decides whether an
+    // entry is already there — and how its last line ended — has to start
+    // empty too, or the new block opens with a separator before its first line.
+    traceStarted = false
+    traceTail = ''
+    lastKind = null
     if (!streamer) return false
     const s = streamer
     streamer = null
@@ -1325,6 +1366,7 @@ async function runSession(): Promise<void> {
   }
 
   sealStream = closeStreamer
+  streamOpen = () => streamer !== null
 
 
   /** Which content block the deltas currently belong to. */
@@ -1456,24 +1498,44 @@ async function runSession(): Promise<void> {
     } else if (m.type === 'user') {
       // Tool results come back as a user turn. Only some are worth showing,
       // and knowing which needs the name from the call that asked for it.
+      let sawToolResult = false
       for (const b of m.message?.content ?? []) {
         if (b.type !== 'tool_result') continue
+        sawToolResult = true
         const name = toolNames.get(b.tool_use_id)
         toolNames.delete(b.tool_use_id)
         if (!name || traceLevel !== 'full') continue
         const out = summariseResult(name, b.content)
         if (out) await trace(`${out}\n`)
       }
+
+      // Where a message the operator sent mid-turn actually joins the
+      // conversation. Claude Code drains its queue once a batch of tool calls
+      // has all reported, just before the next model call, and folds the text
+      // in as an attachment — the API refuses a plain user message interleaved
+      // among tool results, so no other point in a turn can take one.
+      //
+      // Nothing on the stream announces it: the attachment is never emitted,
+      // and these tool results are the only visible trace of the boundary it
+      // rides on. `toolNames` empties exactly when the last outstanding call
+      // reports, which is that boundary. Waiting for it matters when calls run
+      // in parallel — cutting at the first result of a batch would cut while
+      // the others are still running, and a slow one makes that minutes early.
+      //
+      // A call that never reports leaves the map full and the seal unfired;
+      // the turn's `result` catches it.
+      //
+      // After the summaries, not before. Those describe work that finished
+      // ahead of the operator's message, so they belong to the stream above.
+      if (sawToolResult && sealPending && toolNames.size === 0) await closeStreamer()
     } else if (m.type === 'result') {
-      // The one place the stream closes. A turn can also end without a final
-      // assistant message (interrupt, error), and this catches that too rather
-      // than leaving it half-written.
+      // Where the stream closes when nothing closed it earlier. A turn can also
+      // end without a final assistant message (interrupt, error), and this
+      // catches that too rather than leaving it half-written. The trace
+      // bookkeeping is reset by closeStreamer itself.
       await closeStreamer()
       block = null
       streamedText = false
-      traceStarted = false
-      traceTail = ''
-      lastKind = null
       toolNames.clear()
       log(`turn finished: ${m.subtype}, turns=${m.num_turns}`)
     }

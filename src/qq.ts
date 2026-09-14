@@ -302,7 +302,9 @@ export async function sendToQQ(
   replyTo?: string,
   keyboard?: Record<string, unknown>,
 ): Promise<void> {
-  await beforeSend()
+  // A card carrying buttons belongs to the reply that is still being written,
+  // so it does not end it. See `beforeSend`.
+  if (!keyboard) await beforeSend()
   const chunks = chunkText(text)
 
   for (const [i, chunk] of chunks.entries()) {
@@ -345,17 +347,23 @@ export async function sendToQQ(
 // @see https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_openid_stream_messages.post.html
 
 /**
- * Run before every standalone message, whatever sends it.
+ * Run before a standalone message that ends what came before it.
  *
  * A QQ conversation is strictly linear: a message occupies the position it was
  * posted at, and nothing that arrives later can appear above it. A stream, on
- * the other hand, keeps writing into the position it started at. So anything
- * that posts a new message while a stream is open leaves that stream growing
- * *above* it — from the reader's side, a message they have already scrolled
- * past starts editing itself.
+ * the other hand, keeps writing into the position it started at. So a message
+ * posted while a stream is open leaves that stream growing *above* it.
  *
  * Registering the seal here rather than calling it from each sender makes that
  * an invariant instead of a habit: a new sender added later cannot forget.
+ *
+ * Keyboards are the exception, and `sendToQQ` skips the seal for them. An
+ * approval card or a question is not a new utterance — it is the reply above
+ * reaching a point where it needs an answer, and it goes on from the same place
+ * once it has one. Sealing for it cuts one reply into a stack of fragments, one
+ * per button the turn happened to need, and spends a passive slot re-opening
+ * each time. Left open, the card lands below everything said so far and the
+ * answer continues the message it belongs to.
  */
 let beforeSend: () => Promise<void> = async () => {}
 
