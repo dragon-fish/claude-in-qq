@@ -14,6 +14,7 @@ import { createSdkMcpServer, query, tool } from '@anthropic-ai/claude-agent-sdk'
 import { z } from 'zod'
 import { allCommands, dispatch, type CommandDeps } from './commands.js'
 import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { uptime } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
@@ -156,6 +157,58 @@ function drainContextChange(): string | null {
   return readOperatorContext()
 }
 
+/**
+ * When this process started, if it started on top of a conversation that was
+ * already running. Null when there was nothing to come back to.
+ *
+ * The agent cannot notice this on its own. A resumed session reads as unbroken
+ * — the transcript is all there — so nothing in it says that the process
+ * holding the other end died, and the agent goes on believing that work it had
+ * in flight is still in flight. Restarts are frequent here, since the bridge is
+ * often what is being edited.
+ *
+ * Armed once at startup, deliberately not per session: `runSession` also reruns
+ * for /clear and /cwd, and neither of those is a restart. A missing session_id
+ * means either a first run or a /clear, and in both the conversation starts
+ * from nothing — there is no earlier state to warn about.
+ *
+ * Set by `main`; drained into the first message that follows.
+ */
+type RestartNotice = {
+  at: number
+  /** When the previous process stopped, or null if it never said goodbye. */
+  stoppedAt: number | null
+  /**
+   * The signal it stopped on, `crash` for an uncaught exception, or null for a
+   * death that ran no handler at all — SIGKILL, the OOM killer, loss of power.
+   *
+   * unhandledRejection is deliberately not among these. Registering a listener
+   * for it suppresses whatever the runtime would have done, so recording it
+   * would mean also deciding whether to exit — and getting that wrong invents
+   * crashes in a process that used to survive. It lands in the null case.
+   */
+  signal: string | null
+  /** What the exception said, for a crash. */
+  error: string | null
+  /** Whether the machine itself rebooted while the bridge was down. */
+  rebooted: boolean
+}
+
+let restartNotice: RestartNotice | null = null
+
+function drainRestartNotice(): RestartNotice | null {
+  const notice = restartNotice
+  restartNotice = null
+  return notice
+}
+
+/** A duration in words, for a gap nobody wants to read in milliseconds. */
+function spokenGap(ms: number): string {
+  if (ms < 60_000) return `${Math.max(1, Math.round(ms / 1000))} 秒`
+  if (ms < 3_600_000) return `${Math.round(ms / 60_000)} 分钟`
+  return `${(ms / 3_600_000).toFixed(1)} 小时`
+}
+
 /** Whoever last wrote in. Single-operator by design; the allowlist enforces it. */
 let currentUser: string | null = null
 
@@ -262,7 +315,8 @@ const xmlAttr = (v: string) => v.replace(/&/g, '&amp;').replace(/</g, '&lt;').re
 function withCommandLog(text: string): string {
   const relayed = drainRelayed()
   const context = drainContextChange()
-  if (!commandLog.length && !relayed.length && !context) return text
+  const restarted = drainRestartNotice()
+  if (!commandLog.length && !relayed.length && !context && !restarted) return text
 
   const hhmm = (at: number) =>
     new Date(at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
@@ -276,6 +330,32 @@ function withCommandLog(text: string): string {
         '——包括系统提示词里的那一份，那是本 session 开始时的快照：',
     )
     lines.push(`<system-reminder>\n${context}\n</system-reminder>`)
+  }
+
+  // Second: it explains a gap the transcript does not show.
+  if (restarted) {
+    const how =
+      restarted.signal === 'crash'
+        ? `上一个进程在 ${hhmm(restarted.stoppedAt!)} 抛出未捕获异常崩溃` +
+          (restarted.error ? `：${restarted.error}` : '')
+        : restarted.signal === 'SIGINT'
+          ? `上一个进程在 ${hhmm(restarted.stoppedAt!)} 收到 SIGINT 退出，是终端里被 Ctrl-C`
+          : restarted.signal
+            ? `上一个进程在 ${hhmm(restarted.stoppedAt!)} 收到 ${restarted.signal} 正常退出，` +
+              '通常是 launchd 在重启这个服务——多半有人刚改过它'
+            : '上一个进程没有走任何退出流程，是被强杀（SIGKILL）、OOM，或者机器直接断了'
+    const down = restarted.stoppedAt
+      ? `，停了 ${spokenGap(restarted.at - restarted.stoppedAt)}`
+      : ''
+    const reboot = restarted.rebooted ? '这台机器在此期间重启过。' : ''
+    lines.push(
+      '<system-reminder>\n' +
+        `claude-in-qq 这个桥接进程在 ${hhmm(restarted.at)} 重启过，本 session 是从磁盘 resume 回来的。` +
+        `${how}${down}。${reboot}\n` +
+        '上下文接得回来，进程里的状态接不回来——重启那一刻正在跑的工具调用、还没答复的审批和提问、' +
+        '没发完的回复，都不会有结果了。若你记得自己在等什么，那件事已经不在了。\n' +
+        '</system-reminder>',
+    )
   }
 
   if (commandLog.length) {
@@ -639,6 +719,17 @@ type BridgeState = {
   workdir?: string
   permission_mode?: string
   trace_level?: TraceLevel
+  /**
+   * When the previous process last shut down cleanly, and on what signal.
+   *
+   * Written by the signal handler, so their *absence* is the interesting case:
+   * a process that died without running it was killed outright or crashed.
+   * Read and cleared at startup, or a later restart would report this one.
+   */
+  stopped_at?: number | null
+  stopped_by?: string | null
+  /** What the exception said, when `stopped_by` is `crash`. */
+  stopped_error?: string | null
 }
 
 function loadState(): BridgeState {
@@ -984,7 +1075,7 @@ class LineStreamer {
     } else {
       await this.writeFence(false)
       if (this.proseFence !== null) {
-        await this.writeThrough(`${this.atStreamLineStart ? '' : '\n'}\`\`\`${this.proseFence}\n`)
+        this.writeThrough(`${this.atStreamLineStart ? '' : '\n'}\`\`\`${this.proseFence}\n`)
       }
     }
     // Blank lines do not carry across a fence; the fence writers place their
@@ -1017,7 +1108,7 @@ class LineStreamer {
    */
   private async writeFence(open: boolean): Promise<void> {
     const lead = this.atStreamLineStart ? '' : '\n'
-    await this.writeThrough(`${lead}\`\`\`${open ? LineStreamer.TRACE_LANG : ''}\n`)
+    this.writeThrough(`${lead}\`\`\`${open ? LineStreamer.TRACE_LANG : ''}\n`)
   }
 
   private static readonly TRACE_LANG = 'text'
@@ -1040,7 +1131,7 @@ class LineStreamer {
     // half-line and the tool name would be held until the tool returned.
     if (channel !== this.channel) await this.switchTo(channel)
     if (this.buffer) return false
-    await this.writeThrough(text)
+    this.writeThrough(text)
     return true
   }
 
@@ -1082,8 +1173,13 @@ class LineStreamer {
     )
   }
 
-  /** Flush the trailing partial line, close the stream, and post any overflow. */
-  async finish(): Promise<void> {
+  /**
+   * Flush the trailing partial line, close the stream, and post any overflow.
+   *
+   * Returns the info string of a code fence the reply was still inside, for
+   * the next message to reopen, or null when it ended outside one.
+   */
+  async finish(): Promise<string | null> {
     if (this.buffer) {
       const rest = this.buffer
       const wasAtStart = this.atLineStart
@@ -1092,13 +1188,24 @@ class LineStreamer {
     }
     // Trailing blank lines are not worth a message of their own.
     this.pendingBlank = ''
+    // A code block the reply opened is not finished, only interrupted. Handed
+    // back so the next message can pick it up; see resumeProseFence.
+    const carried = this.proseFence
     // A turn that ends mid-trace — interrupted, or one that never got round to
     // an answer — would otherwise leave the fence open and swallow whatever the
-    // next message renders beneath it.
+    // next message renders beneath it. On the way into the trace block the
+    // reply's own fence was already closed, so there is only ever one to close.
     if (this.channel === 'trace') {
       await this.writeFence(false)
       this.channel = 'prose'
+    } else if (carried !== null) {
+      this.writeThrough(`${this.atStreamLineStart ? '' : '\n'}\`\`\`\n`)
     }
+    this.proseFence = null
+    // Everything above was queued, not sent. Closing the stream out from under
+    // the drain would end the message before its last batches reached it, and
+    // the overflow below is only whole once the drain has had its say.
+    await this.settle()
     await this.stream?.end()
     this.stream = null
     if (this.overflow.trim()) {
@@ -1106,15 +1213,95 @@ class LineStreamer {
       this.overflow = ''
       await this.sendText(rest.trim())
     }
+    return carried
   }
 
   /**
-   * Hand text to the open stream, opening one on first use and diverting to
-   * `overflow` once QQ has refused. The single place `atStreamLineStart` is
-   * maintained, so a fence always lands on its own line.
+   * Reopen a code fence the previous message was cut inside of.
+   *
+   * A fence belongs to one message and does not survive into the next, but the
+   * seal that ends a message can land anywhere — a tool result arrives while
+   * the reply is halfway through quoting a log. Left alone, the old message
+   * ends unterminated and the reply's own closing fence, now the first one in a
+   * fresh message, reads as an *opening* fence and swallows everything after
+   * it. Both halves render wrong, which is worse than either alone.
    */
-  private async writeThrough(chunk: string): Promise<void> {
+  resumeProseFence(info: string): void {
+    this.proseFence = info
+    this.writeThrough(`\`\`\`${info}\n`)
+  }
+
+  /**
+   * Text handed over but not yet carried by a request.
+   *
+   * An append is one HTTP round trip and they cannot overlap, so a reply that
+   * generates faster than they return will outrun them. Waiting for each one
+   * pinned the whole loop to that rate: 144 requests for 419 characters, under
+   * three characters a request, and a tail that reached the phone half a minute
+   * after the model had stopped writing.
+   *
+   * So the handover does not wait. Deltas arriving behind an in-flight request
+   * pile up here and the next request carries all of them at once. Nothing is
+   * batched when nothing is waiting — a reply slower than the round trip still
+   * goes out a delta at a time — and a batch is never larger than the backlog
+   * that produced it, so this cannot add latency of its own.
+   *
+   * Do not turn this back into an awaited write, and do not reach for a fixed
+   * throttle instead. That was tried: it coarsens every step whether or not
+   * anything is waiting, which reads as stuttering.
+   */
+  private queued = ''
+
+  /** The drain currently running, or null once everything has landed. */
+  private draining: Promise<void> | null = null
+
+  /**
+   * Hand text to the transport. Returns once it is queued, not once it is sent.
+   *
+   * The single place `atStreamLineStart` is maintained, so a fence always lands
+   * on its own line. It tracks what has been handed over rather than what has
+   * been delivered, because the decisions that read it are made while writing.
+   */
+  private writeThrough(chunk: string): void {
     if (!chunk) return
+    this.queued += chunk
+    this.atStreamLineStart = chunk.endsWith('\n')
+    this.draining ??= this.drain()
+  }
+
+  /** Carry the queue to QQ, a request at a time, until it is empty. */
+  private async drain(): Promise<void> {
+    try {
+      while (this.queued) {
+        const chunk = this.queued
+        this.queued = ''
+        await this.deliver(chunk)
+      }
+    } catch (err) {
+      // Losing the drain must not take down the turn producing the text; the
+      // rest of the reply still has finish() and its overflow to land in.
+      log('stream drain failed:', err)
+    } finally {
+      this.draining = null
+    }
+  }
+
+  /**
+   * Wait for everything handed over so far to reach QQ.
+   *
+   * Only ever from the producing side. `deliver` and what it calls — rollStream,
+   * reopen — already run inside the drain, and waiting on it from in there
+   * would be waiting for itself.
+   */
+  private async settle(): Promise<void> {
+    while (this.draining) await this.draining
+  }
+
+  /**
+   * Hand one batch to the open stream, opening one on first use and diverting
+   * to `overflow` once QQ has refused.
+   */
+  private async deliver(chunk: string): Promise<void> {
     if (this.stream?.full) await this.rollStream()
     this.stream ??= this.open()
     // QQ ends a stream from its own side, and has more than one way to say so:
@@ -1123,7 +1310,6 @@ class LineStreamer {
     // rather than holding the rest back until finish() — that wait is what
     // reads as the bridge having hung mid-sentence.
     if (this.stream.failed && !this.stream.exhausted) await this.reopen()
-    this.atStreamLineStart = chunk.endsWith('\n')
     if (this.stream.failed) {
       // Out of passive quota, so there is no new stream to be had. Hold it
       // back rather than drop it; finish() posts it as a normal message so
@@ -1182,7 +1368,7 @@ class LineStreamer {
       // fence a blank line is content — it is the separator between entries,
       // and trimming it away silently removed every one of them.
       if (text) {
-        await this.writeThrough(text.replace(/`{2,}/g, m => `\`${'｀'.repeat(m.length - 1)}`))
+        this.writeThrough(text.replace(/`{2,}/g, m => `\`${'｀'.repeat(m.length - 1)}`))
       }
       return
     }
@@ -1200,7 +1386,7 @@ class LineStreamer {
         this.pendingBlank += chunk
         return
       }
-      await this.writeThrough(this.pendingBlank + chunk)
+      this.writeThrough(this.pendingBlank + chunk)
       this.pendingBlank = ''
     }
 
@@ -1222,6 +1408,9 @@ class LineStreamer {
       // puts the picture where the writing referred to it, instead of stacking
       // every image after the prose has ended.
       await flush()
+      // flush only queued it. The picture may not overtake the words that
+      // introduce it, so the drain has to finish before the message closes.
+      await this.settle()
       await this.stream?.end()
       this.stream = null
       this.atStreamLineStart = true
@@ -1298,6 +1487,13 @@ async function runSession(): Promise<void> {
    */
   let streamedText = false
 
+  /**
+   * A code fence the message just sealed was cut inside of, for the next one to
+   * reopen. Now that a seal can land mid-turn, it lands mid-code-block often —
+   * the reply quotes a log, a tool result comes back partway through it.
+   */
+  let carriedFence: string | null = null
+
   async function closeStreamer(): Promise<boolean> {
     // Settled either way: with no stream open there is nothing left for a
     // pending seal to wait for, and leaving it armed would cut the *next*
@@ -1314,7 +1510,7 @@ async function runSession(): Promise<void> {
     const s = streamer
     streamer = null
     try {
-      await s.finish()
+      carriedFence = await s.finish()
     } catch (err) {
       log('failed to close stream:', err)
     }
@@ -1375,7 +1571,7 @@ async function runSession(): Promise<void> {
   const toolNames = new Map<string, string>()
 
   function newStreamer(): LineStreamer {
-    return new LineStreamer(
+    const s = new LineStreamer(
       () => {
         const user = requireUser()
         return createStream(user, lastInboundMsgId.get(user))
@@ -1394,6 +1590,13 @@ async function runSession(): Promise<void> {
         await sendToQQ(user, text, lastInboundMsgId.get(user))
       },
     )
+    // Before anything else reaches it, so the reopened fence is the first thing
+    // in the message and the text that was cut off resumes inside it.
+    if (carriedFence !== null) {
+      s.resumeProseFence(carriedFence)
+      carriedFence = null
+    }
+    return s
   }
 
   for await (const message of q as any) {
@@ -1536,6 +1739,10 @@ async function runSession(): Promise<void> {
       await closeStreamer()
       block = null
       streamedText = false
+      // A fence is only carried across a seal inside one reply. A turn that
+      // ended inside one left it unbalanced on its own, and reopening it over
+      // the next turn's first words would spread one mistake across two.
+      carriedFence = null
       toolNames.clear()
       log(`turn finished: ${m.subtype}, turns=${m.num_turns}`)
     }
@@ -1548,8 +1755,33 @@ async function main(): Promise<void> {
   permissionMode = state.permission_mode ?? process.env.QQ_PERMISSION_MODE ?? 'auto'
   traceLevel = state.trace_level ?? 'full'
 
-  // The linearity invariant, installed once: every standalone message closes
-  // the open stream on its way out, whoever sends it and whenever it is added.
+  // A session on disk means this process is picking up a conversation rather
+  // than starting one, which the agent has no other way to find out.
+  if (state.session_id) {
+    const now = Date.now()
+    const bootedAt = now - uptime() * 1000
+    restartNotice = {
+      at: now,
+      stoppedAt: state.stopped_at ?? null,
+      signal: state.stopped_by ?? null,
+      error: state.stopped_error ?? null,
+      // With a recorded stop, a boot after it settles the question. Without
+      // one, coming up within a few minutes of boot is the tell — that is
+      // launchd starting its jobs, not someone restarting this one.
+      rebooted: state.stopped_at
+        ? bootedAt > state.stopped_at
+        : now - bootedAt < 5 * 60_000,
+    }
+    log(`resuming an existing session; previous stop: ${state.stopped_by ?? 'none recorded'}`)
+  }
+  // Cleared whether or not it was reported, so the next restart cannot inherit
+  // this one's cause and describe a shutdown that already happened.
+  if (state.stopped_at || state.stopped_by) {
+    patchState({ stopped_at: null, stopped_by: null, stopped_error: null })
+  }
+
+  // Sealing before a standalone message, installed once. Cards with buttons are
+  // exempt and take their own route — see `beforeSend` in qq.ts.
   onBeforeSend(async () => {
     await sealStream()
   })
@@ -1610,6 +1842,10 @@ async function shutdown(signal: string): Promise<void> {
   if (shuttingDown) return
   shuttingDown = true
   log(`${signal} received, shutting down`)
+  // Recorded first. Everything below can be cut short by the grace timer or by
+  // launchd losing patience, and the successor reads the *absence* of this as
+  // "died without warning" — so it has to be on disk before anything can fail.
+  patchState({ stopped_at: Date.now(), stopped_by: signal, stopped_error: null })
   setTimeout(() => process.exit(0), SHUTDOWN_GRACE_MS).unref()
   try {
     // Only when a reply was actually in flight. A restart while idle needs no
@@ -1627,5 +1863,32 @@ async function shutdown(signal: string): Promise<void> {
 
 process.on('SIGINT', () => void shutdown('SIGINT'))
 process.on('SIGTERM', () => void shutdown('SIGTERM'))
+
+/**
+ * Record a crash on the way out, then crash anyway.
+ *
+ * Registering a handler suppresses the default exit, so exiting here is what
+ * keeps the behaviour the same as before — launchd sees a failure and restarts,
+ * but now the successor can say what happened instead of reporting the death as
+ * unexplained.
+ *
+ * unhandledRejection is deliberately left alone. Listening to it would also
+ * suppress whatever the runtime does today, and guessing wrong there invents
+ * crashes in a process that used to survive. Those land in the no-record case,
+ * which reads as "no exit path ran" — true enough.
+ */
+process.on('uncaughtException', err => {
+  log('uncaught exception:', err)
+  try {
+    patchState({
+      stopped_at: Date.now(),
+      stopped_by: 'crash',
+      stopped_error: String((err as Error)?.message ?? err).slice(0, 200),
+    })
+  } catch {
+    // Nothing left to do about it; the crash itself still has to happen.
+  }
+  process.exit(1)
+})
 
 await main()
