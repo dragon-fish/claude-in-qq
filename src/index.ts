@@ -1015,6 +1015,7 @@ class LineStreamer {
 
   async push(delta: string, channel: Channel = 'prose'): Promise<void> {
     if (channel !== this.channel) await this.switchTo(channel)
+    if (this.channel === 'prose') this.trackFenceLines(delta)
     this.buffer += delta
 
     const cut = this.buffer.lastIndexOf('\n')
@@ -1089,6 +1090,32 @@ class LineStreamer {
    * is not inside one. Tracked because the trace has to step around it.
    */
   private proseFence: string | null = null
+
+  /** The line being assembled for fence tracking, however the text was cut up. */
+  private fenceLine = ''
+
+  /**
+   * Feed the reply's text through, line by logical line.
+   *
+   * Deliberately driven from `push` rather than from `emit`. A line is released
+   * as soon as it can no longer be a MEDIA line, long before its newline
+   * arrives, and that release sets `atLineStart` false — which is the very test
+   * `emit` gated fence tracking on. So a fence the model happened to split, as
+   * "``" then "`ts\n", was never recorded: `proseFence` stayed null, the trace
+   * block opened inside a code block the streamer did not know was open, and
+   * every fence after it landed on the wrong side. Whether a reply came out
+   * right came down to where the model put its delta boundaries.
+   *
+   * Do not move this back into `emit`, and do not call it from both — a whole
+   * line arriving in one delta would then toggle the fence twice.
+   */
+  private trackFenceLines(text: string): void {
+    this.fenceLine += text
+    for (let nl = this.fenceLine.indexOf('\n'); nl >= 0; nl = this.fenceLine.indexOf('\n')) {
+      this.trackProseFence(this.fenceLine.slice(0, nl))
+      this.fenceLine = this.fenceLine.slice(nl + 1)
+    }
+  }
 
   /** Update `proseFence` for one line of the reply. */
   private trackProseFence(line: string): void {
@@ -1395,10 +1422,8 @@ class LineStreamer {
       const atStart = lineStart
       const media = atStart ? /^MEDIA:[ \t]*(\S.*?)[ \t]*$/.exec(line.replace(/\n$/, '')) : null
       lineStart = line.endsWith('\n')
-      // Only whole lines: a fence is a line, and half of one released early
-      // by the chunker would read as an opening fence with a truncated info
-      // string.
-      if (atStart && lineStart) this.trackProseFence(line)
+      // Fence tracking does not happen here — see trackFenceLines for why this
+      // is the wrong place for it.
       if (!media) {
         prose += line
         continue
