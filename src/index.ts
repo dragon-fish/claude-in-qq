@@ -75,11 +75,10 @@ const QUESTION_TIMEOUT_MS = 15 * 60 * 1000
 /**
  * End the turn's growing message, so whatever comes next starts a new one.
  *
- * For a standalone message that is its own utterance rather than part of the
- * reply — a slash command's answer, a file, the shutdown notice. Those follow
- * what was said; leaving the stream open would have the reply above go on
- * growing after them. Cards with buttons are not in this group and deliberately
- * do not seal: see `beforeSend` in qq.ts.
+ * Ordering in QQ is positional, so anything sent as its own message — a slash
+ * command's answer, an approval card, a question, a file — lands below a stream
+ * that would otherwise go on growing above it. Sealing first puts the reply
+ * underneath the thing it is replying to, where it happened.
  *
  * Returns whether there was anything to seal.
  *
@@ -106,6 +105,14 @@ let sealStream: () => Promise<boolean> = async () => false
  * seal from any cause settles it. Both matter: left armed with nothing to cut,
  * it would fire on the *next* reply instead, severing that one at its first
  * tool result over a message it was already answering.
+ *
+ * This is one of the two rules that decide where a message ends, one per
+ * direction. Outbound is `beforeSend` in qq.ts: anything not written into the
+ * open stream seals it on the way out, enforced at the transport so a sender
+ * added later inherits it. Inbound is this: the seal waits for the moment the
+ * message actually reaches the model. Answering a card is an inbound message
+ * that happens to arrive as a tool result, and needs nothing of its own —
+ * posting the card already sealed under the outbound rule.
  */
 let sealPending = false
 

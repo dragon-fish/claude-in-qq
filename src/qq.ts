@@ -302,9 +302,7 @@ export async function sendToQQ(
   replyTo?: string,
   keyboard?: Record<string, unknown>,
 ): Promise<void> {
-  // A card carrying buttons belongs to the reply that is still being written,
-  // so it does not end it. See `beforeSend`.
-  if (!keyboard) await beforeSend()
+  await beforeSend()
   const chunks = chunkText(text)
 
   for (const [i, chunk] of chunks.entries()) {
@@ -347,23 +345,29 @@ export async function sendToQQ(
 // @see https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_openid_stream_messages.post.html
 
 /**
- * Run before a standalone message that ends what came before it.
+ * Run before every standalone message, whatever sends it and whatever it says.
  *
  * A QQ conversation is strictly linear: a message occupies the position it was
  * posted at, and nothing that arrives later can appear above it. A stream, on
  * the other hand, keeps writing into the position it started at. So a message
- * posted while a stream is open leaves that stream growing *above* it.
+ * posted while a stream is open leaves that stream growing *above* it, and the
+ * reader watches something they have already scrolled past rewrite itself.
  *
  * Registering the seal here rather than calling it from each sender makes that
  * an invariant instead of a habit: a new sender added later cannot forget.
  *
- * Keyboards are the exception, and `sendToQQ` skips the seal for them. An
- * approval card or a question is not a new utterance — it is the reply above
- * reaching a point where it needs an answer, and it goes on from the same place
- * once it has one. Sealing for it cuts one reply into a stack of fragments, one
- * per button the turn happened to need, and spends a passive slot re-opening
- * each time. Left open, the card lands below everything said so far and the
- * answer continues the message it belongs to.
+ * No exceptions, and cards with buttons are not one. A tool call that asks for
+ * something is where the conversation changes hands: the bot's name is on the
+ * message, but the turn it opens belongs to the operator, and what the agent
+ * says afterwards answers them. Read that way it is not a special case at all
+ * — it is an inbound message that happens to be posted by this side — and it
+ * wants the same treatment as one. Carving out a class of message here is what
+ * turns the invariant back into a habit, and then every tool added later has to
+ * remember on its own.
+ *
+ * Sealing does not cut anything short. `finish()` drains the queued appends
+ * before it closes, so by the time the message goes out the bubble above it is
+ * complete — the card cannot land over text still on its way.
  */
 let beforeSend: () => Promise<void> = async () => {}
 
