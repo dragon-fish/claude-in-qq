@@ -354,22 +354,29 @@ register(
       // tail comes off before comparing, or nothing ever matches.
       const bare = (s: string | undefined) => s?.replace(/\[[^\]]*\]$/, '')
       const wanted = bare(live ?? undefined)
-      // Several rows can resolve to one model: 'default' and 'opus[1m]' both
-      // land on Opus. Only the first is marked — they name the same thing, and
-      // two markers would pose a question that has no answer.
+      // Several rows can resolve to one model: 'default' and 'opus' both land on
+      // Opus 5.5. Only the first is marked — they name the same thing, and two
+      // markers would pose a question that has no answer.
       const liveIndex = wanted
         ? models.findIndex(m => bare(m.value) === wanted || bare(m.resolvedModel) === wanted)
         : -1
-      // Prefer the display name: it is what the buttons say, and a raw wire id
-      // in the header would not visibly match any of them.
-      const current = models[liveIndex]?.displayName ?? live
 
       const labels = models.map(m => m.displayName || m.value)
-      const idx = await deps.askChoice(labels, () => {
-        // Three lines and the buttons. A table here repeats the buttons
-        // verbatim once they truncate, which is most of the time.
+      const idx = await deps.askChoice(labels, mode => {
         const lines = ['**可用模型**']
-        if (current) lines.push(`当前：\`${current}\``)
+        // A button carries the name and nothing else, and the alias rows hide
+        // the thing most worth knowing — 'Default (recommended)' never says
+        // which version it resolves to today. So the list below the buttons
+        // carries the descriptions, which is also where the version lives for
+        // those rows. Numbered, so a truncated button still has a referent.
+        if (liveIndex < 0 && live) lines.push(`当前：\`${live}\``)
+        lines.push('')
+        models.forEach((m, i) => {
+          const marker = mode === 'letters' ? ('ABCDEFGH'[i] ?? String(i + 1)) : `${i + 1}.`
+          const desc = m.description ? ` · ${cell(m.description, 60)}` : ''
+          lines.push(`${marker} **${m.displayName || m.value}**${desc}${i === liveIndex ? ' ←当前' : ''}`)
+        })
+        lines.push('')
         lines.push('点按钮切换，或 `/model default` 恢复默认')
         return lines.join('\n')
       })
