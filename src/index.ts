@@ -873,6 +873,24 @@ function shortPath(value: unknown): string {
   return oneLine(rel || path)
 }
 
+/** How a subagent's end reads, by the status it ended with; others are not an end. */
+const SUBAGENT_OUTCOMES: Record<string, string> = {
+  completed: '✅ 子代理完成',
+  failed: '❌ 子代理失败',
+  stopped: '⏹ 子代理已停止',
+  killed: '⏹ 子代理已停止',
+}
+
+function formatDuration(ms: number): string {
+  const s = Math.round(ms / 1000)
+  return s < 60 ? `${s} 秒` : `${Math.floor(s / 60)} 分 ${s % 60} 秒`
+}
+
+/** Spawning a subagent is announced by its own start line instead. */
+function isSubagentTool(name: string): boolean {
+  return name === 'Agent' || name === 'Task'
+}
+
 /**
  * The trace line for a tool call, or null to leave it out.
  *
@@ -881,7 +899,7 @@ function shortPath(value: unknown): string {
  * someone what you are about to tell them.
  */
 function summariseTool(name: string, input: Record<string, any>): string | null {
-  if (name.startsWith('mcp__qq__')) return null
+  if (name.startsWith('mcp__qq__') || isSubagentTool(name)) return null
 
   const arg = (() => {
     switch (name) {
@@ -900,8 +918,6 @@ function summariseTool(name: string, input: Record<string, any>): string | null 
         return oneLine(input.pattern)
       case 'WebFetch':
         return oneLine(input.url)
-      case 'Task':
-        return oneLine(input.description)
       default:
         return ''
     }
@@ -1601,6 +1617,19 @@ async function runSession(): Promise<void> {
   let block: string | null = null
   /** tool_use id → name, so a result can be matched to the call that made it. */
   const toolNames = new Map<string, string>()
+  /**
+   * Subagents still working, by task id. Their own frames are never shown, so
+   * a start and an end line are all the operator gets — enough to tell a long
+   * wait from a hang. Outlives turns: a background one ends in a later one.
+   */
+  const subagents = new Map<string, { description: string; startedAt: number }>()
+
+  async function traceSubagent(line: string): Promise<void> {
+    await traceBreak()
+    await trace(`${line}\n`)
+    traceStarted = true
+    lastKind = null
+  }
 
   function newStreamer(): LineStreamer {
     const s = new LineStreamer(
@@ -1634,10 +1663,33 @@ async function runSession(): Promise<void> {
   for await (const message of q as any) {
     const m = message as any
 
+    // A subagent's frames carry the Agent call that spawned it. They are its
+    // own work, not the operator's conversation: tracing them floods the chat
+    // with another agent's Bash and Edit, and their tool results would also
+    // drain `toolNames` and fire the mid-turn seal at the wrong boundary. The
+    // Agent call itself is a top-level frame and is still traced.
+    if (m.parent_tool_use_id) continue
+
     if (m.type === 'system' && m.subtype === 'init') {
       // Persist immediately: a crash before the first reply should still leave
       // a resumable session behind.
       if (m.session_id) saveSessionId(m.session_id)
+    } else if (m.type === 'system' && m.subtype === 'task_started') {
+      if (m.task_type === 'local_agent' && !m.ambient) {
+        subagents.set(m.task_id, { description: m.description, startedAt: Date.now() })
+        await traceSubagent(`🤖 已创建子代理：${m.description}（当前 ${subagents.size} 个）`)
+      }
+    } else if (m.type === 'system' && (m.subtype === 'task_notification' || m.subtype === 'task_updated')) {
+      // A task can report its end both ways; whichever lands first removes it,
+      // so the other finds nothing and says nothing.
+      const status: string | undefined = m.subtype === 'task_notification' ? m.status : m.patch?.status
+      const agent = subagents.get(m.task_id)
+      const outcome = status ? SUBAGENT_OUTCOMES[status] : undefined
+      if (agent && outcome) {
+        subagents.delete(m.task_id)
+        const took = formatDuration(m.usage?.duration_ms ?? Date.now() - agent.startedAt)
+        await traceSubagent(`${outcome}：${agent.description}，用时 ${took}（剩 ${subagents.size} 个）`)
+      }
     } else if (m.type === 'stream_event') {
       // Everything the operator sees is driven from here rather than from the
       // finished assistant message, because only the event order says what
@@ -1713,7 +1765,7 @@ async function runSession(): Promise<void> {
               traceStarted = true
               lastKind = 'tools'
             }
-          } else if (traceLevel === 'balanced' && !b.name.startsWith('mcp__qq__')) {
+          } else if (traceLevel === 'balanced' && !b.name.startsWith('mcp__qq__') && !isSubagentTool(b.name)) {
             // Names accumulate along one line — a stream can only append, so
             // the line is built as it goes rather than rewritten at the end.
             // Written straight through: without a newline to end it, a
