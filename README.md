@@ -179,7 +179,7 @@ Get-Content -Wait ~/.claude/channels/qq/bridge.log    # 日志
 `Stop-ScheduledTask` 停不掉它：计划任务只结束了启动脚本，bun 会留下来继续跑。
 
 另外两点和服务无关、但 Windows 上会碰到：`chmod 600` 没有对应物，凭据靠用户目录本身的 ACL 保护；
-`MEDIA:` 后面写 `C:\...` 这样的 Windows 绝对路径即可。
+`/cwd` 和 `MEDIA:` 的路径会归一化成磁盘上的真实写法，`e:/x`、`/e/x`（Git Bash）都认。
 
 #### 其他平台
 

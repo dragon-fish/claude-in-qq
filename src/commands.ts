@@ -13,9 +13,9 @@
 import { listSessions } from '@anthropic-ai/claude-agent-sdk'
 import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
-import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { nativePath } from './paths.js'
 
 /** How much meaning the buttons carry on their own; see buildAskKeyboard. */
 export type AskMode = 'text' | 'truncated' | 'letters'
@@ -588,7 +588,7 @@ register(
         await deps.reply(`当前工作目录：\`${deps.workdir()}\``)
         return
       }
-      const next = arg.startsWith('~') ? join(homedir(), arg.slice(1)) : arg
+      const next = nativePath(arg, deps.workdir())
       if (!existsSync(next)) {
         await deps.reply(`目录不存在：\`${next}\``)
         return

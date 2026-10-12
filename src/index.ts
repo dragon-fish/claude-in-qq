@@ -17,6 +17,7 @@ import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { homedir, uptime } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { nativePath } from './paths.js'
 import {
   buildApprovalKeyboard,
   buildAskKeyboard,
@@ -973,7 +974,7 @@ async function deliverReply(text: string): Promise<void> {
 
   for (const [i, path] of paths.entries()) {
     try {
-      await sendFile(user, path, replyTo, asCaption && i === 0 ? remaining : undefined)
+      await sendFile(user, nativePath(path, workdir), replyTo, asCaption && i === 0 ? remaining : undefined)
       log(`sent file ${path}`)
     } catch (err) {
       // Logged, not reported: the operator asked for a file, not for an
@@ -1640,7 +1641,7 @@ async function runSession(): Promise<void> {
       async path => {
         try {
           const user = requireUser()
-          await sendFile(user, path, lastInboundMsgId.get(user))
+          await sendFile(user, nativePath(path, workdir), lastInboundMsgId.get(user))
           log(`sent file ${path}`)
         } catch (err) {
           log(`failed to send ${path}:`, err)
