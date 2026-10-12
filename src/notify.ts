@@ -10,6 +10,12 @@
  *   bun run notify "构建完成"
  *   bun run notify --from partymaker-service "测试全绿"
  *   somecommand | bun run notify --from ci
+ *   bun run notify --from render "出图了" MEDIA:/tmp/a.png
+ *
+ * A `MEDIA:/path` line — the same convention the bridge's agent uses — sends
+ * that file as a native attachment, so text and files go out in the order
+ * they are written. A positional argument that is a whole `MEDIA:` line counts
+ * as its own line.
  *
  * Every message is labelled with its origin, because the operator is already
  * chatting with the bridge in that same QQ window and an unattributed line
@@ -20,10 +26,18 @@
  */
 
 import { createHash } from 'node:crypto'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, join } from 'node:path'
-import { appendRelayed, HAS_CREDENTIALS, loadAccess, sendToQQ, STATE_DIR } from './qq.js'
+import { basename, join, resolve } from 'node:path'
+import {
+  appendRelayed,
+  HAS_CREDENTIALS,
+  loadAccess,
+  MEDIA_LINE_RE,
+  sendFile,
+  sendToQQ,
+  STATE_DIR,
+} from './qq.js'
 
 async function readStdin(): Promise<string> {
   const chunks: Buffer[] = []
@@ -42,14 +56,46 @@ for (let i = 0; i < args.length; i++) {
   words.push(args[i])
 }
 
-let text = words.join(' ').trim()
+let text = words.map(w => (/^MEDIA:/.test(w.trim()) ? `\n${w.trim()}\n` : w)).join(' ').trim()
 if (!text && !process.stdin.isTTY) text = (await readStdin()).trim()
 
 if (!text) {
   console.error('用法: bun run notify [--from <来源>] <消息>')
-  console.error('      <消息> 也可以从 stdin 传入')
+  console.error('      <消息> 也可以从 stdin 传入；单独一行 MEDIA:/路径 会作为附件发送')
   process.exit(1)
 }
+
+type Segment = { text: string } | { file: string }
+
+/** Prose and attachments in the order written; relative paths resolve against the caller's cwd. */
+function toSegments(raw: string): Segment[] {
+  const out: Segment[] = []
+  let last = 0
+  for (const m of raw.matchAll(MEDIA_LINE_RE)) {
+    const prose = raw.slice(last, m.index).trim()
+    if (prose) out.push({ text: prose })
+    out.push({ file: resolve(m[1]) })
+    last = m.index + m[0].length
+  }
+  const tail = raw.slice(last).trim()
+  if (tail) out.push({ text: tail })
+  return out
+}
+
+const segments = toSegments(text)
+
+// Checked before anything goes out: a missing file discovered halfway would
+// leave the operator with the caption and no picture.
+const missing = segments.flatMap(s =>
+  'file' in s && !(existsSync(s.file) && statSync(s.file).isFile()) ? [s.file] : [],
+)
+if (missing.length) {
+  console.error(`找不到文件: ${missing.join(', ')}`)
+  process.exit(1)
+}
+
+// Paths resolved, so the rate check and the relayed note see what was sent.
+text = segments.map(s => ('file' in s ? `MEDIA:${s.file}` : s.text)).join('\n\n')
 
 if (!HAS_CREDENTIALS) {
   console.error('QQ 凭据缺失，先跑: bun run onboard')
@@ -120,14 +166,23 @@ if (recent.length >= DAILY_MAX) {
 
 const cwd = process.cwd().replace(homedir(), '~')
 const origin = from || basename(process.cwd())
-const body = from
-  ? `**${from}**（\`${cwd}\`）下的 Claude 给你留言：\n\n${text}`
-  : `\`${cwd}\` 下的 Claude 给你留言：\n\n${text}`
+const header = from
+  ? `**${from}**（\`${cwd}\`）下的 Claude 给你留言：`
+  : `\`${cwd}\` 下的 Claude 给你留言：`
+
+// The attribution leads whatever comes first; a bare attachment would read as
+// something the bridge's agent sent.
+const [first, ...rest] = segments
+const outgoing: Segment[] =
+  'text' in first ? [{ text: `${header}\n\n${first.text}` }, ...rest] : [{ text: header }, ...segments]
 
 let failed = 0
 for (const openid of access.allowed) {
   try {
-    await sendToQQ(openid, body)
+    for (const seg of outgoing) {
+      if ('text' in seg) await sendToQQ(openid, seg.text)
+      else await sendFile(openid, seg.file)
+    }
   } catch (err) {
     failed++
     console.error(`发送给 ${openid.slice(0, 8)} 失败:`, err instanceof Error ? err.message : err)

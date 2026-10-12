@@ -34,6 +34,7 @@ import {
   LETTERS,
   loadAccess,
   log,
+  MEDIA_LINE_RE,
   PAIRING_TTL_MS,
   randomId,
   saveAccess,
@@ -836,15 +837,8 @@ function commandDeps(user: string): CommandDeps {
 
 // ------------------------------------------------------------------ main loop
 
-/**
- * A line of exactly `MEDIA:/absolute/path` asks for that file to be sent as a
- * native attachment. Claude has no way to hand over a file otherwise — it can
- * describe a screenshot or a log, but not give it to you.
- */
 /** Above this, prose is its own message so it keeps markdown rendering. */
 const CAPTION_LIMIT = 200
-
-const MEDIA_LINE_RE = /^MEDIA:[ \t]*(\S.*?)[ \t]*$/gm
 
 // ------------------------------------------------------------- trace summaries
 //

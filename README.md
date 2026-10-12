@@ -181,6 +181,7 @@ QQ 发一条单向通知：
 ```bash
 qq-notify --from "重构订单模块" "测试全绿，可以合了"
 pytest 2>&1 | tail -20 | qq-notify --from "跑测试"
+qq-notify --from "出图" "对比图如下" MEDIA:./board.png   # 单独一行 MEDIA:路径 作为附件发送
 ```
 
 ```bash

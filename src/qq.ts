@@ -886,6 +886,13 @@ export async function fetchImage(
   }
 }
 
+/**
+ * A line of exactly `MEDIA:/absolute/path` asks for that file to be sent as a
+ * native attachment. Claude has no way to hand over a file otherwise — it can
+ * describe a screenshot or a log, but not give it to you.
+ */
+export const MEDIA_LINE_RE = /^MEDIA:[ \t]*(\S.*?)[ \t]*$/gm
+
 /** QQ media kinds for the upload endpoint. */
 const MEDIA_IMAGE = 1
 const MEDIA_VIDEO = 2
