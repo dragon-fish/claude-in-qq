@@ -1543,7 +1543,19 @@ async function runSession(): Promise<void> {
    */
   let carriedFence: string | null = null
 
+  /**
+   * Whether the streamer is sending an attachment from one of its own MEDIA
+   * lines. It ends its own message before the file goes out, so the seal that
+   * `sendFile` runs on the way finds nothing above it to close.
+   */
+  let sendingOwnMedia = false
+
   async function closeStreamer(): Promise<boolean> {
+    // Not a seal at all: the streamer is mid-emit, and finishing it from inside
+    // would flush the partial line it holds back — the "M" of the next MEDIA
+    // line goes out as text, and the rest of that line, landing in a fresh
+    // streamer that never saw its start, is no longer recognised as one.
+    if (sendingOwnMedia) return false
     // Settled either way: with no stream open there is nothing left for a
     // pending seal to wait for, and leaving it armed would cut the *next*
     // reply at its first tool result for no reason.
@@ -1639,12 +1651,15 @@ async function runSession(): Promise<void> {
         return createStream(user, lastInboundMsgId.get(user))
       },
       async path => {
+        sendingOwnMedia = true
         try {
           const user = requireUser()
           await sendFile(user, nativePath(path, workdir), lastInboundMsgId.get(user))
           log(`sent file ${path}`)
         } catch (err) {
           log(`failed to send ${path}:`, err)
+        } finally {
+          sendingOwnMedia = false
         }
       },
       async text => {
