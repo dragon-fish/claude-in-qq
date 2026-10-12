@@ -71,7 +71,7 @@ src/index.ts ──── Claude Agent SDK ──── Claude Code（订阅额�
 | `src/onboard.ts`  | 扫码配置                                        |
 | `src/panel.ts`    | 把斜杠指令注册进 QQ 指令面板                    |
 | `src/pair.ts`     | 白名单管理，只能在本机跑                        |
-| `service/`        | 常驻服务（macOS launchd）                       |
+| `service/`        | 常驻服务（macOS launchd / Windows 计划任务）    |
 
 ## 上手
 
@@ -127,7 +127,7 @@ bun run pair <code>      # 批准
 
 不装也能用，但进程活在启动它的那个终端里，关掉就没了。
 
-作者用 macOS，所以仓库里带的是一份开箱即用的 launchd 脚本：
+作者用 macOS，所以 launchd 脚本最成熟、开箱即用（Windows 见下文）：
 
 ```bash
 service/install.sh
@@ -151,7 +151,37 @@ launchctl bootout   gui/$UID/local.claude-in-qq       # 停止并卸载
 tail -f ~/.claude/channels/qq/bridge.log              # 日志
 ```
 
-#### 不是 macOS 的话
+#### Windows
+
+用计划任务托管，同样是现场生成、不进仓库。从你日常用的 pwsh 7 里跑（脚本含中文，Windows PowerShell 5.1
+读不对）：
+
+```powershell
+pwsh service/install.ps1
+```
+
+它读当前 shell 的代理变量，写进任务参数——计划任务没有设置环境变量的地方。`PATH` 不用传：计划任务
+从注册表构造环境，拿到的就是真实的 `PATH`，只缺 `$PROFILE` 里临时追加的那些。
+
+任务有两个触发器：登录时启动，外加从安装时刻起每分钟一次的看门狗。后者不能挂在登录触发器上——挂在
+上面的重复要等**下一次登录**才开始计时，装完不重启的话看门狗等于不存在。
+
+日常操作：
+
+```powershell
+# 重启（改完代码用这个）：结束 bun，看门狗一分钟内拉起
+Get-CimInstance Win32_Process -Filter "Name = 'bun.exe'" | Where-Object CommandLine -like '*src/index.ts*' |
+  ForEach-Object { Stop-Process -Id $_.ProcessId }
+Unregister-ScheduledTask claude-in-qq    # 卸载（之后再用上一条结束 bun）
+Get-Content -Wait ~/.claude/channels/qq/bridge.log    # 日志
+```
+
+`Stop-ScheduledTask` 停不掉它：计划任务只结束了启动脚本，bun 会留下来继续跑。
+
+另外两点和服务无关、但 Windows 上会碰到：`chmod 600` 没有对应物，凭据靠用户目录本身的 ACL 保护；
+`/cwd` 和 `MEDIA:` 的路径会归一化成磁盘上的真实写法，`e:/x`、`/e/x`（Git Bash）都认。
+
+#### 其他平台
 
 没有现成脚本，但也不必照搬。读一遍 `service/install.sh` 和 `service/claude-in-qq.sh`——它们做的事
 很直白——然后按本机 init 系统的惯例重写一份（Linux 上大概是 systemd user unit 加

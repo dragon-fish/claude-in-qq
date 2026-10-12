@@ -16,7 +16,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 
 // ---------------------------------------------------------------- paths & env
 
@@ -935,7 +935,7 @@ export async function sendFile(
     srv_send_msg: false,
     file_data: buf.toString('base64'),
   }
-  if (kind === MEDIA_FILE) body.file_name = path.split('/').pop()
+  if (kind === MEDIA_FILE) body.file_name = basename(path)
 
   const upload = await qqFetch(
     `/v2/users/${openid}/files`,
