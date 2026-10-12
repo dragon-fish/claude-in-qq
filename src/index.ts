@@ -14,7 +14,7 @@ import { createSdkMcpServer, query, tool } from '@anthropic-ai/claude-agent-sdk'
 import { z } from 'zod'
 import { allCommands, dispatch, type CommandDeps } from './commands.js'
 import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
-import { uptime } from 'node:os'
+import { homedir, uptime } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
@@ -1835,7 +1835,7 @@ async function runSession(): Promise<void> {
 
 async function main(): Promise<void> {
   const state = loadState()
-  workdir = state.workdir ?? process.env.QQ_BRIDGE_CWD ?? process.env.HOME!
+  workdir = state.workdir ?? process.env.QQ_BRIDGE_CWD ?? homedir()
   permissionMode = state.permission_mode ?? process.env.QQ_PERMISSION_MODE ?? 'auto'
   traceLevel = state.trace_level ?? 'full'
 
