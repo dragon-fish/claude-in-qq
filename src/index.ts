@@ -543,7 +543,9 @@ const qqTools = createSdkMcpServer({
           return lines.join('\n')
         }
 
+        log(`question ${id} posting: ${question.slice(0, 60)}`)
         await postQuestion(user, id, options, render)
+        log(`question ${id} posted`)
 
         const answer = await new Promise<string>(resolve => {
           const timer = setTimeout(() => {
@@ -999,6 +1001,11 @@ async function deliverReply(text: string): Promise<void> {
 type Channel = 'prose' | 'trace'
 
 class LineStreamer {
+  private static nextId = 1
+  /** Names this streamer in the log, so a seal can be matched to what it sealed. */
+  readonly id = LineStreamer.nextId++
+  /** Set once finish() starts; text pushed after that has no close coming. */
+  private finished = false
   private buffer = ''
   private stream: StreamHandle | null = null
   /** Text that missed the stream and has to go out as an ordinary message. */
@@ -1032,6 +1039,7 @@ class LineStreamer {
   private atLineStart = true
 
   async push(delta: string, channel: Channel = 'prose'): Promise<void> {
+    if (this.finished) log(`streamer #${this.id} push after finish (${channel}): ${JSON.stringify(delta.slice(0, 80))}`)
     if (channel !== this.channel) await this.switchTo(channel)
     if (this.channel === 'prose') this.trackFenceLines(delta)
     this.buffer += delta
@@ -1225,6 +1233,7 @@ class LineStreamer {
    * the next message to reopen, or null when it ended outside one.
    */
   async finish(): Promise<string | null> {
+    this.finished = true
     if (this.buffer) {
       const rest = this.buffer
       const wasAtStart = this.atLineStart
@@ -1256,6 +1265,7 @@ class LineStreamer {
     if (this.overflow.trim()) {
       const rest = this.overflow
       this.overflow = ''
+      log(`streamer #${this.id} posting ${rest.length} chars of overflow as a message`)
       await this.sendText(rest.trim())
     }
     return carried
@@ -1348,6 +1358,7 @@ class LineStreamer {
    */
   private async deliver(chunk: string): Promise<void> {
     if (this.stream?.full) await this.rollStream()
+    if (!this.stream && this.finished) log(`streamer #${this.id} opening a stream after finish — nothing will close it`)
     this.stream ??= this.open()
     // QQ ends a stream from its own side, and has more than one way to say so:
     // 40034020 is a documented time limit, seen once at ten minutes, and
@@ -1359,6 +1370,7 @@ class LineStreamer {
       // Out of passive quota, so there is no new stream to be had. Hold it
       // back rather than drop it; finish() posts it as a normal message so
       // nothing is lost and nothing already on screen gets repeated.
+      if (!this.overflow) log(`streamer #${this.id} diverting to overflow (stream failed, exhausted=${this.stream.exhausted})`)
       this.overflow += chunk
       return
     }
@@ -1544,7 +1556,8 @@ async function runSession(): Promise<void> {
    */
   let sendingOwnMedia = false
 
-  async function closeStreamer(): Promise<boolean> {
+  async function closeStreamer(reason = 'before send'): Promise<boolean> {
+    if (streamer) log(`sealing streamer #${streamer.id}: ${reason}${sendingOwnMedia ? ' (skipped: own media)' : ''}`)
     // Not a seal at all: the streamer is mid-emit, and finishing it from inside
     // would flush the partial line it holds back — the "M" of the next MEDIA
     // line goes out as text, and the rest of that line, landing in a fresh
@@ -1730,7 +1743,10 @@ async function runSession(): Promise<void> {
       } else if (ev?.type === 'content_block_delta') {
         const delta = ev.delta
         if (delta?.type === 'text_delta') {
-          streamer ??= newStreamer()
+          if (!streamer) {
+            streamer = newStreamer()
+            log(`streamer #${streamer.id} created for ${currentUser ? lastInboundMsgId.get(currentUser)?.slice(-8) : 'none'}`)
+          }
           streamedText = true
           // Prose closes the block; a later one starts its own entry list.
           traceStarted = false
@@ -1824,13 +1840,13 @@ async function runSession(): Promise<void> {
       //
       // After the summaries, not before. Those describe work that finished
       // ahead of the operator's message, so they belong to the stream above.
-      if (sawToolResult && sealPending && toolNames.size === 0) await closeStreamer()
+      if (sawToolResult && sealPending && toolNames.size === 0) await closeStreamer('operator message joins')
     } else if (m.type === 'result') {
       // Where the stream closes when nothing closed it earlier. A turn can also
       // end without a final assistant message (interrupt, error), and this
       // catches that too rather than leaving it half-written. The trace
       // bookkeeping is reset by closeStreamer itself.
-      await closeStreamer()
+      await closeStreamer('turn end')
       block = null
       streamedText = false
       // A fence is only carried across a seal inside one reply. A turn that

@@ -27,7 +27,7 @@ const LOG_FILE = join(STATE_DIR, 'bridge.log')
 
 export function log(...parts: unknown[]): void {
   const line = `${new Date().toISOString()} ${parts
-    .map(p => (typeof p === 'string' ? p : JSON.stringify(p)))
+    .map(p => (typeof p === 'string' ? p : p instanceof Error ? (p.stack ?? String(p)) : JSON.stringify(p)))
     .join(' ')}\n`
   process.stderr.write(`[qq] ${line}`)
   try {
@@ -198,7 +198,10 @@ function claimPassive(msgId: string | undefined): string | null {
     passiveQuota.set(msgId, { used: 1, firstAt: now })
     return msgId
   }
-  if (entry.used >= PASSIVE_MAX_USES || now - entry.firstAt >= PASSIVE_TTL_MS) return null
+  if (entry.used >= PASSIVE_MAX_USES || now - entry.firstAt >= PASSIVE_TTL_MS) {
+    log(`passive quota spent for ${msgId.slice(-8)}: used ${entry.used}, age ${Math.round((now - entry.firstAt) / 1000)}s`)
+    return null
+  }
   entry.used += 1
   return msgId
 }
@@ -473,6 +476,9 @@ export function createStream(openid: string, replyTo?: string): StreamHandle {
   const passiveId = claimPassive(replyTo)
   const seq = msgSeq++
   let failed = !passiveId
+  if (failed) log(`stream born failed: no passive id (replyTo ${replyTo ? replyTo.slice(-8) : 'none'})`)
+  /** Set by end(); a write after it is text no closing replace will ever cover. */
+  let ended = false
   /** Distinct from `full`, which is the accumulated text this stream has sent. */
   let nearlyFull = false
   /** Set when QQ refuses further streams against this msg_id entirely. */
@@ -549,7 +555,10 @@ export function createStream(openid: string, replyTo?: string): StreamHandle {
       log(`stream retry ${attempt + 1}/${STREAM_RETRIES} after [${res.status}]: ${body}`)
     }
     const data = (await res.json()) as { id?: string; remain_msg_len?: number }
-    if (!streamId && data.id) streamId = data.id
+    if (!streamId && data.id) {
+      streamId = data.id
+      log(`stream opened ${streamId.slice(-8)} on ${passiveId?.slice(-8)} seq ${seq}`)
+    }
     const took = Date.now() - startedAt
     sentCount += 1
     sentMs += took
@@ -579,6 +588,7 @@ export function createStream(openid: string, replyTo?: string): StreamHandle {
       return nearlyFull
     },
     write(text: string) {
+      if (ended) log(`stream write after end (${streamId?.slice(-8) ?? 'unopened'}, failed=${failed}): ${JSON.stringify(text.slice(0, 80))}`)
       if (!text || failed) return chain
       full += text
       chain = chain.then(() => send(false, text)).catch(err => {
@@ -588,14 +598,18 @@ export function createStream(openid: string, replyTo?: string): StreamHandle {
       return chain
     },
     end() {
+      ended = true
       chain = chain
         .then(async () => {
           // Nothing was ever sent, so there is no stream to close.
-          if (!streamId || failed) return
+          if (!streamId || failed) {
+            if (full) log(`stream end skipped (${streamId?.slice(-8) ?? 'unopened'}, failed=${failed}) with ${full.length} chars written`)
+            return
+          }
           await send(true, '')
           if (sentCount) {
             log(
-              `stream done: ${sentCount} appends, ${full.length} chars, ` +
+              `stream done ${streamId.slice(-8)}: ${sentCount} appends, ${full.length} chars, ` +
                 `avg ${Math.round(sentMs / sentCount)}ms, slowest ${slowestMs}ms`,
             )
           }
