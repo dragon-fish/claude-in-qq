@@ -1635,6 +1635,8 @@ async function runSession(): Promise<void> {
 
   /** Which content block the deltas currently belong to. */
   let block: string | null = null
+  /** Text received through deltas in the current block, for the event log. */
+  let blockTextChars = 0
   /** tool_use id → name, so a result can be matched to the call that made it. */
   const toolNames = new Map<string, string>()
   /**
@@ -1720,7 +1722,15 @@ async function runSession(): Promise<void> {
       // thought. Reading tool calls off the finished message instead would
       // stack them after their own reasoning.
       const ev = m.event
+      if (ev?.type === 'content_block_delta') {
+        if (ev.delta?.type === 'text_delta') blockTextChars += ev.delta.text.length
+      } else if (ev?.type === 'content_block_stop') {
+        log(`event: block stop #${ev.index} (${block})${block === 'text' ? ` ${blockTextChars} chars` : ''}`)
+      } else {
+        log(`event: ${ev?.type}${ev?.type === 'content_block_start' ? ` #${ev.index} ${ev.content_block?.type}${ev.content_block?.name ? ` ${ev.content_block.name}` : ''}` : ''}`)
+      }
       if (ev?.type === 'content_block_start') {
+        blockTextChars = 0
         block = ev.content_block?.type ?? null
         if (block === 'thinking' && traceLevel === 'full') {
           await traceBreak()
@@ -1774,6 +1784,13 @@ async function runSession(): Promise<void> {
       // and only here is it whole enough to summarise. This still lands after
       // the thinking that produced it and before the call runs, which is the
       // order it happened in.
+      log(
+        `assistant msg: ${(m.message?.content ?? [])
+          .map((b: { type: string; text?: string; name?: string }) =>
+            b.type === 'text' ? `text(${b.text?.length})` : b.type === 'tool_use' ? `tool_use(${b.name})` : b.type,
+          )
+          .join(', ')} streamedText=${streamedText}`,
+      )
       for (const b of m.message?.content ?? []) {
         if (b.type === 'text' && b.text.trim() && !streamedText) {
           try {
