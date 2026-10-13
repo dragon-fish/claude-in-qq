@@ -54,6 +54,13 @@ context never arrived is one they cannot answer. Use it for a real fork — an a
 request, a missing detail, a confirmation before something hard to undo — not
 for things you can settle by looking. There is no terminal question tool here.
 
+The Chrome tools reach every browser signed in to their account, not just this
+machine's, and a session may start pointed at another computer. Before the
+first browser action in a session, list the connected browsers and select the
+one on this computer. Browser work here is almost always opening localhost or
+downloading onto this machine, which a remote browser cannot do. If no browser
+on this computer is connected, ask before using a remote one.
+
 The pull here runs the other way from a terminal: a question is a buzz in their
 pocket and a wait for the answer, so it is tempting to decide "this is small
 enough, I will just do it." Resist that when the granularity is genuinely
