@@ -403,6 +403,12 @@ function withCommandLog(text: string): string {
 type Pending<T> = { resolve: (v: T) => void; timer: ReturnType<typeof setTimeout> }
 
 const pendingApprovals = new Map<string, Pending<boolean>>()
+
+type FetchedImage = { data: string; mediaType: string }
+
+/** What answered a question: a choice or typed words, and any images sent with them. */
+type QuestionAnswer = { text: string; images: FetchedImage[] }
+
 /**
  * `render` is kept alongside the options because a page turn re-posts the same
  * question: the layout mode can change with the page, so the body has to be
@@ -410,7 +416,7 @@ const pendingApprovals = new Map<string, Pending<boolean>>()
  */
 const pendingQuestions = new Map<
   string,
-  Pending<string> & {
+  Pending<QuestionAnswer> & {
     options: string[]
     render: (mode: AskLayout['mode']) => string
     /**
@@ -454,13 +460,13 @@ function settleApproval(id: string, allow: boolean): boolean {
   return true
 }
 
-function settleQuestion(id: string, answer: string): boolean {
+function settleQuestion(id: string, text: string, images: FetchedImage[] = []): boolean {
   const p = pendingQuestions.get(id)
   if (!p) return false
   clearTimeout(p.timer)
   pendingQuestions.delete(id)
-  p.resolve(answer)
-  log(`question ${id} -> ${answer.slice(0, 60)}`)
+  p.resolve({ text, images })
+  log(`question ${id} -> ${text.slice(0, 60)}${images.length ? ` (+${images.length} 图)` : ''}`)
   return true
 }
 
@@ -518,18 +524,28 @@ const qqTools = createSdkMcpServer({
         'options as tappable buttons on their phone and blocks until they respond, so use it ' +
         'whenever you would otherwise stop and ask — a fork in the approach, a missing detail, ' +
         'a confirmation before something hard to undo. They may also reply with free text ' +
-        'instead of picking an option, in which case you get their words verbatim. ' +
+        'instead of picking an option, in which case you get their words verbatim, along with ' +
+        'any images they send. ' +
         'Keep options short: 20 characters or less renders the text on the button itself.',
       {
         question: z.string().describe('The question, stated plainly'),
+        details: z
+          .string()
+          .optional()
+          .describe(
+            'Markdown shown under the question: whatever the operator needs in order to answer — ' +
+              'what you found, the trade-offs, what each option leads to. Put that context here ' +
+              'rather than in prose before the call; the card is the one thing sure to reach them.',
+          ),
         options: z.array(z.string()).min(2).max(8).describe('Between 2 and 8 choices'),
       },
-      async ({ question, options }) => {
+      async ({ question, details, options }) => {
         const user = requireUser()
         const id = randomId()
 
         const render = (mode: AskLayout['mode']) => {
           const lines = [`**${question}**`, '']
+          if (details?.trim()) lines.push(details.trim(), '')
           if (mode === 'letters') {
             // Buttons carry only a letter, so the list has to carry the meaning.
             options.forEach((opt, i) => lines.push(`${LETTERS[i]}：${opt}`))
@@ -547,15 +563,20 @@ const qqTools = createSdkMcpServer({
         await postQuestion(user, id, options, render)
         log(`question ${id} posted`)
 
-        const answer = await new Promise<string>(resolve => {
+        const answer = await new Promise<QuestionAnswer>(resolve => {
           const timer = setTimeout(() => {
             pendingQuestions.delete(id)
-            resolve('(操作者未在 15 分钟内回答)')
+            resolve({ text: '(操作者未在 15 分钟内回答)', images: [] })
           }, QUESTION_TIMEOUT_MS)
           pendingQuestions.set(id, { resolve, timer, options, render })
         })
 
-        return { content: [{ type: 'text' as const, text: answer }] }
+        return {
+          content: [
+            ...answer.images.map(img => ({ type: 'image' as const, data: img.data, mimeType: img.mediaType })),
+            { type: 'text' as const, text: answer.text },
+          ],
+        }
       },
     ),
   ],
@@ -629,33 +650,17 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
       const idx = LETTERS.indexOf(letter[1].toUpperCase())
       if (idx >= 0 && idx < q.options.length) answer = q.options[idx]
     }
-    settleQuestion(id, answer)
+    const { images, notes } = await readAttachments(msg)
+    answer = [answer, ...notes].filter(Boolean).join('\n')
+    settleQuestion(id, answer || (images.length ? '(图片)' : '(空消息)'), images)
     return
   }
 
-  // Images are fetched and inlined: a CDN link is something Claude cannot see,
-  // and QQ's links expire. Anything that is not an image still goes as a URL,
-  // which is all a non-image attachment can usefully be.
-  const blocks: ContentBlock[] = []
-  const notes: string[] = []
-
-  for (const att of msg.attachments) {
-    if (!att.url) continue
-    const isImage = att.content_type?.includes('image') || /\.(jpe?g|png|gif|webp)$/i.test(att.url)
-    if (!isImage) {
-      notes.push(`[文件] ${att.filename ?? ''} ${att.url}`.trim())
-      continue
-    }
-    const image = await fetchImage(att.url, att.content_type)
-    if (image) {
-      blocks.push({
-        type: 'image',
-        source: { type: 'base64', media_type: image.mediaType, data: image.data },
-      })
-    } else {
-      notes.push(`[图片下载失败] ${att.url}`)
-    }
-  }
+  const { images, notes } = await readAttachments(msg)
+  const blocks: ContentBlock[] = images.map(image => ({
+    type: 'image',
+    source: { type: 'base64', media_type: image.mediaType, data: image.data },
+  }))
 
   const text = withCommandLog([msg.content, ...notes].filter(Boolean).join('\n'))
   log(`inbound from ${msg.openid.slice(0, 8)}: ${msg.content.slice(0, 60)}${blocks.length ? ` (+${blocks.length} 图)` : ''}`)
@@ -666,6 +671,28 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
   } else {
     queue.push(text)
   }
+}
+
+/**
+ * Images are fetched and inlined: a CDN link is something Claude cannot see,
+ * and QQ's links expire. Anything that is not an image still goes as a URL,
+ * which is all a non-image attachment can usefully be.
+ */
+async function readAttachments(msg: InboundMessage): Promise<{ images: FetchedImage[]; notes: string[] }> {
+  const images: FetchedImage[] = []
+  const notes: string[] = []
+  for (const att of msg.attachments) {
+    if (!att.url) continue
+    const isImage = att.content_type?.includes('image') || /\.(jpe?g|png|gif|webp)$/i.test(att.url)
+    if (!isImage) {
+      notes.push(`[文件] ${att.filename ?? ''} ${att.url}`.trim())
+      continue
+    }
+    const image = await fetchImage(att.url, att.content_type)
+    if (image) images.push(image)
+    else notes.push(`[图片下载失败] ${att.url}`)
+  }
+  return { images, notes }
 }
 
 async function handleButton(openid: string, buttonData: string): Promise<void> {
@@ -791,14 +818,14 @@ async function askChoice(
 
   await postQuestion(user, id, options, renderBody)
 
-  const answer = await new Promise<string>(resolve => {
+  const answer = await new Promise<QuestionAnswer>(resolve => {
     const timer = setTimeout(() => {
       pendingQuestions.delete(id)
-      resolve('')
+      resolve({ text: '', images: [] })
     }, QUESTION_TIMEOUT_MS)
     pendingQuestions.set(id, { options, resolve, timer, render: renderBody, buttonsOnly })
   })
-  return options.indexOf(answer)
+  return options.indexOf(answer.text)
 }
 
 /** Everything the command layer is allowed to touch, and nothing more. */

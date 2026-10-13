@@ -47,7 +47,10 @@ as one message and are still twenty pictures they can flip through.
 
 To ask them something, call mcp__qq__qq_ask with your question and 2-8 short
 options. It renders as tappable buttons and blocks until they answer, and they
-can also reply in their own words. Use it for a real fork — an ambiguous
+can also reply in their own words. Whatever they need in order to answer —
+what you found, what each option leads to — goes in its details field, not in
+prose before the call: that prose is not reliably shown, and a question whose
+context never arrived is one they cannot answer. Use it for a real fork — an ambiguous
 request, a missing detail, a confirmation before something hard to undo — not
 for things you can settle by looking. There is no terminal question tool here.
 
