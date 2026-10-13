@@ -40,6 +40,9 @@ harness 本身：同一套工具、同样的 skills 和 hooks、一样的权限�
 - **图片进出**：发图给它看；它用**顶头独占一行**的 `MEDIA:/绝对路径` 把文件发回来，文件会插在正文
   对应的位置而不是堆在末尾。一条消息只能带一个附件，所以多个文件它会打包成 zip——手机 QQ 能直接
   预览 zip 里的图，不用解压
+- **用你的浏览器**：会话总是带 `--chrome` 启动，装了 [Claude in Chrome](https://chromewebstore.google.com/detail/claude/fcoeoabgfenejglbffodgkkbkcdhcgfn)
+  扩展的话，它能直接操作你本机的 Chrome，沿用里面的登录状态。要求 CC 用 `/login` 登录（API Key 和
+  `setup-token` 的长期 token 不行）；没装扩展或 Chrome 没开时，浏览器工具只会报未连接，其余照常
 - **不掉线**：会话 ID 落盘，重启机器后接着上次的上下文聊
 - **捎话**（可选）：本机任意目录的其他 CC 会话可以借这条通道给你发通知（见下）
 
@@ -244,6 +247,8 @@ skills/install.sh --uninstall   # 卸
 - 待审批的工具入参放在围栏代码块里，免得内容自己伪装成 markdown，让你看不清在批什么
 - 默认 `auto` 权限模式。`/mode` 可切 `default`（每个危险操作都问），但不提供 `bypassPermissions`——
   那是给一次性容器用的，不该出现在一台你日常用的机器上
+- 浏览器工具和其他工具一样走审批；但 `auto` 模式下分类器放行的浏览器操作会跳过扩展自己的按站点授权，
+  而浏览器里是你所有网站的登录态。不想让它碰的站点，在扩展设置里拒绝
 - 凭据存在 `~/.claude/channels/qq/.env`，权限 600
 
 ## 已知风险

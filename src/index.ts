@@ -1534,6 +1534,10 @@ async function runSession(): Promise<void> {
       // 'omitted' — thinking blocks still arrive, with empty text — and the
       // trace would show tool calls with nothing between them.
       thinking: { type: 'adaptive', display: 'summarized' },
+      // Claude in Chrome: drives the operator's own browser, logins included.
+      // Needs the extension and a /login session; without them the tools only
+      // report the extension as not connected and everything else carries on.
+      extraArgs: { chrome: null },
       canUseTool: async (toolName: string, input: Record<string, unknown>) => {
         // This bridge's own tools only talk to the operator — they touch no
         // files, run no commands, and reach nothing outside the chat. Gating
