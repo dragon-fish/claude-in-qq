@@ -13,7 +13,8 @@
 - 其他 bot 的消息同样会推送，`author.bot = true`。
 - `mentions[]` 列出被 @ 的成员，`is_you: true` 表示 @ 的是本机器人。content 里的 @ 形如 `<@member_openid>`。
 - 主人在群里的 `member_openid` 与私聊白名单里的 `user_openid` 相同。同一个人在不同 bot 下 id 不同。
-- 群被动回复：收到消息后 5 分钟内、每条最多回复 5 次。群主动消息额度未实测（2025 文档写每群每月 4 条）。
+- 群被动回复：收到消息后 5 分钟内、每条最多回复 5 次。全量消息开启后，任何一条近 5 分钟的群消息都能作为回复对象，
+  不必是 @ 本 bot 的那条。群主动消息额度未实测（2025 文档写每群每月 4 条）。
 
 ## 身份与权限
 
@@ -58,7 +59,7 @@ operator context 增加一节说明各块含义：只回应 `<user_message>`；�
 
 ## 群历史
 
-- bun 内置 `bun:sqlite`，库在状态目录 `history.db`。表：`messages(group_openid, message_id, author_openid,
+- `node:sqlite`（bun ≥ 1.4 支持；不用 `bun:sqlite`，运行时私有接口），库在状态目录 `history.db`。表：`messages(group_openid, message_id, author_openid,
   author_name, is_bot, content, mentions_json, created_at)`。每群保留 30 天，启动时和每小时清理一次。
 - 工具 `qq_group_history(group?, limit?, before_message_id?, query?)`：默认当前会话所在群，返回带 id 的消息列表。
 - 本 bot 自己发到群里的消息也入库。
@@ -66,6 +67,7 @@ operator context 增加一节说明各块含义：只回应 `<user_message>`；�
 ## 群里的回复
 
 - 默认挂在触发消息上被动回复；能流式就流式，不能则按现有逻辑退回普通发送。
+- 主动发起（如主人在私聊里让它去群里找另一个 bot）时，挂在该群最近 5 分钟内的任一条消息上；没有则同下。
 - 被动窗口过期后先试群主动消息；失败则发到主人私聊，注明来自哪个群、回复的是哪条消息。
 - agent 输出里的 `<@member_openid>` 原样保留为 QQ @；`@备注名`（op 列表里的）转成 `<@id>`。
 
