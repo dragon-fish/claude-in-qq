@@ -1338,9 +1338,11 @@ type UploadPrepare = {
  * bytes to the presigned storage URL (no QQ auth) followed by
  * upload_part_finish with that part's MD5.
  *
- * Part `index` is 0-based and its bytes start at `index * block_size`. Only
- * the parts QQ lists are sent — it may list none when it already holds the
- * file. Each worker reads one part from disk at a time, never the whole file.
+ * Part `index` is 1-based (measured: a single-part file comes back as index 1;
+ * the docs' 0-based reading put the read past EOF). Its bytes start at
+ * `(index - 1) * block_size`. Only the parts QQ lists are sent — it may list
+ * none when it already holds the file. Each worker reads one part from disk at
+ * a time, never the whole file.
  *
  * @see https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_id_upload_prepare.post.html
  * @see https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_id_upload_part_finish.post.html
@@ -1371,7 +1373,7 @@ async function uploadParts(base: string, path: string, size: number, kind: numbe
   const file = await open(path, 'r')
   const worker = async () => {
     for (let part = queue.shift(); part; part = queue.shift()) {
-      const offset = part.index * blockSize
+      const offset = (part.index - 1) * blockSize
       const length = Number(part.block_size) || Math.min(blockSize, size - offset)
       const bytes = Buffer.alloc(length)
       const { bytesRead } = await file.read(bytes, 0, length, offset)
