@@ -614,7 +614,12 @@ class Conversation {
     const group = key.startsWith(GROUP_PREFIX) ? key.slice(GROUP_PREFIX.length) : null
     this.workdir = saved.workdir ?? (group ? groupWorkdir(group) : (process.env.QQ_BRIDGE_CWD ?? homedir()))
     if (group && !saved.workdir) mkdirSync(this.workdir, { recursive: true })
-    this.permissionMode = saved.permission_mode ?? process.env.QQ_PERMISSION_MODE ?? 'auto'
+    const mode = saved.permission_mode ?? process.env.QQ_PERMISSION_MODE ?? 'auto'
+    // bypassPermissions is the owner's, in private chat: in a group non-owner
+    // ops start turns. allowDangerouslySkipPermissions only stops switching
+    // into it mid-session — a session launched in it runs in it — so a group
+    // must never be launched with it, whatever its state or the env says.
+    this.permissionMode = group && mode === 'bypassPermissions' ? 'auto' : mode
     this.traceLevel = saved.trace_level ?? (group ? 'off' : 'full')
     this.name = saved.name ?? null
     this.qqName = saved.qq_name ?? null
@@ -2581,6 +2586,9 @@ async function runSession(conv: Conversation): Promise<void> {
       // it considers risky. 'default' escalates every write and every command,
       // which on a phone means approving your way through the whole task.
       permissionMode: conv.permissionMode,
+      // Lets /mode switch the private session into bypassPermissions; without
+      // it the switch is refused. Groups never get it — see the constructor.
+      allowDangerouslySkipPermissions: conv.key === PRIVATE_KEY,
       resume: resume ?? undefined,
       // The terminal question tool has no UI here — nobody is watching a
       // terminal. Left enabled it renders into the void and comes back

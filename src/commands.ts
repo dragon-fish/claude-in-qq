@@ -463,14 +463,18 @@ register(
       const q = await requireQuery(deps)
       if (!q) return
 
-      // bypassPermissions is deliberately absent: it needs
-      // allowDangerouslySkipPermissions, and a phone is not an isolated VM.
       const modes = [
         { value: 'auto', label: 'auto 智能判断', desc: '分类器放行常规操作，只对有风险的问你' },
         { value: 'default', label: 'default 每步都问', desc: '任何写入和命令都要批准' },
         { value: 'acceptEdits', label: 'acceptEdits 改文件免批', desc: '文件编辑自动通过，命令仍要批' },
         { value: 'plan', label: 'plan 只读规划', desc: '只看不动，先给方案' },
       ]
+      // Private chat only, never a group: there non-owner ops start turns, and
+      // in this mode their requests would run with no approval card to stop
+      // them. Group sessions refuse the switch anyway (no allowDangerouslySkipPermissions).
+      if (deps.where() === 'private') {
+        modes.push({ value: 'bypassPermissions', label: 'bypass 危险全开', desc: '所有工具调用不经审批直接执行' })
+      }
 
       const apply = async (value: string) => {
         try {
