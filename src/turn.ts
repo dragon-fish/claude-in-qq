@@ -74,7 +74,11 @@ export function routeGroupMessage(
 ): 'trigger' | 'history' {
   // A quote of this bot's message addresses it even without an @: some QQ
   // clients add the @ to a quote-reply and some do not.
-  const addressed = mentionsMe(msg) || quotesMe || stripNickname(msg.content, nicknames) !== null
+  // Nicknames are a shortcut for people. Two bots given the same nickname
+  // would wake each other whenever a reply happened to open with it; a bot
+  // addresses another by @ or quote.
+  const byNickname = !msg.author.bot && stripNickname(msg.content, nicknames) !== null
+  const addressed = mentionsMe(msg) || quotesMe || byNickname
   return addressed && isOp(msg.author.openid) ? 'trigger' : 'history'
 }
 

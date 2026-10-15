@@ -1539,7 +1539,7 @@ async function handleGroupMessage(msg: InboundGroupMessage): Promise<void> {
   const quotesMe = ownQuoted !== null
   const quotedRow = msg.quote ? (ownQuoted ?? byRef ?? history.byContent(msg.group, msg.quote.text)) : null
   if (routeGroupMessage(msg, id => isOp(id, access), nicknames, quotesMe) !== 'trigger') {
-    if (mentionsMe(msg) || quotesMe || stripNickname(msg.content, nicknames) !== null) {
+    if (mentionsMe(msg) || quotesMe || (!msg.author.bot && stripNickname(msg.content, nicknames) !== null)) {
       log(`${where}: addressed by non-op ${msg.author.openid.slice(0, 8)}, recorded only`)
     }
     return
@@ -1571,7 +1571,7 @@ async function handleGroupMessage(msg: InboundGroupMessage): Promise<void> {
   // The text goes in as written, a nickname that addressed the bot included,
   // as an @ of it is: a bare sentence leaves the agent unable to tell it was
   // called at all. The context names what woke it.
-  const nickname = mentionsMe(msg) ? null : matchNickname(msg.content, nicknames)
+  const nickname = mentionsMe(msg) || msg.author.bot ? null : matchNickname(msg.content, nicknames)
   const { images, notes } = await readAttachments(msg.attachments)
   const said = [msg.content, ...notes].filter(Boolean).join('\n') || (images.length ? '(图片)' : '')
   const rendered = renderMentions(said, msg.mentions, memberName)
