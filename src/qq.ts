@@ -1647,6 +1647,9 @@ async function ackInteraction(id: string): Promise<void> {
   }
 }
 
+/** How long a gateway connection must stay up after READY/RESUMED for its close to reset the backoff. */
+const HEALTHY_CONNECTION_MS = 30_000
+
 export async function connectGateway(handlers: GatewayHandlers, attempt = 0): Promise<void> {
   if (gw.closed) return
   try {
@@ -1655,11 +1658,14 @@ export async function connectGateway(handlers: GatewayHandlers, attempt = 0): Pr
     const ws = new WebSocket(url)
     gw.ws = ws
     // QQ closes every gateway connection about every 30 minutes as routine. A
-    // connection that got as far as READY/RESUMED was healthy, so its close
-    // reconnects at once with the backoff reset; only connections that never
-    // came up back off. Carrying `attempt` across healthy connections is what
-    // once left the bridge deaf for a full minute after every routine close.
-    let established = false
+    // connection that stayed up HEALTHY_CONNECTION_MS past READY/RESUMED was
+    // healthy, so its close reconnects after a second with the backoff reset —
+    // carrying `attempt` across healthy connections once left the bridge deaf
+    // for a full minute after every routine close. One that closed sooner,
+    // whether it never came up or was dropped right after, backs off: reset on
+    // READY alone, a gateway that accepts and then drops every connection is
+    // reconnected to once a second forever.
+    let establishedAt: number | null = null
 
     ws.addEventListener('open', () => log('gateway connected'))
 
@@ -1710,13 +1716,13 @@ export async function connectGateway(handlers: GatewayHandlers, attempt = 0): Pr
       const d = payload.d ?? {}
 
       if (payload.t === 'READY') {
-        established = true
+        establishedAt = Date.now()
         gw.sessionId = d.session_id ?? null
         log('ready, session', gw.sessionId)
         return
       }
       if (payload.t === 'RESUMED') {
-        established = true
+        establishedAt = Date.now()
         log('session resumed')
         return
       }
@@ -1771,8 +1777,9 @@ export async function connectGateway(handlers: GatewayHandlers, attempt = 0): Pr
       if (gw.heartbeat) clearInterval(gw.heartbeat)
       gw.heartbeat = null
       if (gw.closed) return
-      const next = established ? 0 : attempt + 1
-      const delay = established ? 1000 : Math.min(60_000, 2000 * 2 ** attempt)
+      const healthy = establishedAt !== null && Date.now() - establishedAt >= HEALTHY_CONNECTION_MS
+      const next = healthy ? 0 : attempt + 1
+      const delay = healthy ? 1000 : Math.min(60_000, 2000 * 2 ** attempt)
       log(`gateway closed (${event.code}${event.reason ? ` ${event.reason}` : ''}), reconnecting in ${delay}ms`)
       setTimeout(() => void connectGateway(handlers, next), delay)
     })
