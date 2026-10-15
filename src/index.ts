@@ -485,7 +485,7 @@ class Conversation {
   turn: Record<InputKind, boolean> = { human: false, agent: false }
   /** When anything last happened here — a message in, or anything from the session. 0 for never. */
   lastActivity = 0
-  /** Subagents of the live session still working. Assigned per session by `runSession`. */
+  /** Tasks of the live session still running: subagents, background shells, monitors. Assigned per session by `runSession`. */
   backgroundTasks: () => number = () => 0
 
   /**
@@ -636,8 +636,9 @@ class Conversation {
   /**
    * Whether closing the session now could lose or cut anything: a turn under
    * way, messages handed over that no turn has answered yet (the session may
-   * be about to start a turn on them), subagents still working, a card waiting
-   * on the owner, or messages queued for the next session.
+   * be about to start a turn on them), background tasks still running —
+   * closing the session kills them — a card waiting on the owner, or messages
+   * queued for the next session.
    */
   busy(): boolean {
     const carded = [...pendingApprovals.values(), ...pendingQuestions.values()].some(p => p.conversation === this.key)
@@ -1831,6 +1832,9 @@ function shortPath(value: unknown, workdir: string): string {
 }
 
 /** How a subagent's end reads, by the status it ended with; others are not an end. */
+/** Task statuses that mean it is no longer running. */
+const TASK_ENDED = new Set(['completed', 'failed', 'stopped', 'killed'])
+
 const SUBAGENT_OUTCOMES: Record<string, string> = {
   completed: '✅ 子代理完成',
   failed: '❌ 子代理失败',
@@ -2624,7 +2628,16 @@ async function runSession(conv: Conversation): Promise<void> {
    * wait from a hang. Outlives turns: a background one ends in a later one.
    */
   const subagents = new Map<string, { description: string; startedAt: number }>()
-  conv.backgroundTasks = () => subagents.size
+
+  /**
+   * Every task still running — subagents, background Bash, monitors, whatever
+   * else Claude Code runs as a task — since closing the session kills them
+   * all. Ambient tasks are housekeeping and do not count. Fed by the start and
+   * end bookends and by `background_tasks_changed`, the level signal, which
+   * replaces the set whole so a missed bookend cannot pin a session open.
+   */
+  const liveTasks = new Set<string>()
+  conv.backgroundTasks = () => liveTasks.size
 
   /** Tasks still running, by id, with who the turn that launched them answered. */
   const launchedBy = new Map<string, InputKind>()
@@ -2710,8 +2723,14 @@ async function runSession(conv: Conversation): Promise<void> {
       // Persist immediately: a crash before the first reply should still leave
       // a resumable session behind.
       if (m.session_id) conv.setSessionId(m.session_id)
+    } else if (m.type === 'system' && m.subtype === 'background_tasks_changed') {
+      liveTasks.clear()
+      for (const t of m.tasks ?? []) if (!t.ambient) liveTasks.add(t.task_id)
     } else if (m.type === 'system' && m.subtype === 'task_started') {
-      if (!m.ambient) launchedBy.set(m.task_id, conv.silent() ? 'agent' : 'human')
+      if (!m.ambient) {
+        liveTasks.add(m.task_id)
+        launchedBy.set(m.task_id, conv.silent() ? 'agent' : 'human')
+      }
       if (m.task_type === 'local_agent' && !m.ambient) {
         subagents.set(m.task_id, { description: m.description, startedAt: Date.now() })
         await traceSubagent(`🤖 已创建子代理：${m.description}（当前 ${subagents.size} 个）`)
@@ -2720,6 +2739,7 @@ async function runSession(conv: Conversation): Promise<void> {
       // A task can report its end both ways; whichever lands first removes it,
       // so the other finds nothing and says nothing.
       const status: string | undefined = m.subtype === 'task_notification' ? m.status : m.patch?.status
+      if (status && TASK_ENDED.has(status)) liveTasks.delete(m.task_id)
       const launcher = launchedBy.get(m.task_id)
       if (m.subtype === 'task_notification' && launcher) {
         launchedBy.delete(m.task_id)
