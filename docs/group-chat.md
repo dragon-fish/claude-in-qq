@@ -246,3 +246,10 @@ operator context 有一节说明各块含义：只回应 `<user_message>`；不�
 - 并入检测依赖 `command_lifecycle` 帧，它不在 SDK 的类型里。升级 Agent SDK 后要重新实测（见「实测确认的
   Claude Code 行为」）；没有这种帧时，一轮的开头仍能从 `user_message_uuid(s)` 判定，并入的消息要到 result 才知道，
   并入点之后的文字会按并入前的判定处理。
+
+## 待办（已定方向，未做）
+
+- `/callme <称呼>`：每人设置 bot 怎么称呼自己（按 openid 存，跨群通用；主人和 op 可用）。不带参数回「我记得你，xxx，有什么事吗」，`/callme clear` 清除自己的，主人可 `/callme clear @某人`；agent 有工具清除不可接受的称呼并私聊告知主人。称呼只是称呼，不代表身份。私聊未设时称「主人」（QQ 私聊事件不带昵称）。
+- `msg_break`：agent 在回复里单独一行写标记，bridge 立即把之前的部分发出、后面另起一条；私聊即封口当前流另起新消息。
+- 群工具发言模式 `/group output tool`：群里只有 `qq_say` 才发言；一轮没调用过就发最后一段结论兜底。UX 实在不行再做。
+

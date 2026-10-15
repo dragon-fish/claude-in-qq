@@ -8,3 +8,4 @@ service/*.plist
 # build artifacts
 claude-in-qq
 claude-in-qq-*
+.scratch/
