@@ -252,7 +252,7 @@ function stamp(ms: number, ref: number): string {
  */
 export function historyEntry(
   m: HistoryMessage,
-  opts: MemberLookup & { ref: number; clip?: number; withId?: boolean },
+  opts: MemberLookup & { ref: number; clip?: number; withId?: boolean; shortIds?: boolean },
 ): Record<string, unknown> {
   let text = renderMentions(m.content, m.mentions, opts.nameOf)
   if (opts.clip && text.length > opts.clip) text = `${text.slice(0, opts.clip)}…`
@@ -261,10 +261,12 @@ export function historyEntry(
   const role = opts.roleOf?.(m.author_openid)
   return {
     ...head,
-    openid: m.author_openid,
+    // Eight characters tell members of one group apart; the full id is in
+    // qq_group_history when an @ needs it.
+    openid: opts.shortIds ? m.author_openid.slice(0, 8) : m.author_openid,
     name: m.author_name,
     ...(role === 'owner' ? { is_owner: true } : {}),
-    ...(role ? { is_op: true } : {}),
+    ...(role === 'op' ? { is_op: true } : {}),
     ...(m.is_bot ? { is_bot: true } : {}),
     text,
   }
@@ -286,12 +288,13 @@ export function wrapTurn(input: TurnInput): string {
       source.kind === 'group'
         ? (input.trigger ?? { kind: 'mention' })
         : undefined,
+    // Flags appear only when true; the owner is an op by definition.
     speaker: {
       openid: speaker.openid,
-      name: speaker.name,
-      is_owner: speaker.isOwner,
-      ...(source.kind === 'group' ? { is_op: speaker.isOwner || role === 'op' } : {}),
-      is_bot: speaker.isBot,
+      ...(speaker.name ? { name: speaker.name } : {}),
+      ...(speaker.isOwner ? { is_owner: true } : {}),
+      ...(source.kind === 'group' && !speaker.isOwner && role === 'op' ? { is_op: true } : {}),
+      ...(speaker.isBot ? { is_bot: true } : {}),
     },
     time: fullTime(input.at),
     // Quoting the bot's own last message is the cheap way to address it
@@ -313,7 +316,7 @@ export function wrapTurn(input: TurnInput): string {
         : undefined,
     recent:
       source.kind === 'group'
-        ? (input.recent ?? []).map(m => historyEntry(m, { ...input, ref: input.at, clip: RECENT_CLIP }))
+        ? (input.recent ?? []).map(m => historyEntry(m, { ...input, ref: input.at, clip: RECENT_CLIP, shortIds: true }))
         : undefined,
   })
   const body = renderMentions(input.text, input.mentions ?? [], input.nameOf)

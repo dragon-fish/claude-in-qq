@@ -186,6 +186,27 @@ export class History {
     return prefix ? fromRow(prefix) : null
   }
 
+  /**
+   * Messages strictly between two of a group's messages, oldest first, the
+   * last `limit` of them; null when `afterMessageId` is no longer on record
+   * (pruned), so the caller can fall back to a full window.
+   */
+  between(group: string, afterMessageId: string, beforeMessageId: string, limit: number, excludeSelf = false): HistoryMessage[] | null {
+    const rowOf = (id: string) =>
+      (this.db.prepare('SELECT rowid AS r FROM messages WHERE group_openid = ? AND message_id = ?').get(group, id) as
+        | { r: number }
+        | undefined)?.r
+    const after = rowOf(afterMessageId)
+    const before = rowOf(beforeMessageId)
+    if (after === undefined || before === undefined) return null
+    const rows = this.db
+      .prepare(
+        `SELECT ${COLUMNS} FROM messages WHERE group_openid = ? AND rowid > ? AND rowid < ?${excludeSelf ? ' AND is_self = 0' : ''} ORDER BY rowid DESC LIMIT ?`,
+      )
+      .all(group, after, before, limit) as Row[]
+    return rows.reverse().map(fromRow)
+  }
+
   /** This bot's own messages in a group, newest first. */
   ownRecent(group: string, limit: number): HistoryMessage[] {
     const rows = this.db
