@@ -938,6 +938,14 @@ function originNote(conv: Conversation): string | null {
   return group ? `（来自群 ${groupLabel(group)} 的会话）` : null
 }
 
+/**
+ * The card's last line: how to answer it. Only a card the private
+ * conversation raised takes a typed answer; see handleMessage.
+ */
+function answerHint(conv: Conversation, typed: string): string {
+  return groupOf(conv) ? '群里发起，请点按钮' : typed
+}
+
 /** Strip control and bidi characters: tool input is untrusted text. */
 function sanitize(value: string, limit: number): string {
   const cleaned = value
@@ -970,7 +978,7 @@ async function askApproval(
     sanitize(JSON.stringify(input, null, 1), 800),
     '```',
     '',
-    '点按钮，或回复 y / n',
+    answerHint(conv, '点按钮，或回复 y / n'),
   ].join('\n')
 
   await sendToQQ(user, body, lastInboundMsgId.get(user), buildApprovalKeyboard(id))
@@ -997,9 +1005,11 @@ function qqToolsFor(conv: Conversation) {
         'Ask the operator a multiple-choice question and wait for their answer. Renders the ' +
           'options as tappable buttons on their phone and blocks until they respond, so use it ' +
           'whenever you would otherwise stop and ask — a fork in the approach, a missing detail, ' +
-          'a confirmation before something hard to undo. They may also reply with free text ' +
-          'instead of picking an option, in which case you get their words verbatim, along with ' +
-          'any images they send. ' +
+          'a confirmation before something hard to undo. ' +
+          (groupOf(conv)
+            ? 'Asked from a group, it is answered only by tapping an option. '
+            : 'They may also reply with free text instead of picking an option, in which case you get ' +
+              'their words verbatim, along with any images they send. ') +
           'Keep options short: 20 characters or less renders the text on the button itself.',
         {
           question: z.string().describe('The question, stated plainly'),
@@ -1029,7 +1039,7 @@ function qqToolsFor(conv: Conversation) {
               options.forEach(opt => lines.push(`· ${opt}`))
               lines.push('')
             }
-            lines.push('点按钮选择，或直接打字回答')
+            lines.push(answerHint(conv, '点按钮选择，或直接打字回答'))
             return lines.join('\n')
           }
 
@@ -1341,12 +1351,15 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
   const deps = commandDeps(conv, { sender: msg.openid, mentions: [] })
   if (await dispatch(msg.content, deps)) return
 
-  // An open approval or question takes precedence: the agent is blocked on it,
-  // so this message is the answer rather than a new instruction.
+  // An open approval or question the private conversation raised takes
+  // precedence: its agent is blocked on it, so this message is the answer
+  // rather than a new instruction. A card a group raised is answered by its
+  // buttons only — this chat is the private agent's, and text taken as a
+  // group's answer would reach neither agent as what it was meant to be.
   const short = APPROVAL_REPLY_RE.exec(msg.content)
-  if (short && pendingApprovals.size > 0) {
-    const id = pendingApprovals.keys().next().value as string
-    settleApproval(id, short[1].toLowerCase().startsWith('y'))
+  const approval = [...pendingApprovals.keys()].find(id => pendingApprovals.get(id)!.conversation === PRIVATE_KEY)
+  if (short && approval) {
+    settleApproval(approval, short[1].toLowerCase().startsWith('y'))
     return
   }
 
@@ -1355,7 +1368,7 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
   // so `/model` followed by an unrelated sentence answers neither — the
   // sentence reaches the agent, and the buttons stay clickable until they
   // time out. Passing an argument stays possible the obvious way: /model sonnet.
-  const answering = [...pendingQuestions.entries()].find(([, q]) => !q.buttonsOnly)
+  const answering = [...pendingQuestions.entries()].find(([, q]) => !q.buttonsOnly && q.conversation === PRIVATE_KEY)
   if (answering) {
     const [id, q] = answering
     const letter = /^\s*([A-Za-z])\s*$/.exec(msg.content)
