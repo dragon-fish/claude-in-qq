@@ -25,13 +25,16 @@ agent 查询。两台 bridge 拉进同一个群后，就能互相 @ 对话。私
   （all/only_mention/mention_and_context）、`allow_proactive_msg`、`joined_at`。两者都是白名单接口，
   没权限时返回错误码 `11253`；本 bot 实测可用。
 - 群里撤回一条消息不会推送任何事件。
+- 文件 base64 直传（`file_data`）超过 5MB 会失败：4.9MB 的 zip（base64 后约 6.5MB）回 HTTP 500
+  `{"code":850012,"message":"call inner proxy error"}`，21MB 的视频同样失败，1.3MB 的成功。
 
 官方文档（2026 版 autogen 页）写明、未实测：
 
 - 群消息不支持流式参数，也没有群的 `stream_messages` 接口（该页 302）。群回复只能普通发送。
 - 主动消息限频：每个 bot 60 条/分钟（已认证；未认证 30）；每群 20 条/分钟、每天至多 1000 条。
 - 撤回：`DELETE /v2/groups/{group_openid}/messages/{message_id}`，只能撤回本 bot 自己 2 分钟内的消息。尚未使用。
-- 群文件上传 `/v2/groups/{group_openid}/files` 与单聊同参（`file_type` / `file_data` / `file_name`）。
+- 群文件上传 `/v2/groups/{group_openid}/files` 与单聊同参（`file_type` / `file_data` / `file_name`），分片上传的
+  `upload_prepare` / `upload_part_finish` 也是同参，只换路径前缀。
 - 同一 msg_id 可能重复推送，需去重。
 
 ## 身份与权限
@@ -181,5 +184,6 @@ operator context 有一节说明各块含义：只回应 `<user_message>`；不�
   带 `ref_msg_idx`，但抓到的真实事件里还没有引用。`message_type` 非 0 的群事件会额外写进
   `unhandled-events.jsonl`，在群里引用一条消息再 @ 本 bot 即可拿到样本；历史库已存 `ref_idx`，可据此还原被引用的消息。
 - 群 markdown（`msg_type: 2`）发送、群文件上传未在真实群里跑过；单聊同参的路径是实测可用的。
-- 文档写二进制直传上限 5MB，代码沿用单聊的 30MB 上限。
+- 分片上传（3.5MB 以上的文件）按 2026 文档实现，还未实测：`md5_10m` 对短于 10002432 字节的文件取全文件 MD5、
+  分片 PUT 不带任何头、偏移按 `index * block_size` 计算，这几处都是推断。
 - 未开全量消息时，同一条 @ 是否会同时以两个不同 msg_id 推送（目前按 msg_id 去重）。

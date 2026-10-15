@@ -6,15 +6,19 @@
  * wires it to the agent.
  */
 
+import { createHash } from 'node:crypto'
 import {
   appendFileSync,
+  createReadStream,
   existsSync,
   mkdirSync,
   readFileSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
+import { open } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 
@@ -199,7 +203,7 @@ let tokenExpiresAt = 0
  */
 const REQUEST_TIMEOUT_MS = 30_000
 
-/** An upload carries megabytes of base64 and legitimately takes longer. */
+/** An upload request (inline base64, one part PUT, or the merge) legitimately takes longer. */
 const UPLOAD_TIMEOUT_MS = 120_000
 
 async function ensureToken(): Promise<string> {
@@ -1256,8 +1260,25 @@ const MEDIA_IMAGE = 1
 const MEDIA_VIDEO = 2
 const MEDIA_FILE = 4
 
-/** Uploads are capped well below the API limit; a huge file is a mistake, not a message. */
-const MAX_UPLOAD_BYTES = 30 * 1024 * 1024
+/** QQ's hard limit for every media kind. Past the soft limits (image 20MB, video 30MB) QQ sends it as a plain file. */
+const MAX_UPLOAD_BYTES = 200 * 1024 * 1024
+
+/**
+ * Inline `file_data` must stay within 5MB of base64. Past that QQ answers HTTP
+ * 500 `850012 call inner proxy error` (a 4.9MB zip failed, 1.3MB went
+ * through), so anything larger goes through chunked upload. 3.5MB of bytes is
+ * ~4.7MB of base64.
+ */
+const INLINE_UPLOAD_MAX_BYTES = 3.5 * 1024 * 1024
+
+/** `md5_10m` is the MD5 of exactly this many leading bytes (the whole file if shorter). */
+const MD5_10M_BYTES = 10_002_432
+
+/** QQ sends the part concurrency in upload_config; more than this only queues on our uplink. */
+const MAX_PART_CONCURRENCY = 4
+
+/** Attempts per upload_prepare, part PUT and part_finish before the upload is given up. */
+const UPLOAD_ATTEMPTS = 3
 
 function mediaKind(path: string): number {
   const ext = path.split('.').pop()?.toLowerCase() ?? ''
@@ -1269,28 +1290,32 @@ function mediaKind(path: string): number {
 /**
  * Upload a local file under `base` (`/v2/users/{openid}` or
  * `/v2/groups/{group_openid}`) and return its file_info. A file uploaded for
- * one kind of chat can only be sent to that kind.
+ * one kind of chat can only be sent to that kind; the chunked endpoints are
+ * scoped the same way.
  *
  * `srv_send_msg: false` because letting QQ deliver it immediately would send
  * it without a msg_id, so it could never use the passive quota. Uploading
  * first and sending second keeps that control.
  *
+ * @see https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/rich-media.html
  * @see https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_openid_files.post.html
  * @see https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_files.post.html
  */
 async function uploadFile(base: string, path: string): Promise<string> {
-  const buf = readFileSync(path)
-  if (buf.byteLength > MAX_UPLOAD_BYTES) {
-    throw new Error(`文件太大（${Math.round(buf.byteLength / 1024 / 1024)}MB）`)
+  const size = statSync(path).size
+  if (size > MAX_UPLOAD_BYTES) {
+    throw new Error(`文件太大（${(size / 1024 / 1024).toFixed(1)}MB），QQ 上限 200MB`)
   }
 
   const kind = mediaKind(path)
-  const body: Record<string, unknown> = {
-    file_type: kind,
-    srv_send_msg: false,
-    file_data: buf.toString('base64'),
+  const body: Record<string, unknown> = { file_type: kind, srv_send_msg: false }
+  if (size <= INLINE_UPLOAD_MAX_BYTES) {
+    body.file_data = readFileSync(path).toString('base64')
+    if (kind === MEDIA_FILE) body.file_name = basename(path)
+  } else {
+    body.upload_id = await uploadParts(base, path, size, kind)
+    body.file_name = basename(path)
   }
-  if (kind === MEDIA_FILE) body.file_name = basename(path)
 
   const upload = await qqFetch(`${base}/files`, { method: 'POST', body: JSON.stringify(body) }, UPLOAD_TIMEOUT_MS)
   if (!upload.ok) throw new Error(`上传失败 ${upload.status}: ${(await upload.text()).slice(0, 200)}`)
@@ -1298,6 +1323,128 @@ async function uploadFile(base: string, path: string): Promise<string> {
   const { file_info } = (await upload.json()) as { file_info?: string }
   if (!file_info) throw new Error('上传响应里没有 file_info')
   return file_info
+}
+
+type UploadPrepare = {
+  upload_id?: string
+  block_size?: string
+  parts?: { index: number; presigned_url: string; block_size?: string }[]
+  upload_config?: { concurrency?: number; retry_timeout?: number; retry_delay?: number }
+}
+
+/**
+ * Chunked upload up to the point where `POST {base}/files` with the returned
+ * upload_id merges it: upload_prepare, then for every listed part a PUT of its
+ * bytes to the presigned storage URL (no QQ auth) followed by
+ * upload_part_finish with that part's MD5.
+ *
+ * Part `index` is 0-based and its bytes start at `index * block_size`. Only
+ * the parts QQ lists are sent — it may list none when it already holds the
+ * file. Each worker reads one part from disk at a time, never the whole file.
+ *
+ * @see https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_id_upload_prepare.post.html
+ * @see https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_id_upload_part_finish.post.html
+ */
+async function uploadParts(base: string, path: string, size: number, kind: number): Promise<string> {
+  const digests = await fileDigests(path)
+  const prepareRes = await withRetry(UPLOAD_ATTEMPTS, 1000, () =>
+    qqFetch(`${base}/upload_prepare`, {
+      method: 'POST',
+      body: JSON.stringify({ file_type: kind, file_size: String(size), file_name: basename(path), ...digests }),
+    }),
+  )
+  if (!prepareRes.ok) {
+    throw new Error(`预上传失败 ${prepareRes.status}: ${(await prepareRes.text()).slice(0, 200)}`)
+  }
+  const prepare = (await prepareRes.json()) as UploadPrepare
+  const uploadId = prepare.upload_id
+  const blockSize = Number(prepare.block_size)
+  if (!uploadId || !(blockSize > 0)) {
+    throw new Error(`预上传响应缺少 upload_id 或 block_size: ${JSON.stringify(prepare).slice(0, 200)}`)
+  }
+
+  const config = prepare.upload_config ?? {}
+  const concurrency = Math.min(Math.max(config.concurrency ?? 1, 1), MAX_PART_CONCURRENCY)
+  const retryDelayMs = (config.retry_delay ?? 1) * 1000
+  const queue = [...(prepare.parts ?? [])]
+
+  const file = await open(path, 'r')
+  const worker = async () => {
+    for (let part = queue.shift(); part; part = queue.shift()) {
+      const offset = part.index * blockSize
+      const length = Number(part.block_size) || Math.min(blockSize, size - offset)
+      const bytes = Buffer.alloc(length)
+      const { bytesRead } = await file.read(bytes, 0, length, offset)
+      if (bytesRead !== length) throw new Error(`分片 ${part.index} 读取不完整（${bytesRead}/${length}）`)
+
+      const url = part.presigned_url
+      const put = await withRetry(UPLOAD_ATTEMPTS, retryDelayMs, () =>
+        fetch(url, { method: 'PUT', body: bytes, signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS) }),
+      )
+      if (!put.ok) throw new Error(`分片 ${part.index} 上传失败 ${put.status}: ${(await put.text()).slice(0, 200)}`)
+
+      const finishBody = JSON.stringify({
+        upload_id: uploadId,
+        part_index: part.index,
+        block_size: String(length),
+        md5: createHash('md5').update(bytes).digest('hex'),
+      })
+      const finish = await withRetry(UPLOAD_ATTEMPTS, retryDelayMs, () =>
+        qqFetch(`${base}/upload_part_finish`, { method: 'POST', body: finishBody }),
+      )
+      if (!finish.ok) {
+        throw new Error(`分片 ${part.index} 确认失败 ${finish.status}: ${(await finish.text()).slice(0, 200)}`)
+      }
+    }
+  }
+  // allSettled, not all: the file must stay open until every worker is done with it.
+  const results = await Promise.allSettled(
+    Array.from({ length: concurrency }, () =>
+      worker().catch(err => {
+        queue.length = 0
+        throw err
+      }),
+    ),
+  )
+  await file.close()
+  const failed = results.find(r => r.status === 'rejected')
+  if (failed) throw failed.reason
+  return uploadId
+}
+
+/** Whole-file MD5 and SHA1 plus `md5_10m`, in one streaming pass. */
+async function fileDigests(path: string): Promise<{ md5: string; sha1: string; md5_10m: string }> {
+  const md5 = createHash('md5')
+  const sha1 = createHash('sha1')
+  const md5Head = createHash('md5')
+  let seen = 0
+  for await (const chunk of createReadStream(path) as AsyncIterable<Buffer>) {
+    md5.update(chunk)
+    sha1.update(chunk)
+    if (seen < MD5_10M_BYTES) md5Head.update(chunk.subarray(0, MD5_10M_BYTES - seen))
+    seen += chunk.byteLength
+  }
+  return { md5: md5.digest('hex'), sha1: sha1.digest('hex'), md5_10m: md5Head.digest('hex') }
+}
+
+/**
+ * Retry network errors, 5xx, and QQ's 40093001 ("upload failed, retry")
+ * whatever its status. Any other response goes back to the caller to report.
+ */
+async function withRetry(attempts: number, delayMs: number, call: () => Promise<Response>): Promise<Response> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const res = await call()
+      if (res.ok || attempt === attempts) return res
+      const text = await res.clone().text()
+      if (res.status < 500 && !text.includes('40093001')) return res
+      log(`upload retry ${attempt}/${attempts}: ${res.status} ${text.slice(0, 200)}`)
+    } catch (err) {
+      if (attempt === attempts) throw err
+      log(`upload retry ${attempt}/${attempts}:`, err)
+    }
+    await new Promise(resolve => setTimeout(resolve, delayMs))
+  }
 }
 
 /**

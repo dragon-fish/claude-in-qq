@@ -305,6 +305,9 @@ skills/install.sh --uninstall   # 卸
 - **按钮文字上限约 20 字**，且随屏幕宽度变化。选项过长时自动降级为截断标签，再不行退成 A/B/C/D
 - **一条消息只能带一个附件**：`media` 传数组会被拒（`40011000 请求数据异常`），markdown 里的外链
   图片也不会被渲染。多张图只能打包成 zip——手机 QQ 可以直接预览里面的图，电脑版则需要下载
+- **文件上限 200MB**：base64 直传（`file_data`）只收 5MB 以内，超过实测回 HTTP 500
+  `850012 call inner proxy error`，所以 3.5MB 以上的文件走分片上传（`upload_prepare` → 逐片 PUT +
+  `upload_part_finish` → 合并）。图片超 20MB、视频超 30MB 时 QQ 会降级成普通文件发送
 - Agent SDK 的 `resume` 跨目录续接依赖官方行为，`/cwd` 保留上下文正是建立在这上面
 
 ## QQ 的接口文档
