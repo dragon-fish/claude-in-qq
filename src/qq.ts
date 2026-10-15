@@ -572,6 +572,17 @@ async function postGroupMessage(
   return (await res.json()) as { id?: string; ext_info?: { ref_idx?: string } }
 }
 
+/**
+ * Recall a message this bot sent to a group. QQ refuses messages older than
+ * two minutes (40064004); a member bot can recall only its own.
+ *
+ * @see https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages_message_id.delete.html
+ */
+export async function recallGroupMessage(group: string, messageId: string): Promise<void> {
+  const res = await qqFetch(`/v2/groups/${group}/messages/${encodeURIComponent(messageId)}`, { method: 'DELETE' })
+  if (!res.ok) throw new Error(`撤回失败 ${res.status}: ${(await res.text()).slice(0, 200)}`)
+}
+
 async function postGroupText(group: string, text: string): Promise<void> {
   for (const chunk of chunkText(toGroupMentions(text))) {
     const data = await postGroupMessage(group, { markdown: { content: chunk }, msg_type: 2 })

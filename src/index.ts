@@ -62,6 +62,7 @@ import {
   isOwner,
   lastInboundMsgId,
   onGroupSent,
+  recallGroupMessage,
   rememberGroupInbound,
   rememberInbound,
   removeNickname,
@@ -1189,6 +1190,44 @@ function qqToolsFor(conv: Conversation) {
           }
           log(`[${conv.key}] qq_say: ${text.length} chars`)
           return { content: [{ type: 'text' as const, text: `Posted to ${conversationLabel(conv.key)}.` }] }
+        },
+      ),
+      tool(
+        'qq_recall',
+        "Recall (unsend) messages you yourself sent to this conversation's QQ group — for something said " +
+          'wrongly or that should not have been posted. QQ allows it only within 2 minutes of sending; older ' +
+          'ones are reported, not recalled. Groups only.',
+        {
+          count: z.number().int().min(1).max(10).optional().describe('How many of your latest messages here, default 1'),
+          message_id: z.string().optional().describe('Recall this one of your messages instead (from qq_group_history)'),
+        },
+        async ({ count, message_id }) => {
+          const group = groupOf(conv)
+          if (!group) return { content: [{ type: 'text' as const, text: 'Only group messages can be recalled.' }], isError: true }
+          const targets = message_id
+            ? [history.get(group, message_id)].filter(m => m?.is_self)
+            : history.ownRecent(group, count ?? 1)
+          if (!targets.length) return { content: [{ type: 'text' as const, text: 'No message of yours found to recall.' }], isError: true }
+          const lines: string[] = []
+          for (const m of targets) {
+            const age = Date.now() - m!.created_at
+            const head = m!.content.replace(/\s+/g, ' ').slice(0, 40)
+            if (m!.message_id.startsWith('self-')) {
+              lines.push(`not recalled (QQ gave no id): ${head}`)
+            } else if (age > 2 * 60_000) {
+              lines.push(`too old (${Math.round(age / 1000)}s, limit 120s): ${head}`)
+            } else {
+              try {
+                await recallGroupMessage(group, m!.message_id)
+                history.remove(group, m!.message_id)
+                lines.push(`recalled: ${head}`)
+              } catch (err) {
+                lines.push(`failed (${err}): ${head}`)
+              }
+            }
+          }
+          log(`[${conv.key}] qq_recall: ${lines.join(' | ').slice(0, 300)}`)
+          return { content: [{ type: 'text' as const, text: lines.join('\n') }] }
         },
       ),
       tool(

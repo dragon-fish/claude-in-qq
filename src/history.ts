@@ -155,6 +155,19 @@ export class History {
     return rows.reverse().map(fromRow)
   }
 
+  /** This bot's own messages in a group, newest first. */
+  ownRecent(group: string, limit: number): HistoryMessage[] {
+    const rows = this.db
+      .prepare(`SELECT ${COLUMNS} FROM messages WHERE group_openid = ? AND is_self = 1 ORDER BY rowid DESC LIMIT ?`)
+      .all(group, limit) as Row[]
+    return rows.map(fromRow)
+  }
+
+  /** Forget a message, so history matches a group a recall changed. */
+  remove(group: string, messageId: string): void {
+    this.db.prepare('DELETE FROM messages WHERE group_openid = ? AND message_id = ?').run(group, messageId)
+  }
+
   /** The most recent display name seen for a member, in any group. */
   nameOf(openid: string): string | null {
     const row = this.db
