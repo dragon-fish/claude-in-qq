@@ -94,5 +94,7 @@ write in. When there is work left to do after it, write a wake note first:
 `wake.md` in the bridge's state directory (`~/.claude/channels/qq/` unless
 `QQ_STATE_DIR` says otherwise). If it is non-empty when the new process starts,
 it comes straight back to you as a message, the operator is told you were
-woken, and the file is moved to `wake.md.last` so it fires once. Write it as a
-handover to yourself: what you just changed, what to check, what is left.
+woken, and the file is emptied so it fires once. Write it as a handover to
+yourself: what you just changed, what to check, what is left. When the
+operator restarts with /restart, whatever they add to it is appended to the
+same file under an "操作者附言" heading.

@@ -13,7 +13,7 @@
 import { createSdkMcpServer, query, tool } from '@anthropic-ai/claude-agent-sdk'
 import { z } from 'zod'
 import { allCommands, confirmRestart, dispatch, type CommandDeps } from './commands.js'
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { homedir, uptime } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -869,7 +869,10 @@ function commandDeps(user: string): CommandDeps {
       const s = process.env.CLAUDE_IN_QQ_SUPERVISOR
       return s === 'launchd' || s === 'schtasks' ? s : null
     },
-    restartProcess: () => void shutdown('/restart'),
+    restartProcess: remark => {
+      if (remark) appendFileSync(WAKE_FILE, `\n\n## 操作者附言（随 /restart 发送）\n\n${remark}\n`)
+      void shutdown('/restart')
+    },
   }
 }
 
@@ -1928,13 +1931,14 @@ const WAKE_PREVIEW = 300
 
 function deliverWakeNote(): void {
   if (!existsSync(WAKE_FILE)) return
-  const writtenAt = statSync(WAKE_FILE).mtimeMs
   const note = readFileSync(WAKE_FILE, 'utf8').trim()
-  // Moved aside before anything else can fail: a note that is still in place
-  // when this process dies would wake the next one too, and a note whose work
-  // crashes the bridge would restart it forever.
-  renameSync(WAKE_FILE, `${WAKE_FILE}.last`)
   if (!note) return
+  const writtenAt = statSync(WAKE_FILE).mtimeMs
+  // Emptied before anything else can fail: a note still in place when this
+  // process dies would wake the next one too, and a note whose work crashes the
+  // bridge would restart it forever. No copy is kept: a stale note lying around
+  // is how an old task resurfaces later.
+  writeFileSync(WAKE_FILE, '')
 
   log(`wake note found (${note.length} chars), delivering`)
   const user = requireUser()
@@ -1944,10 +1948,11 @@ function deliverWakeNote(): void {
   )
   queue.push(
     withCommandLog(
-      `<system-reminder>\n这条消息不是操作者发的，是你在 ${spokenGap(Date.now() - writtenAt)}前写进 ` +
-        `\`${WAKE_FILE}\` 的唤醒便条，bridge 重启后自动投递；操作者已收到「自动唤醒」的通知和便条开头。` +
-        '便条已移到 `wake.md.last`，不会再触发。按便条继续，做完照常汇报；' +
-        '若情况和便条描述的对不上，先说清楚再动手。\n</system-reminder>\n\n' +
+      `<system-reminder>\n这是 \`${WAKE_FILE}\` 里的唤醒便条（最后写入于 ${spokenGap(Date.now() - writtenAt)}前），` +
+        'bridge 重启后自动投递；操作者已收到「自动唤醒」的通知和便条开头。' +
+        '没有标题的部分是你重启前写给自己的交接；「操作者附言」是操作者重启时附上的话，以附言为准。' +
+        '文件已清空，不会再触发。按便条继续，做完照常汇报；若情况和便条描述的对不上，先说清楚再动手。' +
+        '\n</system-reminder>\n\n' +
         note,
     ),
   )

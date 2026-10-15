@@ -55,8 +55,11 @@ export type CommandDeps = {
   counts(): { allowed: number; approvals: number; questions: number }
   /** What brings the process back after it exits, or null when nothing does. */
   supervisor(): 'launchd' | 'schtasks' | null
-  /** Exit through the normal shutdown path; the supervisor starts a fresh process. */
-  restartProcess(): void
+  /**
+   * Exit through the normal shutdown path; the supervisor starts a fresh process.
+   * `remark` is appended to the wake note, so the next process hands it to the agent.
+   */
+  restartProcess(remark: string): void
 }
 
 export type Command = {
@@ -630,9 +633,10 @@ register(
 
   {
     name: 'restart',
-    usage: '/restart',
+    aliases: ['reload'],
+    usage: '/restart [附言]',
     summary: '重启 bridge 进程，加载新代码',
-    async run(_arg, deps) {
+    async run(arg, deps) {
       const supervisor = deps.supervisor()
       if (!supervisor) {
         await deps.reply(
@@ -642,9 +646,9 @@ register(
         return
       }
       const code = String(randomInt(0, 1_000_000)).padStart(6, '0')
-      pendingRestart = { code, expires: Date.now() + RESTART_WINDOW_MS }
+      pendingRestart = { code, expires: Date.now() + RESTART_WINDOW_MS, remark: arg }
       await deps.reply(
-        `60 秒内发送 \`${code}\` 确认重启。进程退出后，${SUPERVISOR_WORDS[supervisor]}；正在进行的回复会被打断，会话会自动接回。`,
+        `60 秒内发送 \`${code}\` 确认重启，码后可以再附一句话，重启后连同附言一起交给 agent。进程退出后，${SUPERVISOR_WORDS[supervisor]}；正在进行的回复会被打断，会话会自动接回。`,
       )
     },
   },
@@ -679,7 +683,7 @@ register(
 // answer QQ until someone reached the machine, so that case is refused.
 
 const RESTART_WINDOW_MS = 60_000
-let pendingRestart: { code: string; expires: number } | null = null
+let pendingRestart: { code: string; expires: number; remark: string } | null = null
 
 const SUPERVISOR_WORDS = {
   launchd: 'launchd 会立刻把它拉起来',
@@ -696,17 +700,19 @@ export async function confirmRestart(text: string, deps: CommandDeps): Promise<b
     pendingRestart = null
     return false
   }
-  const typed = text.trim()
-  if (!/^\d{6}$/.test(typed)) return false
+  // The code leads the message; anything after it is a remark for the agent.
+  const m = /^\s*(\d{6})(?!\d)\s*([\s\S]*)$/.exec(text)
+  if (!m) return false
 
-  const ok = typed === pendingRestart.code
+  const ok = m[1] === pendingRestart.code
+  const remark = [pendingRestart.remark, m[2].trim()].filter(Boolean).join('\n')
   pendingRestart = null
   if (!ok) {
     await deps.reply('确认码不对，这次重启已作废。要重启请重新发 `/restart`。')
     return true
   }
   await deps.reply('🔄 正在重启，稍后自动接回。')
-  deps.restartProcess()
+  deps.restartProcess(remark)
   return true
 }
 
