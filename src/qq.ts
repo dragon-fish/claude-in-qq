@@ -188,7 +188,38 @@ async function qqFetch(
 const PASSIVE_MAX_USES = 4
 const PASSIVE_TTL_MS = 60 * 60 * 1000
 
-const passiveQuota = new Map<string, { used: number; firstAt: number }>()
+type PassiveEntry = { used: number; firstAt: number }
+
+// Persisted so a restarted bridge can still answer the operator's last message:
+// a stream only opens as a reply, and a wake note arrives with nothing new to
+// reply to. The use counts travel with it, or the successor would spend uses
+// its predecessor already spent and have QQ refuse them.
+const PASSIVE_FILE = join(STATE_DIR, 'passive.json')
+
+function loadPassive(): { last: Record<string, string>; quota: Record<string, PassiveEntry> } {
+  try {
+    const raw = JSON.parse(readFileSync(PASSIVE_FILE, 'utf8'))
+    return { last: raw.last ?? {}, quota: raw.quota ?? {} }
+  } catch {
+    return { last: {}, quota: {} }
+  }
+}
+
+const savedPassive = loadPassive()
+const passiveQuota = new Map<string, PassiveEntry>(Object.entries(savedPassive.quota))
+
+function savePassive(): void {
+  try {
+    mkdirSync(STATE_DIR, { recursive: true })
+    writeFileSync(
+      PASSIVE_FILE,
+      JSON.stringify({ last: Object.fromEntries(lastInboundMsgId), quota: Object.fromEntries(passiveQuota) }),
+    )
+  } catch (err) {
+    // Losing this costs one restart's worth of streaming, never a message.
+    log('passive quota not saved:', err)
+  }
+}
 
 function claimPassive(msgId: string | undefined): string | null {
   if (!msgId) return null
@@ -196,6 +227,7 @@ function claimPassive(msgId: string | undefined): string | null {
   const entry = passiveQuota.get(msgId)
   if (!entry) {
     passiveQuota.set(msgId, { used: 1, firstAt: now })
+    savePassive()
     return msgId
   }
   if (entry.used >= PASSIVE_MAX_USES || now - entry.firstAt >= PASSIVE_TTL_MS) {
@@ -203,6 +235,7 @@ function claimPassive(msgId: string | undefined): string | null {
     return null
   }
   entry.used += 1
+  savePassive()
   return msgId
 }
 
@@ -214,7 +247,13 @@ setInterval(() => {
 }, 5 * 60 * 1000).unref?.()
 
 /** Newest inbound msg_id per sender, so mid-task pushes can still ride passive quota. */
-export const lastInboundMsgId = new Map<string, string>()
+export const lastInboundMsgId = new Map<string, string>(Object.entries(savedPassive.last))
+
+/** Record the operator's newest message, surviving a restart. */
+export function rememberInbound(openid: string, msgId: string): void {
+  lastInboundMsgId.set(openid, msgId)
+  savePassive()
+}
 
 // -------------------------------------------------------------- relayed notes
 //

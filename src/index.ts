@@ -32,6 +32,7 @@ import {
   HAS_CREDENTIALS,
   isAllowed,
   lastInboundMsgId,
+  rememberInbound,
   LETTERS,
   loadAccess,
   log,
@@ -611,7 +612,7 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
   }
 
   currentUser = msg.openid
-  lastInboundMsgId.set(msg.openid, msg.id)
+  rememberInbound(msg.openid, msg.id)
 
   // A stream is bound to the inbound message it replies to and cannot be moved
   // to a newer one, so the reply above goes on growing over the operator's
