@@ -12,6 +12,7 @@
 
 import { listSessions } from '@anthropic-ai/claude-agent-sdk'
 import { execFileSync } from 'node:child_process'
+import { randomInt } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -52,6 +53,10 @@ export type CommandDeps = {
   verbose(): 'full' | 'balanced' | 'off'
   setVerbose(level: 'full' | 'balanced' | 'off'): void
   counts(): { allowed: number; approvals: number; questions: number }
+  /** What brings the process back after it exits, or null when nothing does. */
+  supervisor(): 'launchd' | 'schtasks' | null
+  /** Exit through the normal shutdown path; the supervisor starts a fresh process. */
+  restartProcess(): void
 }
 
 export type Command = {
@@ -624,6 +629,27 @@ register(
   },
 
   {
+    name: 'restart',
+    usage: '/restart',
+    summary: '重启 bridge 进程，加载新代码',
+    async run(_arg, deps) {
+      const supervisor = deps.supervisor()
+      if (!supervisor) {
+        await deps.reply(
+          '这个进程不是由系统服务启动的，退出后没有东西会把它拉起来，所以不执行。' +
+            '用 `service/install.sh`（Windows 用 `service/install.ps1`）装成服务后再试。',
+        )
+        return
+      }
+      const code = String(randomInt(0, 1_000_000)).padStart(6, '0')
+      pendingRestart = { code, expires: Date.now() + RESTART_WINDOW_MS }
+      await deps.reply(
+        `60 秒内发送 \`${code}\` 确认重启。进程退出后，${SUPERVISOR_WORDS[supervisor]}；正在进行的回复会被打断，会话会自动接回。`,
+      )
+    },
+  },
+
+  {
     name: 'version',
     aliases: ['v', 'ver'],
     usage: '/version',
@@ -644,6 +670,45 @@ register(
     },
   },
 )
+
+// ------------------------------------------------------------------- restart
+//
+// A restart cuts off whatever the agent is doing, and a tap on the command
+// panel is easy to make by accident, so it takes a code typed back within a
+// minute. Without a supervisor the process would simply die and nothing would
+// answer QQ until someone reached the machine, so that case is refused.
+
+const RESTART_WINDOW_MS = 60_000
+let pendingRestart: { code: string; expires: number } | null = null
+
+const SUPERVISOR_WORDS = {
+  launchd: 'launchd 会立刻把它拉起来',
+  schtasks: '计划任务的 watchdog 会在一分钟内把它拉起来',
+}
+
+/**
+ * Consume `text` if it answers a pending /restart. Returns false for anything
+ * else, so ordinary messages pass through untouched.
+ */
+export async function confirmRestart(text: string, deps: CommandDeps): Promise<boolean> {
+  if (!pendingRestart) return false
+  if (Date.now() > pendingRestart.expires) {
+    pendingRestart = null
+    return false
+  }
+  const typed = text.trim()
+  if (!/^\d{6}$/.test(typed)) return false
+
+  const ok = typed === pendingRestart.code
+  pendingRestart = null
+  if (!ok) {
+    await deps.reply('确认码不对，这次重启已作废。要重启请重新发 `/restart`。')
+    return true
+  }
+  await deps.reply('🔄 正在重启，稍后自动接回。')
+  deps.restartProcess()
+  return true
+}
 
 /**
  * Run `text` as a command. Returns false when it is not one, so the caller can

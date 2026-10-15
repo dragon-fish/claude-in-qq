@@ -41,4 +41,6 @@ if ($NoProxy) { $env:NO_PROXY = $NoProxy }
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 
 Set-Location $Root
+# Tells /restart that exiting is safe: the task's one-minute watchdog starts the next one.
+$env:CLAUDE_IN_QQ_SUPERVISOR = 'schtasks'
 & "$HOME\.bun\bin\bun.exe" run src/index.ts *>> (Join-Path $StateDir 'service.log')

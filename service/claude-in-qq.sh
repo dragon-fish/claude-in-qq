@@ -44,4 +44,6 @@ rotate "$STATE_DIR/bridge.log"
 rotate "$STATE_DIR/launchd.log"
 
 cd "$ROOT"
+# Tells /restart that exiting is safe: launchd's KeepAlive starts the next one.
+export CLAUDE_IN_QQ_SUPERVISOR=launchd
 exec "$HOME/.bun/bin/bun" run src/index.ts

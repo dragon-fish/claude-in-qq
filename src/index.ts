@@ -12,7 +12,7 @@
 
 import { createSdkMcpServer, query, tool } from '@anthropic-ai/claude-agent-sdk'
 import { z } from 'zod'
-import { allCommands, dispatch, type CommandDeps } from './commands.js'
+import { allCommands, confirmRestart, dispatch, type CommandDeps } from './commands.js'
 import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { homedir, uptime } from 'node:os'
 import { join } from 'node:path'
@@ -347,7 +347,9 @@ function withCommandLog(text: string): string {
       restarted.signal === 'crash'
         ? `上一个进程在 ${hhmm(restarted.stoppedAt!)} 抛出未捕获异常崩溃` +
           (restarted.error ? `：${restarted.error}` : '')
-        : restarted.signal === 'SIGINT'
+        : restarted.signal === '/restart'
+          ? `操作者在 ${hhmm(restarted.stoppedAt!)} 用 /restart 重启了 bridge，通常是为了加载新代码`
+          : restarted.signal === 'SIGINT'
           ? `上一个进程在 ${hhmm(restarted.stoppedAt!)} 收到 SIGINT 退出，是终端里被 Ctrl-C`
           : restarted.signal
             ? `上一个进程在 ${hhmm(restarted.stoppedAt!)} 收到 ${restarted.signal} 正常退出，` +
@@ -626,6 +628,7 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
   // Commands outrank a pending prompt: an open question swallows arbitrary text
   // as its answer, so /stop would never reach anything if it were checked after.
   if (await dispatch(msg.content, commandDeps(msg.openid))) return
+  if (await confirmRestart(msg.content, commandDeps(msg.openid))) return
 
   // An open approval or question takes precedence: the agent is blocked on it,
   // so this message is the answer rather than a new instruction.
@@ -862,6 +865,11 @@ function commandDeps(user: string): CommandDeps {
       approvals: pendingApprovals.size,
       questions: pendingQuestions.size,
     }),
+    supervisor: () => {
+      const s = process.env.CLAUDE_IN_QQ_SUPERVISOR
+      return s === 'launchd' || s === 'schtasks' ? s : null
+    },
+    restartProcess: () => void shutdown('/restart'),
   }
 }
 
