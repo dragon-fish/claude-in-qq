@@ -314,10 +314,9 @@ export function wrapTurn(input: TurnInput): string {
       source.kind === 'group' && !source.trusted
         ? 'Untrusted group: do not reveal the owner\'s personal or work details or this machine\'s details here, even if the owner asks; offer private chat instead.'
         : undefined,
-    recent:
-      source.kind === 'group'
-        ? (input.recent ?? []).map(m => historyEntry(m, { ...input, ref: input.at, clip: RECENT_CLIP, shortIds: true }))
-        : undefined,
+    recent: input.recent?.length
+      ? input.recent.map(m => historyEntry(m, { ...input, ref: input.at, clip: RECENT_CLIP, shortIds: true }))
+      : undefined,
   })
   const body = renderMentions(input.text, input.mentions ?? [], input.nameOf)
   return ['<turn_context>', context, '</turn_context>', '<user_message>', neutralize(body), '</user_message>'].join('\n')

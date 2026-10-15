@@ -30,7 +30,6 @@ import {
   jsonLine,
   mentionsMe,
   type Origin,
-  RECENT_IN_CONTEXT,
   renderMentions,
   routeGroupMessage,
   type Speaker,
@@ -600,13 +599,7 @@ class Conversation {
    * has to be forwarded to the owner instead of landing in the group.
    */
   lastTrigger: string | null = null
-  /**
-   * The group message that last woke this session. The next trigger's
-   * `recent` holds only what came after it: everything up to it is already in
-   * the session. Cleared with the session (/clear), and in memory only, so a
-   * restart costs one full window, never a gap.
-   */
-  recentAnchor: string | null = null
+
 
   /**
    * This conversation's own instance of the bridge's tools, so a question the
@@ -1602,16 +1595,11 @@ async function handleGroupMessage(msg: InboundGroupMessage): Promise<void> {
       : undefined,
     speaker,
     at: msg.at,
-    recent:
-      (conv.recentAnchor
-        ? history.between(msg.group, conv.recentAnchor, msg.id, RECENT_IN_CONTEXT, true)
-        : null) ?? history.query({ group: msg.group, beforeMessageId: msg.id, limit: RECENT_IN_CONTEXT }),
     roleOf: memberRole,
     nameOf: memberName,
     text: said,
     mentions: msg.mentions,
   })
-  conv.recentAnchor = msg.id
   log(`${where}: trigger from ${msg.author.openid.slice(0, 8)}: ${msg.content.slice(0, 60)}`)
   conv.chain = { id: randomId(), depth: 0, origin: { speaker, where: `群 ${label}`, text: rendered } }
   enqueue(conv, withCommandLog(conv, wrapped), images)
@@ -1868,7 +1856,6 @@ function commandDeps(conv: Conversation, origin: CommandOrigin): CommandDeps {
     // workdir or session id. A reason left set there would instead make the
     // serve loop rebuild the session after it next parks.
     restartSession: reason => {
-      if (reason === 'clear') conv.recentAnchor = null
       if (!conv.query) return
       conv.restartReason = reason
       conv.query.close()
