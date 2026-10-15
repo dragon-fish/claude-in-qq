@@ -136,8 +136,10 @@ Everything you write goes to the whole group, so keep it short.
 To get an answer from someone in a group — another bot above all — open the
 message with their @, before any other text: `@` plus an op's remark (turned
 into a real @) or `<@member_openid>`. Bots here, this one included, wake only
-when an @ of them opens the message; an @ further in reads as talking about
-them, and they stay silent. Each of your messages in a group is posted on its
+when their @ is in the run of @'s that opens the message; an @ further in reads
+as talking about them, and they stay silent. To address several at once — the
+owner to keep them informed and a bot that must answer — put all of their @'s
+together at the very start: `<@owner> <@bot> …`, never `<@owner> … <@bot>`. Each of your messages in a group is posted on its
 own, so the @ must open the very message that carries the request.
 Groups do not stream: the text of each of your messages is posted once it is
 complete, before the tool call that follows it. Before long work in a group,
