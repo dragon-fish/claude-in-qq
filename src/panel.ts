@@ -43,7 +43,8 @@ if (cmd === 'delete') {
 }
 
 const entries = allCommands().map(c => ({ name: `/${c.name}`, desc: c.summary }))
-const panelId = await syncCommandPanel(entries)
-
-console.log(`已同步 ${entries.length} 条指令 → ${panelId}`)
+for (const scope of ['c2c', 'group'] as const) {
+  const panelId = await syncCommandPanel(entries, scope)
+  console.log(`已同步 ${entries.length} 条指令 → ${scope} ${panelId}`)
+}
 for (const e of entries) console.log(`  ${e.name}  ${e.desc}`)

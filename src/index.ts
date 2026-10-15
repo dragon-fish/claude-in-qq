@@ -2578,9 +2578,12 @@ async function main(): Promise<void> {
   // panel rather than adding one. Deliberately not awaited and never fatal — a
   // bridge that will not start because a cosmetic list failed to update would
   // be a bad trade, and the panel QQ already has stays usable meanwhile.
-  void syncCommandPanel(allCommands().map(c => ({ name: `/${c.name}`, desc: c.summary })))
-    .then(id => log(`command panel synced (${id})`))
-    .catch(err => log('command panel sync failed, keeping the existing one:', err))
+  const panelEntries = allCommands().map(c => ({ name: `/${c.name}`, desc: c.summary }))
+  for (const scope of ['c2c', 'group'] as const) {
+    void syncCommandPanel(panelEntries, scope)
+      .then(id => log(`command panel synced for ${scope} (${id})`))
+      .catch(err => log(`command panel sync failed for ${scope}, keeping the existing one:`, err))
+  }
 
   serving.add(priv.key)
   await serve(priv)

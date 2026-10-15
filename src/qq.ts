@@ -930,19 +930,25 @@ function fitWidth(s: string, max: number): string {
 }
 
 /**
- * Create or update the C2C command panel. Returns the panel id.
+ * Panels are registered per scope: a panel created for `c2c` never shows in a
+ * group, so the group needs its own.
+ */
+export type PanelScope = 'c2c' | 'group'
+
+/**
+ * Create or update the command panel for one scope. Returns the panel id.
  *
  * `version` is bumped on every update because QQ uses it to decide whether
  * clients need to refetch; leaving it fixed leaves stale panels on phones.
  */
-export async function syncCommandPanel(entries: PanelEntry[]): Promise<string> {
+export async function syncCommandPanel(entries: PanelEntry[], scope: PanelScope = 'c2c'): Promise<string> {
   const items = entries.slice(0, 20).map(e => ({
     name: fitWidth(e.name, PANEL_NAME_MAX),
     desc: fitWidth(e.desc, PANEL_DESC_MAX),
     type: 'command',
   }))
 
-  const listed = await qqFetch('/v2/panels?scope=c2c')
+  const listed = await qqFetch(`/v2/panels?scope=${scope}`)
   if (!listed.ok) throw new Error(`查询面板失败 ${listed.status}: ${(await listed.text()).slice(0, 200)}`)
   // The list comes back under `records`, not `panels`; getting this wrong makes
   // every sync look like a first sync and burns through the 20-panel allowance.
@@ -960,11 +966,11 @@ export async function syncCommandPanel(entries: PanelEntry[]): Promise<string> {
   const res = mine
     ? await qqFetch(`/v2/panels/${mine.panel_id}`, {
         method: 'PUT',
-        body: JSON.stringify({ scope: 'c2c', panel }),
+        body: JSON.stringify({ scope, panel }),
       })
     : await qqFetch('/v2/panels', {
         method: 'POST',
-        body: JSON.stringify({ scope: 'c2c', target_type: 'all', panel }),
+        body: JSON.stringify({ scope, target_type: 'all', panel }),
       })
 
   if (!res.ok) throw new Error(`${mine ? '更新' : '创建'}面板失败 ${res.status}: ${(await res.text()).slice(0, 300)}`)
