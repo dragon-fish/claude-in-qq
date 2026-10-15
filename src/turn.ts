@@ -11,9 +11,22 @@
 import type { HistoryMessage } from './history.js'
 import type { InboundGroupMessage } from './qq.js'
 
-/** Whether this message @'s this bot, by either of the two ways QQ reports it. */
+/** The run of @'s a message opens with, e.g. `<@a> <@b> ` in `<@a> <@b> hi`. */
+const LEADING_MENTIONS = /^\s*((?:<@!?[^>\s]+>\s*)+)/
+
+/**
+ * Whether this message is addressed to this bot by an @: its @ is in the run of
+ * @'s the message opens with. An @ further in is talk about the bot, not to it
+ * — `<@otherbot> /op add <@this bot>` is for the other bot. A GROUP_AT event
+ * (only without "receive all messages") arrives with this bot's @ already
+ * removed, so its position is unknown and it counts.
+ */
 export function mentionsMe(msg: InboundGroupMessage): boolean {
-  return msg.atEvent || msg.mentions.some(m => m.isYou)
+  if (msg.atEvent) return true
+  const me = msg.mentions.find(m => m.isYou)
+  if (!me) return false
+  const lead = LEADING_MENTIONS.exec(msg.content)?.[1] ?? ''
+  return lead.includes(`<@${me.openid}>`) || lead.includes(`<@!${me.openid}>`)
 }
 
 /** What may follow a nickname before the words addressed to the bot begin. */
