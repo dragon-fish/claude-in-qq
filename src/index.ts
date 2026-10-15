@@ -1936,9 +1936,10 @@ function deliverWakeNote(): void {
   const writtenAt = statSync(WAKE_FILE).mtimeMs
   // Emptied before anything else can fail: a note still in place when this
   // process dies would wake the next one too, and a note whose work crashes the
-  // bridge would restart it forever. No copy is kept: a stale note lying around
-  // is how an old task resurfaces later.
+  // bridge would restart it forever. The copy in `.last` is for reading back
+  // what was delivered; nothing ever reads it to wake from.
   writeFileSync(WAKE_FILE, '')
+  writeFileSync(`${WAKE_FILE}.last`, `${note}\n`)
 
   log(`wake note found (${note.length} chars), delivering`)
   const user = requireUser()
@@ -1951,7 +1952,7 @@ function deliverWakeNote(): void {
       `<system-reminder>\n这是 \`${WAKE_FILE}\` 里的唤醒便条（最后写入于 ${spokenGap(Date.now() - writtenAt)}前），` +
         'bridge 重启后自动投递；操作者已收到「自动唤醒」的通知和便条开头。' +
         '没有标题的部分是你重启前写给自己的交接；「操作者附言」是操作者重启时附上的话，以附言为准。' +
-        '文件已清空，不会再触发。按便条继续，做完照常汇报；若情况和便条描述的对不上，先说清楚再动手。' +
+        '文件已清空、原文另存为 `wake.md.last`，不会再触发。按便条继续，做完照常汇报；若情况和便条描述的对不上，先说清楚再动手。' +
         '\n</system-reminder>\n\n' +
         note,
     ),
