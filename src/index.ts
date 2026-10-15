@@ -479,6 +479,17 @@ class Conversation {
   parking = false
 
   /**
+   * Whether the current session got as far as Claude Code starting a turn
+   * (its `init`). One that ends before that failed to start; see `serve`.
+   */
+  sessionStarted = false
+  /**
+   * Set when `serve` gave up on sessions that kept failing to start, so the
+   * queue left behind does not restart it at once. The next message clears it.
+   */
+  startFailed = false
+
+  /**
    * Whether a turn is under way: set by every message that is part of one,
    * cleared by its result. Messages handed to the session and not yet
    * answered count as well — see `busy`.
@@ -1410,6 +1421,7 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
  */
 function enqueue(conv: Conversation, text: string, images: FetchedImage[], from: InputKind = 'human'): void {
   conv.lastActivity = Date.now()
+  conv.startFailed = false
   const blocks: ContentBlock[] = images.map(image => ({
     type: 'image',
     source: { type: 'base64', media_type: image.mediaType, data: image.data },
@@ -2729,6 +2741,7 @@ async function runSession(conv: Conversation): Promise<void> {
     if (m.type === 'stream_event' || m.type === 'assistant' || m.type === 'user') conv.inTurn = true
 
     if (m.type === 'system' && m.subtype === 'init') {
+      conv.sessionStarted = true
       // Persist immediately: a crash before the first reply should still leave
       // a resumable session behind.
       if (m.session_id) conv.setSessionId(m.session_id)
@@ -3038,6 +3051,9 @@ function markHealthy(): void {
   }
 }
 
+/** Sessions in a row that end before starting a turn, after which `serve` stops retrying. */
+const START_FAILURE_LIMIT = 3
+
 /**
  * Keep `conv` served until it is parked — for the private conversation, which
  * never is, the life of the process.
@@ -3045,9 +3061,20 @@ function markHealthy(): void {
  * The session is rebuilt rather than the process restarted: /clear and /cwd
  * both need a fresh query, and a crashed query should not take the QQ
  * connection, or any other conversation, down with it.
+ *
+ * A session that ends before Claude Code starts a turn failed to start — most
+ * often a session id that no longer resumes. Retried at once forever, that
+ * spins a Claude Code process a second and, for a group, holds its slot with
+ * nothing to show for it. So retries back off, and after START_FAILURE_LIMIT
+ * in a row the session id (if any) is dropped, the owner is told once, and a
+ * group is parked until its next message. The private conversation goes on
+ * retrying at the capped backoff.
  */
 async function serve(conv: Conversation): Promise<void> {
+  let failures = 0
+  let told = false
   while (true) {
+    conv.sessionStarted = false
     try {
       await runSession(conv)
     } catch (err) {
@@ -3065,7 +3092,34 @@ async function serve(conv: Conversation): Promise<void> {
       conv.restartReason = null
       continue
     }
-    await new Promise(r => setTimeout(r, 1000))
+    if (conv.sessionStarted) {
+      failures = 0
+      told = false
+    } else {
+      failures++
+    }
+    if (failures >= START_FAILURE_LIMIT) {
+      const group = groupOf(conv)
+      const dropped = conv.sessionId()
+      if (dropped) conv.setSessionId(null)
+      log(`[${conv.key}] ${failures} sessions in a row ended before starting${dropped ? `; dropped session ${dropped}` : ''}`)
+      const owner = operatorOpenid()
+      if (owner && !told) {
+        told = true
+        await sendToQQ(
+          owner,
+          `⚠️ ${conversationLabel(conv.key)}的会话连续 ${failures} 次没能启动` +
+            (dropped ? `，已放弃恢复旧会话（\`${dropped}\`${group ? '' : '，可用 /resume 找回'}）` : '') +
+            (group ? '，先关闭，下一条消息再试。' : '，继续重试。'),
+          lastInboundMsgId.get(owner),
+        ).catch(err => log('start failure notice failed:', err))
+      }
+      if (group) {
+        conv.startFailed = true
+        return
+      }
+    }
+    await new Promise(r => setTimeout(r, Math.min(60_000, 1000 * 2 ** failures)))
   }
 }
 
@@ -3134,7 +3188,9 @@ function startServing(conv: Conversation): void {
       startServing(conversations.get(waiting[0])!)
     }
     // Pushed while it was closing: buffered for the next session, not lost.
-    if (conv.queue.size) ensureServing(conv)
+    // Not after giving up on a session that would not start: the next message
+    // tries again.
+    if (conv.queue.size && !conv.startFailed) ensureServing(conv)
   })
 }
 
