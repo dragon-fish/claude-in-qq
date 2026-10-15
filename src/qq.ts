@@ -85,6 +85,11 @@ export type Access = {
    * an op without being listed here, and can never be removed.
    */
   ops: Record<string, string>
+  /**
+   * Names that address this bot in any group, as an @ of it does, when a
+   * message from an op opens with one. Bot-wide: shared by every group.
+   */
+  nicknames: string[]
 }
 
 export const PAIRING_TTL_MS = 10 * 60 * 1000
@@ -100,10 +105,11 @@ export function loadAccess(): Access {
       pending:
         typeof raw.pending === 'object' && raw.pending ? (raw.pending as Record<string, Pending>) : {},
       ops: Object.fromEntries(Object.entries(ops).filter(([, v]) => typeof v === 'string')),
+      nicknames: Array.isArray(raw.nicknames) ? raw.nicknames.filter(x => typeof x === 'string' && x) : [],
     }
   } catch (err) {
     if (existsSync(ACCESS_FILE)) log('access.json unreadable, denying all:', err)
-    return { policy: 'allowlist', allowed: [], pending: {}, ops: {} }
+    return { policy: 'allowlist', allowed: [], pending: {}, ops: {}, nicknames: [] }
   }
 }
 
@@ -151,6 +157,24 @@ export function removeOp(openid: string): 'removed' | 'owner' | 'absent' {
   if (isOwner(openid, access)) return 'owner'
   if (!Object.hasOwn(access.ops, openid)) return 'absent'
   delete access.ops[openid]
+  saveAccess(access)
+  return 'removed'
+}
+
+/** Add a nickname; one differing only in case is the same nickname, since matching ignores case. */
+export function addNickname(nickname: string): 'added' | 'exists' {
+  const access = loadAccess()
+  if (access.nicknames.some(n => n.toLowerCase() === nickname.toLowerCase())) return 'exists'
+  access.nicknames.push(nickname)
+  saveAccess(access)
+  return 'added'
+}
+
+export function removeNickname(nickname: string): 'removed' | 'absent' {
+  const access = loadAccess()
+  const kept = access.nicknames.filter(n => n.toLowerCase() !== nickname.toLowerCase())
+  if (kept.length === access.nicknames.length) return 'absent'
+  access.nicknames = kept
   saveAccess(access)
   return 'removed'
 }
@@ -532,6 +556,44 @@ async function postGroupText(group: string, text: string): Promise<void> {
     groupSent(group, { id: String(data.id ?? ''), refIdx: data.ext_info?.ref_idx ?? null, content: chunk })
   }
 }
+
+/** What `GET /v2/groups/{group_openid}/info` returns. */
+export type GroupInfo = {
+  group_openid: string
+  group_name: string
+  group_finger_memo?: string
+  group_class_text?: string
+  group_tags?: string[]
+  group_member_num?: number
+}
+
+/** What `GET /v2/groups/{group_openid}/bot_state` returns, about this bot in that group. */
+export type GroupBotState = {
+  member_openid: string
+  joined_at?: number | string
+  allow_proactive_msg?: boolean
+  recv_msg_setting?: 'all' | 'only_mention' | 'mention_and_context' | string
+  member_role?: 'member' | 'admin' | 'owner' | string
+}
+
+/**
+ * Read one of the per-group lookups. Both are limited to 30 calls a minute,
+ * and an app without the permission gets code 11253 (they are
+ * whitelist-only), so a caller treats any throw as "not known" and carries on.
+ * Measured working on this bot; neither page is in the 2025 docs repo.
+ */
+async function groupLookup<T>(group: string, what: 'info' | 'bot_state'): Promise<T> {
+  const res = await qqFetch(`/v2/groups/${group}/${what}`)
+  const body = await res.text()
+  if (!res.ok) {
+    const code = /"code"\s*:\s*(\d+)/.exec(body)?.[1]
+    throw new Error(`group ${what} ${res.status}${code ? ` code ${code}${code === '11253' ? ' (no permission)' : ''}` : ''}`)
+  }
+  return JSON.parse(body) as T
+}
+
+export const fetchGroupInfo = (group: string) => groupLookup<GroupInfo>(group, 'info')
+export const fetchGroupBotState = (group: string) => groupLookup<GroupBotState>(group, 'bot_state')
 
 /**
  * Send to a group: passive on the newest message that still has a use left,
