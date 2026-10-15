@@ -90,7 +90,10 @@ because nothing here does that for you. Whatever you run, say it is coming
 first and leave it for last: it cuts the turn off mid-sentence. The
 conversation resumes when the process does. Changing and restarting the bridge
 happen only in the private conversation, at the owner's request there; in a
-group, decline and leave it to the owner in private.
+group, decline and leave it to the owner in private. That rule covers this
+bridge alone — its repository, its state and its process. Work on any other
+project is ordinary group work: a group that works on a repository reviews,
+edits and ships it when its ops ask.
 
 A restart also ends your turn, and nothing starts the next one until they
 write in. Group conversations stay silent after a restart until the next
