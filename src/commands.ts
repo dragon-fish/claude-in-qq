@@ -70,6 +70,9 @@ export type CommandDeps = {
   groupName(): { name: string; source: 'owner' | 'qq' | 'openid' } | null
   /** Set the owner's override for the group's name, or clear it with null. */
   setGroupName(name: string | null): void
+  /** Whether the owner declared this group to hold only the owner and the owner's bots. */
+  trusted(): boolean
+  setTrusted(on: boolean): void
   /**
    * QQ's group info and this bot's state in the group, each the parsed
    * response or, when the lookup failed, why.
@@ -758,17 +761,38 @@ register(
   {
     name: 'group',
     scope: 'group',
-    usage: '/group name [set [群名]] | info',
+    usage: '/group name [set [群名]] | trust [on|off] | info',
     summary: '这个群的名字和信息',
     async run(arg, deps) {
       const usage =
         '用法：`/group name` 查看群名，`/group name set <群名>` 自定义群名，' +
-        '`/group name set` 清除自定义，`/group info` 查看群信息'
+        '`/group name set` 清除自定义，`/group trust on|off` 标记这个群是否只有主人和主人自己的 bot，' +
+        '`/group info` 查看群信息'
       const [, rawSub = '', rest = ''] = /^(\S*)\s*([\s\S]*)$/.exec(arg) ?? []
       const sub = rawSub.toLowerCase()
 
       if (sub === 'info') {
         await deps.reply(await groupInfoText(deps))
+        return
+      }
+      if (sub === 'trust') {
+        const value = rest.trim().toLowerCase()
+        if (!value) {
+          await deps.reply(`这个群${deps.trusted() ? '已' : '未'}标记为可信。${TRUST_MEANING}`)
+          return
+        }
+        if (value !== 'on' && value !== 'off') {
+          await deps.reply(usage)
+          return
+        }
+        const on = value === 'on'
+        deps.setTrusted(on)
+        deps.noteToAgent(
+          on
+            ? '主人把这个群标记为可信：群里只有主人和主人自己的 bot。'
+            : '主人取消了这个群的可信标记：群里可能有别人。',
+        )
+        await deps.reply(`${on ? '已把这个群标记为可信' : '已取消这个群的可信标记'}。${TRUST_MEANING}`)
         return
       }
       if (sub !== 'name') {
@@ -865,6 +889,10 @@ register(
 
 // ---------------------------------------------------------------------- group
 
+const TRUST_MEANING =
+  '可信的群里 agent 可以谈主人的私事和本机细节（路径、主机、账号等），用于主人自己的 bot 之间交接；' +
+  '不可信的群里一律不谈，主人问也不谈。凭据和密钥在哪里都不输出。'
+
 const NAME_SOURCE = {
   owner: '主人设置的名字',
   qq: 'QQ 上的群名',
@@ -882,7 +910,11 @@ const ROLE: Record<string, string> = { owner: '群主', admin: '管理员', memb
 async function groupInfoText(deps: CommandDeps): Promise<string> {
   const { info, bot } = await deps.groupInfo()
   const shown = deps.groupName()!
-  const lines = ['**群信息**', `显示名：${shown.name}（${NAME_SOURCE[shown.source]}）`]
+  const lines = [
+    '**群信息**',
+    `显示名：${shown.name}（${NAME_SOURCE[shown.source]}）`,
+    `可信：${deps.trusted() ? '是' : '否'}（\`/group trust on|off\`）`,
+  ]
   if (typeof info === 'string') lines.push(`群资料：查询失败（${info}）`)
   else {
     if (info.group_name && info.group_name !== shown.name) lines.push(`QQ 群名：${info.group_name}`)

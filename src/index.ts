@@ -473,6 +473,8 @@ class Conversation {
   name: string | null
   /** Groups only: the name QQ last reported for it, or null. */
   qqName: string | null
+  /** Groups only: the owner declared, with /group trust on, that only the owner and the owner's bots are in it. */
+  trusted: boolean
 
   /**
    * Set when the session is being closed for good rather than rebuilt: the
@@ -615,6 +617,7 @@ class Conversation {
     this.traceLevel = saved.trace_level ?? (group ? 'off' : 'full')
     this.name = saved.name ?? null
     this.qqName = saved.qq_name ?? null
+    this.trusted = saved.trusted ?? false
     // Armed once per process, here, and never again: the Conversation outlives
     // its sessions, so a group parked and resumed later is not told twice.
     this.restartNotice = saved.session_id ? startupNotice : null
@@ -695,6 +698,11 @@ class Conversation {
   setName(name: string | null): void {
     this.name = name
     patchConversationState(this.key, { name })
+  }
+
+  setTrusted(trusted: boolean): void {
+    this.trusted = trusted
+    patchConversationState(this.key, { trusted })
   }
 }
 
@@ -1517,7 +1525,7 @@ async function handleGroupMessage(msg: InboundGroupMessage): Promise<void> {
   const speaker: Speaker = { openid: msg.author.openid, name: msg.author.name, isOwner: owner, isBot: msg.author.bot }
   const label = groupLabel(msg.group)
   const wrapped = wrapTurn({
-    source: { kind: 'group', label, key: conv.key },
+    source: { kind: 'group', label, key: conv.key, trusted: conv.trusted },
     trigger: nickname === null ? { kind: 'mention' } : { kind: 'nickname', nickname },
     speaker,
     at: msg.at,
@@ -1676,6 +1684,8 @@ type ConversationState = {
   /** Groups only: the name QQ reported, and when it was last asked for, failed or not. */
   qq_name?: string | null
   qq_name_checked_at?: number
+  /** Groups only: set with /group trust; see `Conversation.trusted`. */
+  trusted?: boolean
 }
 
 /**
@@ -1813,6 +1823,8 @@ function commandDeps(conv: Conversation, origin: CommandOrigin): CommandDeps {
       return group ? groupName(group) : null
     },
     setGroupName: name => conv.setName(name),
+    trusted: () => conv.trusted,
+    setTrusted: on => conv.setTrusted(on),
     groupInfo: async () => {
       const group = groupOf(conv)
       if (!group) throw new Error('not a group')

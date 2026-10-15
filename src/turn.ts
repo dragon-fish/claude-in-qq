@@ -176,9 +176,10 @@ export type TurnInput = MemberLookup & {
   /**
    * A group is shown by `label` — its display name, or the head of its openid
    * when it has none — and by its conversation key, which is what
-   * qq_message_agent and qq_group_history take.
+   * qq_message_agent and qq_group_history take. `trusted` is the owner's
+   * /group trust setting.
    */
-  source: { kind: 'private' } | { kind: 'group'; label: string; key: string }
+  source: { kind: 'private' } | { kind: 'group'; label: string; key: string; trusted: boolean }
   /**
    * Group only: what made this message start a turn — an @ of this bot, or
    * one of its nicknames opening the message (which stays in the text).
@@ -246,7 +247,7 @@ export function wrapTurn(input: TurnInput): string {
   const context = framingJson({
     source:
       source.kind === 'group'
-        ? { kind: 'group', key: source.key, name: source.label }
+        ? { kind: 'group', key: source.key, name: source.label, trusted: source.trusted }
         : { kind: 'private' },
     trigger:
       source.kind === 'group'
