@@ -13,7 +13,7 @@
 import { createSdkMcpServer, query, tool } from '@anthropic-ai/claude-agent-sdk'
 import { z } from 'zod'
 import { allCommands, confirmRestart, dispatch, type CommandDeps } from './commands.js'
-import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { homedir, uptime } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -1915,6 +1915,44 @@ async function runSession(): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------- wake note
+//
+// A restart ends the agent's turn, and nothing makes it take the next one until
+// the operator writes in. So before restarting itself the agent can leave a
+// note; the next process hands it straight back as a message, which lets work
+// that needed a restart carry on without a prod from the phone.
+
+const WAKE_FILE = join(STATE_DIR, 'wake.md')
+/** How much of the note the operator sees in the wake notice. */
+const WAKE_PREVIEW = 300
+
+function deliverWakeNote(): void {
+  if (!existsSync(WAKE_FILE)) return
+  const writtenAt = statSync(WAKE_FILE).mtimeMs
+  const note = readFileSync(WAKE_FILE, 'utf8').trim()
+  // Moved aside before anything else can fail: a note that is still in place
+  // when this process dies would wake the next one too, and a note whose work
+  // crashes the bridge would restart it forever.
+  renameSync(WAKE_FILE, `${WAKE_FILE}.last`)
+  if (!note) return
+
+  log(`wake note found (${note.length} chars), delivering`)
+  const user = requireUser()
+  const preview = note.length > WAKE_PREVIEW ? `${note.slice(0, WAKE_PREVIEW)}…` : note
+  void sendToQQ(user, `⏰ 重启后按唤醒便条自动接续：\n\n${preview}`).catch(err =>
+    log('wake notice failed:', err),
+  )
+  queue.push(
+    withCommandLog(
+      `<system-reminder>\n这条消息不是操作者发的，是你在 ${spokenGap(Date.now() - writtenAt)}前写进 ` +
+        `\`${WAKE_FILE}\` 的唤醒便条，bridge 重启后自动投递；操作者已收到「自动唤醒」的通知和便条开头。` +
+        '便条已移到 `wake.md.last`，不会再触发。按便条继续，做完照常汇报；' +
+        '若情况和便条描述的对不上，先说清楚再动手。\n</system-reminder>\n\n' +
+        note,
+    ),
+  )
+}
+
 async function main(): Promise<void> {
   const state = loadState()
   workdir = state.workdir ?? process.env.QQ_BRIDGE_CWD ?? homedir()
@@ -1959,6 +1997,13 @@ async function main(): Promise<void> {
 
   await connectGateway({ onMessage: handleMessage, onButton: handleButton })
   log(`bridge up, workdir=${workdir}, mode=${permissionMode}, state=${STATE_DIR}`)
+
+  // After the restart notice is set, so the note and the notice arrive together.
+  try {
+    deliverWakeNote()
+  } catch (err) {
+    log('wake note unreadable, skipped:', err)
+  }
 
   // Republish the command panel, so editing a command is enough to change what
   // the operator sees under "/". Safe to repeat: the sync updates the existing

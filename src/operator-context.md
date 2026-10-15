@@ -88,3 +88,11 @@ started, so look before you act — and check that something brings it back,
 because nothing here does that for you. Whatever you run, say it is coming
 first and leave it for last: it cuts the turn off mid-sentence. The
 conversation resumes when the process does.
+
+A restart also ends your turn, and nothing starts the next one until they
+write in. When there is work left to do after it, write a wake note first:
+`wake.md` in the bridge's state directory (`~/.claude/channels/qq/` unless
+`QQ_STATE_DIR` says otherwise). If it is non-empty when the new process starts,
+it comes straight back to you as a message, the operator is told you were
+woken, and the file is moved to `wake.md.last` so it fires once. Write it as a
+handover to yourself: what you just changed, what to check, what is left.
