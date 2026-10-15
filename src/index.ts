@@ -390,9 +390,10 @@ const privateChat: Chat = {
 
 /**
  * A group's output. No streaming — QQ takes no stream parameters for groups —
- * so a turn's text is collected and posted when the streamer seals it; see
- * createGroupStream. Each post is passive on the newest group message that
- * still has a use left, and active otherwise.
+ * so text is collected and posted when the streamer seals it, which in a group
+ * happens as each assistant message's text is complete; see createGroupStream
+ * and the seal in runSession. Each post is passive on the newest group message
+ * that still has a use left, and active otherwise.
  *
  * Text QQ refuses goes to the owner's private chat rather than nowhere.
  */
@@ -2758,6 +2759,15 @@ async function runSession(conv: Conversation): Promise<void> {
         }
       }
       streamedText = false
+      // A group has no stream to grow, so its text would otherwise sit unseen
+      // until the turn ends, and a long task reads as a bot that went quiet.
+      // Each message's text goes out as soon as it is whole instead — Claude
+      // Code emits one assistant message per content block, so this lands
+      // right after the text and before the tool call that follows it. A
+      // message with no text posts nothing.
+      if (groupOf(conv) && (m.message?.content ?? []).some((b: { type: string }) => b.type === 'text')) {
+        await closeStreamer('group: text complete')
+      }
     } else if (m.type === 'user') {
       // Tool results come back as a user turn. Only some are worth showing,
       // and knowing which needs the name from the call that asked for it.
