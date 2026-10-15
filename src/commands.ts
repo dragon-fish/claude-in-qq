@@ -60,6 +60,13 @@ export type CommandDeps = {
    * `remark` is appended to the wake note, so the next process hands it to the agent.
    */
   restartProcess(remark: string): void
+  /** Whether whoever sent this command is the owner. */
+  senderIsOwner(): boolean
+  /** A member's display name: from the message's own mentions, then from group history. */
+  nameOf(openid: string): string | null
+  listOps(): { openid: string; remark: string }[]
+  addOp(openid: string, remark: string): 'added' | 'updated' | 'owner'
+  removeOp(openid: string): 'removed' | 'owner' | 'absent'
 }
 
 export type Command = {
@@ -659,6 +666,64 @@ register(
       if (!supervisor) return refuseUnsupervised(deps)
       await deps.reply(`🔄 正在重启，${SUPERVISOR_WORDS[supervisor]}。`)
       deps.restartProcess(arg)
+    },
+  },
+
+  {
+    name: 'op',
+    usage: '/op add|remove|list [<@成员|id>] [备注]',
+    summary: '管理群里能 @ 我开启对话的人',
+    async run(arg, deps) {
+      // Every slash command in a group is already owner-only, but private chat
+      // under the `open` policy is not, and an op list anyone can edit is no list.
+      if (!deps.senderIsOwner()) {
+        await deps.reply('只有主人能管理 op 列表。')
+        return
+      }
+      const [, rawSub = '', rest = ''] = /^(\S*)\s*([\s\S]*)$/.exec(arg) ?? []
+      const sub = rawSub.toLowerCase() || 'list'
+
+      if (sub === 'list' || sub === 'ls') {
+        const ops = deps.listOps()
+        const lines = ['**op 列表**（主人始终是 op，不在列表里）']
+        if (ops.length) for (const o of ops) lines.push(`- ${o.remark} \`${o.openid}\``)
+        else lines.push('', '（空）')
+        await deps.reply(lines.join('\n'))
+        return
+      }
+
+      // In a group the target is a mention, which QQ puts in the text as
+      // <@member_openid>; in private chat it is the bare id.
+      const target = /^<@!?([A-Za-z0-9]+)>\s*([\s\S]*)$/.exec(rest) ?? /^([A-Za-z0-9]{16,})\s*([\s\S]*)$/.exec(rest)
+      if ((sub !== 'add' && sub !== 'remove' && sub !== 'rm') || !target) {
+        await deps.reply('用法：`/op add <@成员|id> [备注]`、`/op remove <@成员|id>`、`/op list`')
+        return
+      }
+      const [, id, tail] = target
+
+      if (sub === 'add') {
+        const remark = tail.trim() || deps.nameOf(id)
+        if (!remark) {
+          await deps.reply('这个 id 没见过，给一个备注名：`/op add <id> 备注`')
+          return
+        }
+        const result = deps.addOp(id, remark)
+        await deps.reply(
+          result === 'owner'
+            ? '主人本来就是 op，不用加。'
+            : `${result === 'added' ? '已添加' : '已更新'} op：${remark}（\`${id}\`）`,
+        )
+        return
+      }
+
+      const result = deps.removeOp(id)
+      await deps.reply(
+        result === 'owner'
+          ? '主人不能移出 op 列表。'
+          : result === 'absent'
+            ? `\`${id}\` 不在 op 列表里。`
+            : `已移除 op \`${id}\``,
+      )
     },
   },
 

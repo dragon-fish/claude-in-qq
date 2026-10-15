@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * Drive Claude Code from QQ private chat.
+ * Drive Claude Code from QQ private chat and QQ groups.
  *
  * The bridge owns the agent session rather than attaching to one: QQ messages
  * are streamed into a long-lived query(), the message stream is read back for
@@ -17,22 +17,41 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFil
 import { homedir, uptime } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { History } from './history.js'
 import { nativePath } from './paths.js'
 import {
+  commandText,
+  describeMessage,
+  mentionsMe,
+  RECENT_IN_CONTEXT,
+  renderMentions,
+  routeGroupMessage,
+  wrapTurn,
+} from './turn.js'
+import {
+  addOp,
+  type Attachment,
   buildApprovalKeyboard,
   buildAskKeyboard,
   type AskLayout,
   closeGateway,
   connectGateway,
+  createGroupStream,
   createStream,
   type StreamHandle,
   drainRelayed,
   dropExpiredPending,
   fetchImage,
+  groupReplyTarget,
   HAS_CREDENTIALS,
   isAllowed,
+  isOp,
+  isOwner,
   lastInboundMsgId,
+  onGroupSent,
+  rememberGroupInbound,
   rememberInbound,
+  removeOp,
   LETTERS,
   loadAccess,
   log,
@@ -41,10 +60,14 @@ import {
   randomId,
   saveAccess,
   sendFile,
+  sendGroupFile,
+  sendToGroup,
   sendToQQ,
   STATE_DIR,
   syncCommandPanel,
   onBeforeSend,
+  type GroupMember,
+  type InboundGroupMessage,
   type InboundMessage,
 } from './qq.js'
 
@@ -257,13 +280,14 @@ type CommandRecord = { name: string; args: string; at: number; note?: string }
 //
 // One conversation is one chat with its own agent session: its own query,
 // queue, streamer, session id, workdir, permission mode and trace level. Two of
-// them never share a stream or a session, so they can run side by side.
+// them never share a stream or a session, so they can run side by side. The
+// private chat is one; each group is another, opened on its first trigger.
 //
 // Process-wide, and deliberately not on a conversation: the QQ gateway and
-// passive quota, the allowlist, approvals and questions (always posted to the
-// operator's private chat, tagged with the conversation that raised them), the
-// wake note (delivered to the private conversation), crash bookkeeping, and
-// shutdown.
+// passive quota, the allowlist and op list, group history, approvals and
+// questions (always posted to the operator's private chat, tagged with the
+// conversation that raised them), the wake note (delivered to the private
+// conversation), crash bookkeeping, and shutdown.
 
 /**
  * The operator's private chat. One key, not one per openid: the bridge is
@@ -287,6 +311,16 @@ type Chat = {
   owns(openid: string): boolean
 }
 
+/** Group conversations are keyed by this plus the group_openid. */
+const GROUP_PREFIX = 'group:'
+
+const groupKey = (group: string) => `${GROUP_PREFIX}${group}`
+
+/** The group a conversation belongs to, or null for the private one. */
+function groupOf(conv: Conversation): string | null {
+  return conv.key.startsWith(GROUP_PREFIX) ? conv.key.slice(GROUP_PREFIX.length) : null
+}
+
 const privateChat: Chat = {
   send: text => {
     const user = requireUser()
@@ -307,6 +341,46 @@ const privateChat: Chat = {
   owns: openid => openid === operatorOpenid(),
 }
 
+/**
+ * A group's output. No streaming — QQ takes no stream parameters for groups —
+ * so a turn's text is collected and posted when the streamer seals it; see
+ * createGroupStream. Each post is passive on the newest group message that
+ * still has a use left, and active otherwise.
+ *
+ * Text QQ refuses goes to the owner's private chat rather than nowhere.
+ */
+function groupChat(group: string): Chat {
+  const undelivered = (text: string, err: unknown) => forwardUndelivered(group, text, err)
+  return {
+    send: async text => {
+      try {
+        await sendToGroup(group, text)
+      } catch (err) {
+        await undelivered(text, err)
+      }
+    },
+    sendFile: (path, caption) => sendGroupFile(group, path, caption),
+    openStream: () => createGroupStream(group, undelivered),
+    replyTo: () => groupReplyTarget(group),
+    owns: id => id === group,
+  }
+}
+
+async function forwardUndelivered(group: string, text: string, err: unknown): Promise<void> {
+  const owner = operatorOpenid()
+  if (!owner) {
+    log(`group ${group.slice(0, 8)}: reply undeliverable and no owner to forward it to`)
+    return
+  }
+  const about = conversations.get(groupKey(group))?.lastTrigger
+  await sendToQQ(
+    owner,
+    `⚠️ 群 \`${group}\` 的回复没能发出（${String(err).slice(0, 120)}），转到这里。` +
+      `${about ? `\n回复的是：${about}` : ''}\n\n${text}`,
+    lastInboundMsgId.get(owner),
+  )
+}
+
 class Conversation {
   readonly key: string
   readonly chat: Chat
@@ -315,6 +389,10 @@ class Conversation {
    * Mutable and persisted. A value chosen with /cwd or /mode outranks the env
    * default: it is the operator's most recent explicit decision, and the env
    * var only describes how this process happened to be launched.
+   *
+   * A new group starts in the home directory with no trace: `QQ_BRIDGE_CWD`
+   * describes the operator's own session, and every trace line in a group is
+   * read by everyone in it.
    */
   workdir: string
   permissionMode: string
@@ -391,6 +469,12 @@ class Conversation {
   restartNotice: RestartNotice | null
 
   /**
+   * Groups only: who said what to start the latest turn, quoted when a reply
+   * has to be forwarded to the owner instead of landing in the group.
+   */
+  lastTrigger: string | null = null
+
+  /**
    * This conversation's own instance of the bridge's tools, so a question the
    * agent asks is recorded against the conversation that asked it.
    */
@@ -400,9 +484,10 @@ class Conversation {
     this.key = key
     this.chat = chat
     const saved = loadConversationState(key)
-    this.workdir = saved.workdir ?? process.env.QQ_BRIDGE_CWD ?? homedir()
+    const isGroup = key !== PRIVATE_KEY
+    this.workdir = saved.workdir ?? (isGroup ? homedir() : (process.env.QQ_BRIDGE_CWD ?? homedir()))
     this.permissionMode = saved.permission_mode ?? process.env.QQ_PERMISSION_MODE ?? 'auto'
-    this.traceLevel = saved.trace_level ?? 'full'
+    this.traceLevel = saved.trace_level ?? (isGroup ? 'off' : 'full')
     this.restartNotice = saved.session_id ? startupNotice : null
     this.tools = qqToolsFor(this)
   }
@@ -445,6 +530,10 @@ function openConversation(key: string, chat: Chat): Conversation {
 
 function privateConversation(): Conversation {
   return openConversation(PRIVATE_KEY, privateChat)
+}
+
+function groupConversation(group: string): Conversation {
+  return openConversation(groupKey(group), groupChat(group))
 }
 
 function recordCommand(conv: Conversation, name: string, args: string): void {
@@ -553,6 +642,40 @@ function withCommandLog(conv: Conversation, text: string): string {
   ].join('\n')
 }
 
+// -------------------------------------------------------------- group history
+
+const history = new History(join(STATE_DIR, 'history.db'))
+
+const HISTORY_PRUNE_EVERY_MS = 60 * 60 * 1000
+
+function pruneHistory(): void {
+  try {
+    const gone = history.prune()
+    if (gone) log(`history: pruned ${gone} message(s) past retention`)
+  } catch (err) {
+    log('history prune failed:', err)
+  }
+}
+
+/** Ops by their remark, then whatever name history last saw. */
+function memberName(openid: string): string | null {
+  return loadAccess().ops[openid] ?? history.nameOf(openid)
+}
+
+function memberRole(openid: string): 'owner' | 'op' | null {
+  const access = loadAccess()
+  return isOwner(openid, access) ? 'owner' : isOp(openid, access) ? 'op' : null
+}
+
+/** Attachments as text, so an image-only message is not a blank line in history. */
+function withAttachmentNotes(content: string, attachments: Attachment[]): string {
+  const notes = attachments.map(a => {
+    const kind = a.content_type?.startsWith('image') ? '图片' : '附件'
+    return `[${kind}${a.filename ? ` ${a.filename}` : ''}]`
+  })
+  return [content, ...notes].filter(Boolean).join(' ')
+}
+
 // ------------------------------------------------------------------ approvals
 
 /**
@@ -633,6 +756,15 @@ function settleQuestion(id: string, text: string, images: FetchedImage[] = []): 
   return true
 }
 
+/**
+ * Cards go to the owner's private chat whichever conversation raised them, so
+ * one raised from a group says which.
+ */
+function originNote(conv: Conversation): string | null {
+  const group = groupOf(conv)
+  return group ? `（来自群 \`${group}\` 的会话）` : null
+}
+
 /** Strip control and bidi characters: tool input is untrusted text. */
 function sanitize(value: string, limit: number): string {
   const cleaned = value
@@ -659,6 +791,7 @@ async function askApproval(
   // could disguise what is actually being approved.
   const body = [
     `**🔐 Claude 要用 ${sanitize(toolName, 40)}**`,
+    ...[originNote(conv)].filter(x => x !== null),
     '',
     '```',
     sanitize(JSON.stringify(input, null, 1), 800),
@@ -712,7 +845,7 @@ function qqToolsFor(conv: Conversation) {
           const id = randomId()
 
           const render = (mode: AskLayout['mode']) => {
-            const lines = [`**${question}**`, '']
+            const lines = [`**${question}**`, ...[originNote(conv)].filter(x => x !== null), '']
             if (details?.trim()) lines.push(details.trim(), '')
             if (mode === 'letters') {
               // Buttons carry only a letter, so the list has to carry the meaning.
@@ -747,6 +880,75 @@ function qqToolsFor(conv: Conversation) {
           }
         },
       ),
+      tool(
+        'qq_group_history',
+        'Read the stored history of a QQ group: every message this bot received there, from people ' +
+          'and other bots alike, and every message it sent. Lines are oldest first, each led by its ' +
+          'message id. Defaults to the group this conversation belongs to. Page backwards with ' +
+          'before_message_id; filter with query, a plain substring of the text or the sender name. ' +
+          'Kept for 30 days.',
+        {
+          group: z.string().optional().describe("group_openid; defaults to this conversation's group"),
+          limit: z.number().int().min(1).max(100).optional().describe('How many messages; default 20'),
+          before_message_id: z.string().optional().describe('Only messages before this one'),
+          query: z.string().optional().describe('Substring of the text or the sender name'),
+        },
+        async ({ group, limit, before_message_id, query }) => {
+          const text = (t: string) => ({ content: [{ type: 'text' as const, text: t }] })
+          const target = group ?? groupOf(conv)
+          if (!target) {
+            const known = history.groups()
+            return text(
+              'This conversation is not a group; pass `group`. Groups on record:\n' +
+                (known.length
+                  ? known.map(g => `${g.group_openid} (${g.messages} messages)`).join('\n')
+                  : '(none)'),
+            )
+          }
+          const rows = history.query({ group: target, limit, beforeMessageId: before_message_id, query })
+          if (!rows.length) {
+            return text(
+              before_message_id && !history.get(target, before_message_id)
+                ? `No message ${before_message_id} on record in this group.`
+                : 'No messages match.',
+            )
+          }
+          const now = Date.now()
+          return text(
+            rows
+              .map(m => describeMessage(m, { ref: now, withId: true, roleOf: memberRole, nameOf: memberName }))
+              .join('\n'),
+          )
+        },
+      ),
+      tool(
+        'qq_op_remove',
+        "Take someone off the op list, so their @ no longer starts a turn with you in any group. " +
+          "For an op who keeps asking for things that would harm the owner's property or " +
+          'reputation. The owner cannot be removed. The owner is told in private chat.',
+        {
+          member_openid: z.string().describe('The member_openid to remove'),
+          reason: z.string().optional().describe('Why, in a sentence; passed on to the owner'),
+        },
+        async ({ member_openid, reason }) => {
+          const text = (t: string) => ({ content: [{ type: 'text' as const, text: t }] })
+          const name = loadAccess().ops[member_openid]
+          const result = removeOp(member_openid)
+          if (result === 'owner') return text('Refused: that is the owner, who is always an op.')
+          if (result === 'absent') return text('Not on the op list; nothing changed.')
+          log(`[${conv.key}] agent removed op ${member_openid}${reason ? `: ${reason}` : ''}`)
+          const owner = operatorOpenid()
+          if (owner) {
+            await sendToQQ(
+              owner,
+              `🚫 agent 把 ${name ?? ''} \`${member_openid}\` 移出了 op 列表` +
+                `${originNote(conv) ?? ''}${reason ? `\n理由：${reason}` : ''}`,
+              lastInboundMsgId.get(owner),
+            ).catch(err => log('op removal notice failed:', err))
+          }
+          return text(`Removed ${name ?? member_openid} from the op list.`)
+        },
+      ),
     ],
   })
 }
@@ -779,7 +981,6 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
 
   currentUser = msg.openid
   rememberInbound(msg.openid, msg.id)
-  // Private chat is the only conversation an inbound message reaches today.
   const conv = privateConversation()
 
   // A stream is bound to the inbound message it replies to and cannot be moved
@@ -796,8 +997,9 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
 
   // Commands outrank a pending prompt: an open question swallows arbitrary text
   // as its answer, so /stop would never reach anything if it were checked after.
-  if (await dispatch(msg.content, commandDeps(conv))) return
-  if (await confirmRestart(msg.content, commandDeps(conv))) return
+  const deps = commandDeps(conv, { sender: msg.openid, mentions: [] })
+  if (await dispatch(msg.content, deps)) return
+  if (await confirmRestart(msg.content, deps)) return
 
   // An open approval or question takes precedence: the agent is blocked on it,
   // so this message is the answer rather than a new instruction.
@@ -822,27 +1024,101 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
       const idx = LETTERS.indexOf(letter[1].toUpperCase())
       if (idx >= 0 && idx < q.options.length) answer = q.options[idx]
     }
-    const { images, notes } = await readAttachments(msg)
+    const { images, notes } = await readAttachments(msg.attachments)
     answer = [answer, ...notes].filter(Boolean).join('\n')
     settleQuestion(id, answer || (images.length ? '(图片)' : '(空消息)'), images)
     return
   }
 
-  const { images, notes } = await readAttachments(msg)
+  const { images, notes } = await readAttachments(msg.attachments)
+  const said = [msg.content, ...notes].filter(Boolean).join('\n') || (images.length ? '(图片)' : '')
+  const wrapped = wrapTurn({
+    source: { kind: 'private' },
+    speaker: { openid: msg.openid, name: msg.name, isOwner: isOwner(msg.openid, access), isBot: false },
+    at: Date.now(),
+    text: said,
+  })
+  log(`inbound from ${msg.openid.slice(0, 8)}: ${msg.content.slice(0, 60)}${images.length ? ` (+${images.length} 图)` : ''}`)
+  enqueue(conv, withCommandLog(conv, wrapped), images)
+}
+
+/** Image first, then the words about it — the order the person sent them in. */
+function enqueue(conv: Conversation, text: string, images: FetchedImage[]): void {
+  if (!images.length) {
+    conv.queue.push(text)
+    return
+  }
   const blocks: ContentBlock[] = images.map(image => ({
     type: 'image',
     source: { type: 'base64', media_type: image.mediaType, data: image.data },
   }))
+  conv.queue.push([...blocks, { type: 'text', text }])
+}
 
-  const text = withCommandLog(conv, [msg.content, ...notes].filter(Boolean).join('\n'))
-  log(`inbound from ${msg.openid.slice(0, 8)}: ${msg.content.slice(0, 60)}${blocks.length ? ` (+${blocks.length} 图)` : ''}`)
-
-  if (blocks.length) {
-    // Image first, then the words about it — the order the person sent them in.
-    conv.queue.push([...blocks, { type: 'text', text: text || '(图片)' }])
-  } else {
-    conv.queue.push(text)
+/**
+ * Every group message is recorded; only an op's @ of this bot starts a turn.
+ *
+ * Recording comes first and doubles as the duplicate check — QQ documents that
+ * one msg_id may be pushed more than once, and a trigger acted on twice is two
+ * replies. Every message, whoever sent it, is also a passive-reply candidate.
+ *
+ * In a group only the owner's slash commands run; an op's slash text reaches
+ * the agent like anything else they say.
+ */
+async function handleGroupMessage(msg: InboundGroupMessage): Promise<void> {
+  const fresh = history.record({
+    group_openid: msg.group,
+    message_id: msg.id,
+    author_openid: msg.author.openid,
+    author_name: msg.author.name,
+    is_bot: msg.author.bot,
+    is_self: false,
+    content: withAttachmentNotes(msg.content, msg.attachments),
+    mentions: msg.mentions.map(m => ({ openid: m.openid, name: m.name, ...(m.isYou ? { is_you: true } : {}) })),
+    ref_idx: msg.msgIdx,
+    created_at: msg.at,
+  })
+  const where = `group ${msg.group.slice(0, 8)}`
+  if (!fresh) {
+    log(`${where}: duplicate push of ${msg.id.slice(-8)} ignored`)
+    return
   }
+  rememberGroupInbound(msg.group, msg.id)
+
+  const access = loadAccess()
+  if (routeGroupMessage(msg, id => isOp(id, access)) !== 'trigger') {
+    if (mentionsMe(msg)) log(`${where}: @ from non-op ${msg.author.openid.slice(0, 8)}, recorded only`)
+    return
+  }
+
+  const conv = groupConversation(msg.group)
+  // See handleMessage: the seal waits for the message to reach the model.
+  conv.sealPending = conv.streamOpen()
+
+  const owner = isOwner(msg.author.openid, access)
+  if (owner) {
+    const text = commandText(msg)
+    const deps = commandDeps(conv, { sender: msg.author.openid, mentions: msg.mentions })
+    if (await dispatch(text, deps)) return
+    if (await confirmRestart(text, deps)) return
+  }
+
+  const { images, notes } = await readAttachments(msg.attachments)
+  const said = [msg.content, ...notes].filter(Boolean).join('\n') || (images.length ? '(图片)' : '')
+  conv.lastTrigger = `${msg.author.name}：${renderMentions(said, msg.mentions, memberName)}`.slice(0, 200)
+  const wrapped = wrapTurn({
+    source: { kind: 'group', group: msg.group },
+    speaker: { openid: msg.author.openid, name: msg.author.name, isOwner: owner, isBot: msg.author.bot },
+    at: msg.at,
+    recent: history.query({ group: msg.group, beforeMessageId: msg.id, limit: RECENT_IN_CONTEXT }),
+    roleOf: memberRole,
+    nameOf: memberName,
+    text: said,
+    mentions: msg.mentions,
+  })
+  log(`${where}: trigger from ${msg.author.openid.slice(0, 8)}: ${msg.content.slice(0, 60)}`)
+  enqueue(conv, withCommandLog(conv, wrapped), images)
+  ensureServing(conv)
 }
 
 /**
@@ -850,10 +1126,10 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
  * and QQ's links expire. Anything that is not an image still goes as a URL,
  * which is all a non-image attachment can usefully be.
  */
-async function readAttachments(msg: InboundMessage): Promise<{ images: FetchedImage[]; notes: string[] }> {
+async function readAttachments(attachments: Attachment[]): Promise<{ images: FetchedImage[]; notes: string[] }> {
   const images: FetchedImage[] = []
   const notes: string[] = []
-  for (const att of msg.attachments) {
+  for (const att of attachments) {
     if (!att.url) continue
     const isImage = att.content_type?.includes('image') || /\.(jpe?g|png|gif|webp)$/i.test(att.url)
     if (!isImage) {
@@ -1015,11 +1291,14 @@ async function askChoice(
   return options.indexOf(answer.text)
 }
 
+/** Who sent a command, and whom their message @'d. */
+type CommandOrigin = { sender: string; mentions: GroupMember[] }
+
 /**
  * Everything the command layer is allowed to touch, and nothing more. A
  * command acts on the conversation it was sent in.
  */
-function commandDeps(conv: Conversation): CommandDeps {
+function commandDeps(conv: Conversation, origin: CommandOrigin): CommandDeps {
   return {
     reply: text => conv.chat.send(text),
     askChoice: (options, render) => askChoice(conv, options, render, true),
@@ -1051,6 +1330,11 @@ function commandDeps(conv: Conversation): CommandDeps {
       if (remark) appendFileSync(WAKE_FILE, `\n\n## 操作者附言（随 /restart 发送）\n\n${remark}\n`)
       void shutdown('/restart')
     },
+    senderIsOwner: () => isOwner(origin.sender),
+    nameOf: openid => origin.mentions.find(m => m.openid === openid)?.name || memberName(openid),
+    listOps: () => Object.entries(loadAccess().ops).map(([openid, remark]) => ({ openid, remark })),
+    addOp,
+    removeOp,
   }
 }
 
@@ -2188,6 +2472,20 @@ async function serve(conv: Conversation): Promise<never> {
   }
 }
 
+/** Conversations whose session loop is running. */
+const serving = new Set<string>()
+
+/**
+ * Start `conv`'s session loop unless it has one. A group's starts on its first
+ * trigger and then runs for the life of the process, like the private one.
+ * A cap on concurrent group sessions, or closing idle ones, belongs here.
+ */
+function ensureServing(conv: Conversation): void {
+  if (serving.has(conv.key)) return
+  serving.add(conv.key)
+  void serve(conv)
+}
+
 async function main(): Promise<void> {
   const state = loadState()
 
@@ -2227,12 +2525,36 @@ async function main(): Promise<void> {
     }
   })
 
+  // This bot's own group messages never come back as events; this is how
+  // they reach the group's history.
+  onGroupSent((group, sent) => {
+    try {
+      history.record({
+        group_openid: group,
+        message_id: sent.id || `self-${Date.now()}-${randomId()}`,
+        author_openid: '',
+        author_name: '',
+        is_bot: true,
+        is_self: true,
+        content: sent.content,
+        mentions: [],
+        ref_idx: sent.refIdx,
+        created_at: Date.now(),
+      })
+    } catch (err) {
+      log('history: own group message not recorded:', err)
+    }
+  })
+
+  pruneHistory()
+  setInterval(pruneHistory, HISTORY_PRUNE_EVERY_MS).unref()
+
   if (!HAS_CREDENTIALS) {
     log('QQ_APP_ID / QQ_CLIENT_SECRET missing — run: bun run onboard.ts')
     process.exit(1)
   }
 
-  await connectGateway({ onMessage: handleMessage, onButton: handleButton })
+  await connectGateway({ onMessage: handleMessage, onGroupMessage: handleGroupMessage, onButton: handleButton })
   log(`bridge up, workdir=${priv.workdir}, mode=${priv.permissionMode}, state=${STATE_DIR}`)
 
   setTimeout(markHealthy, HEALTHY_AFTER_MS).unref()
@@ -2253,6 +2575,7 @@ async function main(): Promise<void> {
     .then(id => log(`command panel synced (${id})`))
     .catch(err => log('command panel sync failed, keeping the existing one:', err))
 
+  serving.add(priv.key)
   await serve(priv)
 }
 

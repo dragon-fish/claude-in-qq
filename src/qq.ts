@@ -64,8 +64,9 @@ const API_BASE = SANDBOX ? 'https://sandbox.api.sgroup.qq.com' : 'https://api.sg
 const TOKEN_URL = 'https://bots.qq.com/app/getAppAccessToken'
 
 /**
- * C2C_MESSAGE_CREATE rides on GROUP_AND_C2C_EVENT (1 << 25); INTERACTION
- * (1 << 26) delivers inline-keyboard clicks. Guild and group intents stay off.
+ * GROUP_AND_C2C_EVENT (1 << 25) carries C2C_MESSAGE_CREATE and both group
+ * message events; INTERACTION (1 << 26) delivers inline-keyboard clicks. Guild
+ * intents stay off.
  * @see https://bot.q.qq.com/wiki/develop/api-v2/dev-prepare/interface-framework/event-emit.html
  */
 const INTENTS = (1 << 25) | (1 << 26)
@@ -76,8 +77,14 @@ type Pending = { openid: string; expires_at: number }
 
 export type Access = {
   policy: 'allowlist' | 'open'
+  /** The owner: private chat, approvals, and slash commands everywhere. */
   allowed: string[]
   pending: Record<string, Pending>
+  /**
+   * Group members whose @ starts a turn, member_openid → remark. The owner is
+   * an op without being listed here, and can never be removed.
+   */
+  ops: Record<string, string>
 }
 
 export const PAIRING_TTL_MS = 10 * 60 * 1000
@@ -86,15 +93,17 @@ export const PAIRING_TTL_MS = 10 * 60 * 1000
 export function loadAccess(): Access {
   try {
     const raw = JSON.parse(readFileSync(ACCESS_FILE, 'utf8')) as Partial<Access>
+    const ops = typeof raw.ops === 'object' && raw.ops ? raw.ops : {}
     return {
       policy: raw.policy === 'open' ? 'open' : 'allowlist',
       allowed: Array.isArray(raw.allowed) ? raw.allowed.filter(x => typeof x === 'string') : [],
       pending:
         typeof raw.pending === 'object' && raw.pending ? (raw.pending as Record<string, Pending>) : {},
+      ops: Object.fromEntries(Object.entries(ops).filter(([, v]) => typeof v === 'string')),
     }
   } catch (err) {
     if (existsSync(ACCESS_FILE)) log('access.json unreadable, denying all:', err)
-    return { policy: 'allowlist', allowed: [], pending: {} }
+    return { policy: 'allowlist', allowed: [], pending: {}, ops: {} }
   }
 }
 
@@ -113,6 +122,37 @@ export function dropExpiredPending(a: Access): void {
 export function isAllowed(openid: string): boolean {
   const access = loadAccess()
   return access.policy === 'open' || access.allowed.includes(openid)
+}
+
+/**
+ * The owner is whoever is on the allowlist. Their group member_openid is the
+ * same string as their private user_openid (measured), so one list serves both.
+ */
+export function isOwner(openid: string, access = loadAccess()): boolean {
+  return access.allowed.includes(openid)
+}
+
+export function isOp(openid: string, access = loadAccess()): boolean {
+  return isOwner(openid, access) || Object.hasOwn(access.ops, openid)
+}
+
+/** Add or rename an op. The owner is refused: listing them would make them removable. */
+export function addOp(openid: string, remark: string): 'added' | 'updated' | 'owner' {
+  const access = loadAccess()
+  if (isOwner(openid, access)) return 'owner'
+  const existed = Object.hasOwn(access.ops, openid)
+  access.ops[openid] = remark
+  saveAccess(access)
+  return existed ? 'updated' : 'added'
+}
+
+export function removeOp(openid: string): 'removed' | 'owner' | 'absent' {
+  const access = loadAccess()
+  if (isOwner(openid, access)) return 'owner'
+  if (!Object.hasOwn(access.ops, openid)) return 'absent'
+  delete access.ops[openid]
+  saveAccess(access)
+  return 'removed'
 }
 
 /** Codes and ids use lowercase letters without 'l', unambiguous when typed on a phone. */
@@ -173,22 +213,41 @@ async function qqFetch(
 
 // -------------------------------------------------------------- passive quota
 //
-// A C2C reply carrying msg_id is "passive": free, but capped at 4 uses per
-// inbound message and valid for 60 minutes. Past either bound it must go out
-// as "active", which draws on a separate daily allowance — 1000 a day per
-// user. Both figures are the documented single-chat ones; group chat differs
-// (5 uses, 5 minutes) and is not supported here.
+// A reply carrying msg_id is "passive": free, but each inbound message is worth
+// a limited number of them for a limited time. Past either bound a message must
+// go out as "active", which draws on a separate allowance.
 //
-// The active send rate for single chat is 10/qps on a personal-certified bot.
-// Appends wait on each other, so this bridge measures ~2.8/s at its fastest
-// and cannot approach it.
+// Single chat: 4 uses within 60 minutes (the docs say 5; 4 is what this bridge
+// was built against), and 1000 active messages a day per user, at 10/qps.
+// Appends wait on each other, so this bridge measures ~2.8/s at its fastest and
+// cannot approach that rate.
+//
+// Group chat: 5 uses within 5 minutes. Any group message received in that
+// window can carry the reply, not only the one that @'d this bot (measured with
+// "receive all messages" on). Active group messages are not capped at 4 a month
+// as the 2025 docs said — five in a row all went through; the current docs say
+// 20/min and 1000/day per group.
 //
 // @see https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/overview.html
+// @see https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages.post.html
 
-const PASSIVE_MAX_USES = 4
-const PASSIVE_TTL_MS = 60 * 60 * 1000
+type PassiveRule = { maxUses: number; ttlMs: number }
+
+const C2C_PASSIVE: PassiveRule = { maxUses: 4, ttlMs: 60 * 60 * 1000 }
+const GROUP_PASSIVE: PassiveRule = { maxUses: 5, ttlMs: 5 * 60 * 1000 }
+
+/**
+ * A group message is only picked as a reply target while this much of its
+ * window is left. The window runs from when QQ took the message, which is a
+ * little before it reached us, and the reply still has to travel back.
+ */
+const GROUP_PASSIVE_MARGIN_MS = 10_000
 
 type PassiveEntry = { used: number; firstAt: number }
+
+function passiveSpent(e: PassiveEntry, rule: PassiveRule, now = Date.now()): boolean {
+  return e.used >= rule.maxUses || now - e.firstAt >= rule.ttlMs
+}
 
 // Persisted so a restarted bridge can still answer the operator's last message:
 // a stream only opens as a reply, and a wake note arrives with nothing new to
@@ -206,6 +265,7 @@ function loadPassive(): { last: Record<string, string>; quota: Record<string, Pa
 }
 
 const savedPassive = loadPassive()
+/** Single-chat uses, keyed by msg_id. Group messages are tracked in `groupInbound`. */
 const passiveQuota = new Map<string, PassiveEntry>(Object.entries(savedPassive.quota))
 
 function savePassive(): void {
@@ -230,7 +290,7 @@ function claimPassive(msgId: string | undefined): string | null {
     savePassive()
     return msgId
   }
-  if (entry.used >= PASSIVE_MAX_USES || now - entry.firstAt >= PASSIVE_TTL_MS) {
+  if (passiveSpent(entry, C2C_PASSIVE, now)) {
     log(`passive quota spent for ${msgId.slice(-8)}: used ${entry.used}, age ${Math.round((now - entry.firstAt) / 1000)}s`)
     return null
   }
@@ -239,12 +299,58 @@ function claimPassive(msgId: string | undefined): string | null {
   return msgId
 }
 
+/**
+ * Recent messages per group, oldest first, each with the uses it has left.
+ *
+ * Kept in memory only. The window is five minutes, so a restart loses at most
+ * that much, and a busy group would otherwise rewrite a file on every message.
+ * The clock starts on arrival rather than on first use: the group window is
+ * counted from the message, and five minutes leaves no slack for guessing.
+ */
+const groupInbound = new Map<string, { msgId: string; entry: PassiveEntry }[]>()
+
+export function rememberGroupInbound(group: string, msgId: string): void {
+  const list = groupInbound.get(group) ?? []
+  if (list.some(m => m.msgId === msgId)) return
+  list.push({ msgId, entry: { used: 0, firstAt: Date.now() } })
+  groupInbound.set(group, list)
+}
+
+function groupCandidate(group: string, now = Date.now()) {
+  const list = groupInbound.get(group) ?? []
+  for (let i = list.length - 1; i >= 0; i--) {
+    const { entry } = list[i]
+    if (entry.used < GROUP_PASSIVE.maxUses && now - entry.firstAt < GROUP_PASSIVE.ttlMs - GROUP_PASSIVE_MARGIN_MS) {
+      return list[i]
+    }
+  }
+  return null
+}
+
+/** The newest group message that can still carry a reply, without spending it. */
+export function groupReplyTarget(group: string): string | undefined {
+  return groupCandidate(group)?.msgId
+}
+
+/** Spend one use on the newest group message that has one, or null to send actively. */
+function claimGroupPassive(group: string): string | null {
+  const hit = groupCandidate(group)
+  if (!hit) return null
+  hit.entry.used += 1
+  return hit.msgId
+}
+
 setInterval(() => {
   const now = Date.now()
   for (const [id, e] of passiveQuota) {
-    if (e.used >= PASSIVE_MAX_USES || now - e.firstAt >= PASSIVE_TTL_MS) passiveQuota.delete(id)
+    if (passiveSpent(e, C2C_PASSIVE, now)) passiveQuota.delete(id)
   }
-}, 5 * 60 * 1000).unref?.()
+  for (const [group, list] of groupInbound) {
+    const live = list.filter(m => !passiveSpent(m.entry, GROUP_PASSIVE, now))
+    if (live.length) groupInbound.set(group, live)
+    else groupInbound.delete(group)
+  }
+}, 60 * 1000).unref?.()
 
 /** Newest inbound msg_id per sender, so mid-task pushes can still ride passive quota. */
 export const lastInboundMsgId = new Map<string, string>(Object.entries(savedPassive.last))
@@ -369,6 +475,75 @@ export async function sendToQQ(
   }
 }
 
+// ---------------------------------------------------------------- group sends
+
+/** A message this bot posted to a group. `refIdx` is what a later quote of it carries. */
+export type SentGroupMessage = { id: string; refIdx: string | null; content: string }
+
+/**
+ * Called after every group message QQ accepts. This bot's own group messages
+ * are never pushed back to it as events, so this is the only way a record of
+ * the group can include what this side said.
+ */
+let groupSent: (group: string, msg: SentGroupMessage) => void = () => {}
+
+export function onGroupSent(fn: (group: string, msg: SentGroupMessage) => void): void {
+  groupSent = fn
+}
+
+/**
+ * Turn `@remark` for a known op into a QQ mention; a mention already written
+ * as `<@id>` is left alone. Longest remark first, so a remark that is a prefix
+ * of another cannot take its mention.
+ *
+ * `<@id>` is the form QQ uses in inbound content. The 2025 docs call it
+ * deprecated for outbound in favour of `<qqbot-at-user id="" />`; which one
+ * renders as a mention today is unverified, and this is the one place to
+ * change if it is the other.
+ */
+export function toGroupMentions(text: string, ops: Record<string, string> = loadAccess().ops): string {
+  const byLength = Object.entries(ops)
+    .filter(([, remark]) => remark)
+    .sort(([, a], [, b]) => b.length - a.length)
+  let out = text
+  for (const [id, remark] of byLength) out = out.split(`@${remark}`).join(`<@${id}>`)
+  return out
+}
+
+async function postGroupText(group: string, text: string): Promise<void> {
+  for (const chunk of chunkText(toGroupMentions(text))) {
+    const passiveId = claimGroupPassive(group)
+    const body: Record<string, unknown> = {
+      markdown: { content: chunk },
+      msg_type: 2,
+      msg_seq: msgSeq++,
+    }
+    if (passiveId) body.msg_id = passiveId
+    const res = await qqFetch(`/v2/groups/${group}/messages`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
+    if (!res.ok) {
+      const detail = await res.text()
+      log(`group send failed [${res.status}] passive=${Boolean(passiveId)}:`, detail.slice(0, 300))
+      throw new Error(`QQ group send failed: ${res.status} ${detail.slice(0, 120)}`)
+    }
+    const data = (await res.json()) as { id?: string; ext_info?: { ref_idx?: string } }
+    groupSent(group, { id: String(data.id ?? ''), refIdx: data.ext_info?.ref_idx ?? null, content: chunk })
+  }
+}
+
+/**
+ * Send to a group: passive on the newest message that still has a use left,
+ * active otherwise. Markdown, like single chat.
+ *
+ * @see https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages.post.html
+ */
+export async function sendToGroup(group: string, text: string): Promise<void> {
+  await beforeSend(group)
+  await postGroupText(group, text)
+}
+
 // ------------------------------------------------------------------ streaming
 //
 // A streamed reply is one QQ message that keeps growing, rather than a series of
@@ -411,8 +586,9 @@ export async function sendToQQ(
  * before it closes, so by the time the message goes out the bubble above it is
  * complete — the card cannot land over text still on its way.
  *
- * Handed the recipient, because only the stream open in that chat is above the
- * message; a stream in another chat is not in its way.
+ * Handed the recipient — a user openid or a group openid — because only the
+ * stream open in that chat is above the message; a stream in another chat is
+ * not in its way.
  */
 let beforeSend: (openid: string) => Promise<void> = async () => {}
 
@@ -661,6 +837,64 @@ export function createStream(openid: string, replyTo?: string): StreamHandle {
           log('stream end threw:', err)
         })
       return chain
+    },
+  }
+}
+
+/**
+ * The group stand-in for a stream: collects what is written and posts it as
+ * one ordinary message on end().
+ *
+ * Groups cannot stream — the send-group-message page says outright that group
+ * messages take no stream parameters, and there is no group stream endpoint.
+ * Presenting the same handle keeps the streamer's rules intact: a MEDIA line
+ * still ends the text before it, so the file lands after the words that
+ * introduce it, and a seal still closes the turn's message.
+ *
+ * Posts without the before-send seal. This is the open message being closed,
+ * not a message arriving over it, and sealing from here would finish the
+ * streamer that is in the middle of calling end().
+ *
+ * `undelivered` gets the text when QQ refuses it, so it can go somewhere
+ * rather than nowhere.
+ */
+export function createGroupStream(
+  group: string,
+  undelivered: (text: string, err: unknown) => Promise<void>,
+): StreamHandle {
+  let text = ''
+  let posted = false
+  let failed = false
+  return {
+    get live() {
+      return posted && !failed
+    },
+    get failed() {
+      return failed
+    },
+    get exhausted() {
+      return false
+    },
+    // One chunk's worth per message, so the streamer rolls (and reopens a
+    // trace fence) at the boundary instead of chunkText cutting inside one.
+    get full() {
+      return text.length >= MAX_CHUNK
+    },
+    async write(delta: string) {
+      text += delta
+    },
+    async end() {
+      const body = text.trim()
+      text = ''
+      if (!body) return
+      try {
+        await postGroupText(group, body)
+        posted = true
+      } catch (err) {
+        failed = true
+        log(`group message to ${group.slice(0, 8)} failed:`, err)
+        await undelivered(body, err).catch(e => log('undelivered group text lost:', e))
+      }
     },
   }
 }
@@ -965,21 +1199,18 @@ function mediaKind(path: string): number {
 }
 
 /**
- * Send a local file as a native QQ attachment.
+ * Upload a local file under `base` (`/v2/users/{openid}` or
+ * `/v2/groups/{group_openid}`) and return its file_info. A file uploaded for
+ * one kind of chat can only be sent to that kind.
  *
- * Two steps rather than one: uploading with `srv_send_msg: true` would have QQ
- * deliver it immediately, but then the message carries no msg_id and cannot use
- * the passive quota. Uploading first and sending second keeps that control.
+ * `srv_send_msg: false` because letting QQ deliver it immediately would send
+ * it without a msg_id, so it could never use the passive quota. Uploading
+ * first and sending second keeps that control.
  *
  * @see https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_openid_files.post.html
+ * @see https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_files.post.html
  */
-export async function sendFile(
-  openid: string,
-  path: string,
-  replyTo?: string,
-  caption?: string,
-): Promise<void> {
-  await beforeSend(openid)
+async function uploadFile(base: string, path: string): Promise<string> {
   const buf = readFileSync(path)
   if (buf.byteLength > MAX_UPLOAD_BYTES) {
     throw new Error(`文件太大（${Math.round(buf.byteLength / 1024 / 1024)}MB）`)
@@ -993,37 +1224,74 @@ export async function sendFile(
   }
   if (kind === MEDIA_FILE) body.file_name = basename(path)
 
-  const upload = await qqFetch(
-    `/v2/users/${openid}/files`,
-    { method: 'POST', body: JSON.stringify(body) },
-    UPLOAD_TIMEOUT_MS,
-  )
+  const upload = await qqFetch(`${base}/files`, { method: 'POST', body: JSON.stringify(body) }, UPLOAD_TIMEOUT_MS)
   if (!upload.ok) throw new Error(`上传失败 ${upload.status}: ${(await upload.text()).slice(0, 200)}`)
 
   const { file_info } = (await upload.json()) as { file_info?: string }
   if (!file_info) throw new Error('上传响应里没有 file_info')
+  return file_info
+}
 
-  const passiveId = claimPassive(replyTo)
-  const send: Record<string, unknown> = { msg_type: 7, media: { file_info }, msg_seq: msgSeq++ }
-  // A media message takes plain-text `content` as a caption, so a short note
-  // rides along with the file instead of arriving as a separate message.
-  // Markdown is not rendered here, which is why long prose still goes on its own.
+/**
+ * The media message that carries an uploaded file. It takes plain-text
+ * `content` as a caption, so a short note rides along with the file instead of
+ * arriving as a separate message. Markdown is not rendered there, which is why
+ * long prose still goes on its own.
+ */
+function mediaBody(fileInfo: string, passiveId: string | null, caption?: string): Record<string, unknown> {
+  const send: Record<string, unknown> = { msg_type: 7, media: { file_info: fileInfo }, msg_seq: msgSeq++ }
   if (caption) send.content = caption.slice(0, MAX_CHUNK)
   if (passiveId) send.msg_id = passiveId
+  return send
+}
 
+/** Send a local file to a user as a native QQ attachment. */
+export async function sendFile(
+  openid: string,
+  path: string,
+  replyTo?: string,
+  caption?: string,
+): Promise<void> {
+  await beforeSend(openid)
+  const fileInfo = await uploadFile(`/v2/users/${openid}`, path)
   const res = await qqFetch(`/v2/users/${openid}/messages`, {
     method: 'POST',
-    body: JSON.stringify(send),
+    body: JSON.stringify(mediaBody(fileInfo, claimPassive(replyTo), caption)),
   })
   if (!res.ok) throw new Error(`发送失败 ${res.status}: ${(await res.text()).slice(0, 200)}`)
+}
+
+/**
+ * Send a local file to a group. The group upload endpoint takes the same body
+ * as the single-chat one, which is the one exercised in practice.
+ */
+export async function sendGroupFile(group: string, path: string, caption?: string): Promise<void> {
+  await beforeSend(group)
+  const fileInfo = await uploadFile(`/v2/groups/${group}`, path)
+  const passiveId = claimGroupPassive(group)
+  const res = await qqFetch(`/v2/groups/${group}/messages`, {
+    method: 'POST',
+    body: JSON.stringify(mediaBody(fileInfo, passiveId, caption)),
+  })
+  if (!res.ok) throw new Error(`发送失败 ${res.status}: ${(await res.text()).slice(0, 200)}`)
+  const data = (await res.json()) as { id?: string; ext_info?: { ref_idx?: string } }
+  const label = mediaKind(path) === MEDIA_IMAGE ? '图片' : '文件'
+  groupSent(group, {
+    id: String(data.id ?? ''),
+    refIdx: data.ext_info?.ref_idx ?? null,
+    content: `[${label}] ${basename(path)}${caption ? `\n${caption}` : ''}`,
+  })
 }
 
 // -------------------------------------------------------------------- gateway
 
 /**
- * Events this bridge does not act on yet (group messages, mostly), kept whole
- * so what QQ actually sends can be read off disk instead of guessed from docs
- * that stop at 2025. Content is clipped; the fields around it are the point.
+ * Events this bridge does not act on, kept whole so what QQ actually sends can
+ * be read off disk instead of guessed from docs that lag behind. Group
+ * messages of a kind other than plain text (quotes, cards, forwarded records)
+ * are kept here too while also being handled as text, because their extra
+ * fields are not read yet. Content is clipped; the fields around it are the
+ * point.
  */
 const UNHANDLED_FILE = join(STATE_DIR, 'unhandled-events.jsonl')
 
@@ -1042,11 +1310,77 @@ export type InboundMessage = {
   id: string
   content: string
   openid: string
-  attachments: { url?: string; content_type?: string; filename?: string }[]
+  /** Often empty in single chat. */
+  name: string
+  attachments: Attachment[]
+}
+
+export type Attachment = { url?: string; content_type?: string; filename?: string }
+
+export type GroupMember = { openid: string; name: string; bot: boolean }
+
+export type InboundGroupMessage = {
+  id: string
+  group: string
+  /**
+   * As QQ sent it: mentions appear as `<@member_openid>`. A GROUP_AT event has
+   * the @ of this bot already removed.
+   */
+  content: string
+  author: GroupMember
+  /** `isYou` marks this bot. GROUP_AT events carry none for it. */
+  mentions: (GroupMember & { isYou: boolean })[]
+  /**
+   * Came as GROUP_AT_MESSAGE_CREATE, which QQ only sends for an @ of this bot.
+   * With "receive all messages" on, an @ arrives as GROUP_MESSAGE_CREATE with
+   * `is_you` in mentions instead, and no AT event alongside it (measured).
+   */
+  atEvent: boolean
+  attachments: Attachment[]
+  /** `msg_idx` from message_scene.ext: the id a quote of this message carries. */
+  msgIdx: string | null
+  /** Milliseconds; QQ's timestamp, or arrival when it has none. */
+  at: number
+}
+
+function parseMember(u: any): GroupMember {
+  return {
+    openid: String(u?.member_openid ?? u?.id ?? ''),
+    name: String(u?.username ?? ''),
+    bot: u?.bot === true,
+  }
+}
+
+function sceneExt(d: Record<string, any>, key: string): string | null {
+  const ext: unknown = d.message_scene?.ext
+  if (!Array.isArray(ext)) return null
+  const hit = ext.find(e => typeof e === 'string' && e.startsWith(`${key}=`)) as string | undefined
+  return hit ? hit.slice(key.length + 1) : null
+}
+
+/** Map a GROUP_MESSAGE_CREATE or GROUP_AT_MESSAGE_CREATE payload; null when it lacks an id or group. */
+export function parseGroupEvent(type: string, d: Record<string, any>): InboundGroupMessage | null {
+  if (!d.id || !d.group_openid) return null
+  const at = Date.parse(String(d.timestamp ?? ''))
+  return {
+    id: String(d.id),
+    group: String(d.group_openid),
+    content: String(d.content ?? '').trim(),
+    author: parseMember(d.author),
+    mentions: (Array.isArray(d.mentions) ? d.mentions : []).map((m: any) => ({
+      ...parseMember(m),
+      isYou: m?.is_you === true,
+    })),
+    atEvent: type === 'GROUP_AT_MESSAGE_CREATE',
+    attachments: Array.isArray(d.attachments) ? d.attachments : [],
+    msgIdx: sceneExt(d, 'msg_idx'),
+    at: Number.isFinite(at) ? at : Date.now(),
+  }
 }
 
 export type GatewayHandlers = {
   onMessage: (msg: InboundMessage) => Promise<void>
+  onGroupMessage: (msg: InboundGroupMessage) => Promise<void>
   onButton: (openid: string, buttonData: string) => Promise<void>
 }
 
@@ -1153,10 +1487,24 @@ export async function connectGateway(handlers: GatewayHandlers, attempt = 0): Pr
             id: String(d.id),
             content: String(d.content ?? '').trim(),
             openid: String(openid),
+            name: String(d.author?.username ?? ''),
             attachments: Array.isArray(d.attachments) ? d.attachments : [],
           })
         } catch (err) {
           log('inbound handling failed:', err)
+        }
+        return
+      }
+
+      // Same shape for both; see InboundGroupMessage.atEvent for which arrives when.
+      if (payload.t === 'GROUP_MESSAGE_CREATE' || payload.t === 'GROUP_AT_MESSAGE_CREATE') {
+        const msg = parseGroupEvent(payload.t, d)
+        if (!msg) return
+        if (d.message_type !== undefined && d.message_type !== 0) recordUnhandledEvent(payload.t, d)
+        try {
+          await handlers.onGroupMessage(msg)
+        } catch (err) {
+          log('group inbound handling failed:', err)
         }
         return
       }
