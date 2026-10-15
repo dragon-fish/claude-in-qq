@@ -26,6 +26,7 @@ import {
   commandText,
   describeOrigin,
   historyEntry,
+  matchNickname,
   jsonLine,
   mentionsMe,
   type Origin,
@@ -1505,17 +1506,19 @@ async function handleGroupMessage(msg: InboundGroupMessage): Promise<void> {
   // first turn's context can show it. Never for long: a name is cosmetic.
   if (naming) await Promise.race([naming, new Promise(r => setTimeout(r, NAME_WAIT_MS))])
 
-  // Addressed by nickname, the nickname is how they got the bot's attention,
-  // not part of what they said — as an @ of this bot is, which stays in.
-  const content = stripNickname(msg.content, nicknames) ?? msg.content
+  // The text goes in as written, a nickname that addressed the bot included,
+  // as an @ of it is: a bare sentence leaves the agent unable to tell it was
+  // called at all. The context names what woke it.
+  const nickname = mentionsMe(msg) ? null : matchNickname(msg.content, nicknames)
   const { images, notes } = await readAttachments(msg.attachments)
-  const said = [content, ...notes].filter(Boolean).join('\n') || (images.length ? '(图片)' : '')
+  const said = [msg.content, ...notes].filter(Boolean).join('\n') || (images.length ? '(图片)' : '')
   const rendered = renderMentions(said, msg.mentions, memberName)
   conv.lastTrigger = `${msg.author.name}：${rendered}`.slice(0, 200)
   const speaker: Speaker = { openid: msg.author.openid, name: msg.author.name, isOwner: owner, isBot: msg.author.bot }
   const label = groupLabel(msg.group)
   const wrapped = wrapTurn({
     source: { kind: 'group', label, key: conv.key },
+    trigger: nickname === null ? { kind: 'mention' } : { kind: 'nickname', nickname },
     speaker,
     at: msg.at,
     recent: history.query({ group: msg.group, beforeMessageId: msg.id, limit: RECENT_IN_CONTEXT }),

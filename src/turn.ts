@@ -20,17 +20,24 @@ export function mentionsMe(msg: InboundGroupMessage): boolean {
 const NICKNAME_SEPARATOR = /^[\s，,：:、]+/
 
 /**
- * The text after the nickname `content` opens with, or null when it opens
- * with none. Only the very start counts — a nickname mid-sentence is someone
- * talking about the bot, not to it. The longest matching nickname wins, so
- * one that is a prefix of another cannot cut it short; case is ignored.
+ * The nickname `content` opens with, or null when it opens with none. Only the
+ * very start counts — a nickname mid-sentence is someone talking about the
+ * bot, not to it. The longest matching nickname wins, so one that is a prefix
+ * of another cannot cut it short; case is ignored.
  */
+export function matchNickname(content: string, nicknames: string[]): string | null {
+  return (
+    [...nicknames]
+      .filter(Boolean)
+      .sort((a, b) => b.length - a.length)
+      .find(n => content.slice(0, n.length).toLowerCase() === n.toLowerCase()) ?? null
+  )
+}
+
+/** The text after the nickname `content` opens with, or null when it opens with none. */
 export function stripNickname(content: string, nicknames: string[]): string | null {
-  const hit = [...nicknames]
-    .filter(Boolean)
-    .sort((a, b) => b.length - a.length)
-    .find(n => content.slice(0, n.length).toLowerCase() === n.toLowerCase())
-  return hit === undefined ? null : content.slice(hit.length).replace(NICKNAME_SEPARATOR, '')
+  const hit = matchNickname(content, nicknames)
+  return hit === null ? null : content.slice(hit.length).replace(NICKNAME_SEPARATOR, '')
 }
 
 /**
@@ -172,6 +179,11 @@ export type TurnInput = MemberLookup & {
    * qq_message_agent and qq_group_history take.
    */
   source: { kind: 'private' } | { kind: 'group'; label: string; key: string }
+  /**
+   * Group only: what made this message start a turn — an @ of this bot, or
+   * one of its nicknames opening the message (which stays in the text).
+   */
+  trigger?: { kind: 'mention' } | { kind: 'nickname'; nickname: string }
   speaker: Speaker
   at: number
   /** Group only: the messages before the trigger, oldest first. */
@@ -236,6 +248,12 @@ export function wrapTurn(input: TurnInput): string {
       source.kind === 'group'
         ? { kind: 'group', key: source.key, name: source.label }
         : { kind: 'private' },
+    trigger:
+      source.kind === 'group'
+        ? input.trigger?.kind === 'nickname'
+          ? { kind: 'nickname', nickname: input.trigger.nickname }
+          : { kind: 'mention' }
+        : undefined,
     speaker: {
       openid: speaker.openid,
       name: speaker.name,

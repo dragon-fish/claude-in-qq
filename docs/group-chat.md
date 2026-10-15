@@ -67,7 +67,8 @@ agent 查询。两台 bridge 拉进同一个群后，就能互相 @ 对话。私
 
 - op（含主人、op 里的 bot）@ 本 bot 的群消息 → 触发该群会话的一轮。
 - op 的群消息以某个昵称**开头** → 等同 @。昵称后可跟空白或 `，,：:、` 作分隔，也可以不跟；多个昵称都匹配时取
-  最长的；不区分大小写。昵称从 `<user_message>` 里去掉。句中出现昵称不算。
+  最长的；不区分大小写。昵称留在 `<user_message>` 里，`<turn_context>` 的 `trigger` 注明是哪个昵称；只有解析主人的斜杠命令时
+  才去掉它（`小克m /cwd ~/x` 照常执行 /cwd）。句中出现昵称不算。
 - 非 op 的 @ 或昵称、所有没叫本 bot 的消息 → 只入历史，不触发。
 - bot 连续触发超过 6 轮（中间没有人类 op 在该群说话，@ 与否都算）→ 第 7 条起不再回应 bot，并在群里 @ 主人一次；
   人类 op 说话即清零。计数只在内存里。
@@ -161,6 +162,7 @@ agent 查询。两台 bridge 拉进同一个群后，就能互相 @ 对话。私
 <turn_context>
 {
   "source": {"kind":"group","key":"group:642E2EF6E499C6B0E4C500F634C0F9CE","name":"小鱼君测试沙盒"},
+  "trigger": {"kind":"mention"},
   "speaker": {"openid":"8C072A8CA2620EE3F14D3CF2CED8D7FA","name":"机智的小鱼君⚡️","is_owner":true,"is_op":true,"is_bot":false},
   "time": "2026/10/16 00:59:32",
   "recent": [
@@ -174,12 +176,13 @@ agent 查询。两台 bridge 拉进同一个群后，就能互相 @ 对话。私
 </user_message>
 ```
 
-- 私聊的 `source` 是 `{"kind":"private"}`，`speaker` 不带 `is_op`，没有 `recent`。群聊的 `recent` 是触发消息之前最多
+- 群聊的 `trigger` 是唤醒这一轮的方式：`{"kind":"mention"}`（@ 本 bot），或 `{"kind":"nickname","nickname":"小克"}`。
+- 私聊的 `source` 是 `{"kind":"private"}`，没有 `trigger`，`speaker` 不带 `is_op`，没有 `recent`。群聊的 `recent` 是触发消息之前最多
   10 条，旧→新；`is_owner` / `is_op` / `is_bot` 只在为真时出现；本 bot 自己的消息是 `{"at":…,"self":true,"text":…}`。
 - 每个顶层字段一行、数组每项一行；所有字符串都由 `JSON.stringify` 生成，`<` `>` 再转成 `\u003c` `\u003e`。成员能控制的
   名字、群名、历史内容因此只能待在 JSON 字符串里，伪造不了字段、身份标记或闭合标签。
 - 私聊和群聊的每条入站消息都包装；`<@id>` 渲染为 `@昵称`（消息自带的名字，其次 op 备注，其次历史里见过的名字）。
-  用昵称叫本 bot 时，昵称不进 `<user_message>`。
+  消息原样放进 `<user_message>`，用昵称叫本 bot 时昵称也留着，和 @ 一样。
 - 历史条目的 `text` 截 200 字。
 - `<user_message>` 和会话留言正文是纯文本，其中像框架标签的 `<`（`turn_context` / `user_message` /
   `conversation_message` / `quoted_message` / `system-reminder` / `harness-reminder`，斜杠前后有空白或不可见字符、
