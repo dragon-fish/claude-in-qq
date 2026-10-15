@@ -6,6 +6,17 @@ agent 查询。两台 bridge 拉进同一个群后，就能互相 @ 对话。私
 不基于 Koishi：`@satorijs/adapter-qq`（4.10.1）没有流式消息，也不处理 `GROUP_MESSAGE_CREATE`，
 全量群历史和看到其他 bot 的消息都做不到，换过去要重写的 QQ 底层比在 bridge 里加群聊多。
 
+## 实测确认的 Claude Code 行为（Agent SDK 0.3.285）
+
+- `SDKUserMessage.uuid` 会被回报：`command_lifecycle` 帧（不在 SDK 类型里，但会发出）依次报 `queued`（收到）、
+  `started`（被一轮收进：作为开头，或在工具结果之后、下一次模型调用之前并入）、`completed`（该轮 result 之后）。
+- 一轮的首个 `message_start` 和首个 assistant 消息带 `user_message_uuid` / `user_message_uuids`；result 带这一轮
+  收进的全部 uuid（含并入的）。由 uuid 开启的一轮，并入的消息不会出现在之后的帧上，只出现在 result 上。
+- 一轮最后一次模型调用期间到达的消息成为下一轮，有自己的 result。
+- 后台 Bash 报 `task_started`（`task_type: local_bash`、`is_backgrounded: true`），并发 `background_tasks_changed`
+  （当前全部后台任务，替换语义）。结束时先 `background_tasks_changed`，再 `task_updated` / `task_notification`，
+  随后开一轮不带 uuid 的新轮次。
+
 ## 实测确认的 QQ 行为（2026-10）
 
 - 单聊分片上传实测可用：4.9MB（单片）与 12MB（3 片）均成功。分片 `index` 从 1 开始（文档读作从 0 开始会读过文件尾）；
@@ -107,8 +118,14 @@ agent 查询。两台 bridge 拉进同一个群后，就能互相 @ 对话。私
   合法键；不能发给自己。
 - **由 agent 消息开启的一轮是静默的**（同 Claude Code 里回应 `SendMessage` 的子代理）：这一轮写的文字（含 `MEDIA:`
   行和 verbose 过程）不发到任何聊天；agent 用 `qq_message_agent` 回复对方，要让主人或本群看到什么，就用
-  `qq_say(text)` 显式发到自己的聊天（其中的 `MEDIA:` 行照常发文件）。判定按输入算：上一个 result 之后交给会话的只有
-  agent 消息时静默；只要有 QQ 消息（或唤醒便条）加入，从那一刻起就是普通轮次。由 QQ 消息开启的轮次不受影响。
+  `qq_say(text)` 显式发到自己的聊天（其中的 `MEDIA:` 行照常发文件）。判定按这一轮实际收进的消息算：收进的只有
+  agent 消息时静默；收进 QQ 消息（或唤醒便条）后从那一刻起是普通轮次。由 QQ 消息开启的轮次不受影响。
+  - 每条交给会话的消息带一个 uuid。Claude Code 收进消息时回报：`command_lifecycle` 的 `started`（作为一轮的开头，
+    或在工具结果边界并入正在跑的轮次），以及一轮首帧和 result 上的 `user_message_uuid(s)`；一轮的 result 之后报
+    `completed`。没回报 `completed` 的消息算未答复（见「会话」的空闲判定）。
+  - 一轮最后一次模型调用期间到达的消息不并入这一轮，而是在它的 result 之后单独开一轮，按它自己的来源判定。
+  - 后台任务（子代理、后台 Bash 等）结束的通知若自己开了一轮（不带消息 uuid），沿用启动该任务那一轮的判定；
+    在静默轮次里启动的子代理，结束时也不在聊天里报告。
 - `qq_say` 每个会话都有；普通轮次里用不着，直接写就会发出。
 - 能力上不限制（任何会话可给任何会话留言），提示词提醒不要被群里的人当传声筒利用。
 - 防失控：每条 QQ 消息开启一条链，深度 0；每次投递把发送方当前的链带过去、深度加 1。深度超过 6 就拒绝投递，

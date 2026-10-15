@@ -14,6 +14,7 @@ import { createSdkMcpServer, query, tool } from '@anthropic-ai/claude-agent-sdk'
 import { z } from 'zod'
 import { buildHead, dispatch, panelEntries, type CommandDeps } from './commands.js'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import { homedir, uptime } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -233,21 +234,26 @@ type SDKUserMessage = {
   message: { role: 'user'; content: string | ContentBlock[] }
   parent_tool_use_id: null
   session_id?: string
+  /** Echoed back by Claude Code on the frames of the turn that takes it; see `Conversation.silent`. */
+  uuid: string
 }
 
 class MessageQueue implements AsyncIterable<SDKUserMessage> {
   private waiting: ((m: SDKUserMessage) => void)[] = []
   private buffered: SDKUserMessage[] = []
 
-  push(content: string | ContentBlock[]): void {
+  /** Returns the message's uuid. */
+  push(content: string | ContentBlock[]): string {
     const msg: SDKUserMessage = {
       type: 'user',
       message: { role: 'user', content },
       parent_tool_use_id: null,
+      uuid: randomUUID(),
     }
     const next = this.waiting.shift()
     if (next) next(msg)
     else this.buffered.push(msg)
+    return msg.uuid
   }
 
   /**
@@ -265,6 +271,11 @@ class MessageQueue implements AsyncIterable<SDKUserMessage> {
   /** Messages no session has taken yet. */
   get size(): number {
     return this.buffered.length
+  }
+
+  /** The uuids of those messages. */
+  bufferedUuids(): Set<string> {
+    return new Set(this.buffered.map(m => m.uuid))
   }
 
   async *[Symbol.asyncIterator](): AsyncIterator<SDKUserMessage> {
@@ -460,16 +471,18 @@ class Conversation {
 
   /**
    * Whether a turn is under way: set by every message that is part of one,
-   * cleared by its result. Messages handed to the session since the last
-   * result count as well — see `busy`.
+   * cleared by its result. Messages handed to the session and not yet
+   * answered count as well — see `busy`.
    */
   inTurn = false
-  /** Messages handed to this conversation, and how many of them the last result covered. */
-  inputs = 0
-  answered = 0
-  /** The `inputs` count at the latest QQ message (or wake note), and at the latest agent message. */
-  lastHumanInput = 0
-  lastAgentInput = 0
+  /**
+   * Messages handed to the session that no turn has finished answering, by
+   * uuid, with who sent them. Claude Code lists the messages a turn took on
+   * its result and reports each `completed` after it; either settles one.
+   */
+  readonly owed = new Map<string, InputKind>()
+  /** Who the turn under way answers, as Claude Code reports taking messages; cleared by its result. */
+  turn: Record<InputKind, boolean> = { human: false, agent: false }
   /** When anything last happened here — a message in, or anything from the session. 0 for never. */
   lastActivity = 0
   /** Subagents of the live session still working. Assigned per session by `runSession`. */
@@ -590,22 +603,45 @@ class Conversation {
    * a turn is silent, like a Claude Code subagent answering SendMessage: what
    * it writes is not posted to this chat — it answers the sender with
    * qq_message_agent, and posts here only on purpose, with qq_say. A QQ
-   * message in the mix makes the turn an ordinary one again, from the moment
-   * it is handed over.
+   * message the turn takes makes it an ordinary one from that point on.
+   *
+   * Decided by what Claude Code says the turn took (see `take`), never by what
+   * arrived since the last result. Claude Code folds a queued message into a
+   * running turn only at a tool-result boundary; one that arrives during the
+   * turn's last model call is not part of it but starts the next turn, with a
+   * result of its own. Counting arrivals marks such a message answered before
+   * it is: an agent's follow-up turn then posts, and a human's can go silent.
+   *
+   * A turn that took no message — one a finished background task started — is
+   * classed by the turn that launched the task; see runSession.
    */
   silent(): boolean {
-    return this.lastAgentInput > this.answered && this.lastHumanInput <= this.answered
+    return this.turn.agent && !this.turn.human
+  }
+
+  /**
+   * Claude Code took the message `uuid` into the turn under way: as the prompt
+   * that starts it, or folded in at a tool-result boundary. Every message owed
+   * before it was taken too — messages sent close together run as one turn,
+   * and an older producer names only the last of them.
+   */
+  take(uuid: string): void {
+    if (!this.owed.has(uuid)) return
+    for (const [id, kind] of this.owed) {
+      this.turn[kind] = true
+      if (id === uuid) break
+    }
   }
 
   /**
    * Whether closing the session now could lose or cut anything: a turn under
-   * way, messages handed over that no result has covered yet (the session may
+   * way, messages handed over that no turn has answered yet (the session may
    * be about to start a turn on them), subagents still working, a card waiting
    * on the owner, or messages queued for the next session.
    */
   busy(): boolean {
     const carded = [...pendingApprovals.values(), ...pendingQuestions.values()].some(p => p.conversation === this.key)
-    return this.inTurn || this.answered < this.inputs || this.backgroundTasks() > 0 || carded || this.queue.size > 0
+    return this.inTurn || this.owed.size > 0 || this.backgroundTasks() > 0 || carded || this.queue.size > 0
   }
 
   sessionId(): string | null {
@@ -637,6 +673,9 @@ class Conversation {
     patchConversationState(this.key, { name })
   }
 }
+
+/** Who sent a message: a QQ message or the wake note, or another conversation's agent. */
+type InputKind = 'human' | 'agent'
 
 /** See `Conversation.chain`. `origin` is from `describeOrigin`, null when no QQ message began it. */
 type Chain = { id: string; depth: number; origin: string | null }
@@ -1164,7 +1203,7 @@ function knownConversationKeys(): string[] {
 
 function conversationStatus(key: string): 'running' | 'idle' | 'waiting' | 'parked' {
   const conv = conversations.get(key)
-  if (conv && serving.has(key)) return conv.inTurn || conv.answered < conv.inputs ? 'running' : 'idle'
+  if (conv && serving.has(key)) return conv.inTurn || conv.owed.size > 0 ? 'running' : 'idle'
   return waiting.includes(key) ? 'waiting' : 'parked'
 }
 
@@ -1346,20 +1385,14 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
  * says whether a QQ message (or the wake note) or another agent sent it; see
  * `Conversation.silent`.
  */
-function enqueue(conv: Conversation, text: string, images: FetchedImage[], from: 'human' | 'agent' = 'human'): void {
-  conv.inputs++
-  if (from === 'human') conv.lastHumanInput = conv.inputs
-  else conv.lastAgentInput = conv.inputs
+function enqueue(conv: Conversation, text: string, images: FetchedImage[], from: InputKind = 'human'): void {
   conv.lastActivity = Date.now()
-  if (!images.length) {
-    conv.queue.push(text)
-    return
-  }
   const blocks: ContentBlock[] = images.map(image => ({
     type: 'image',
     source: { type: 'base64', media_type: image.mediaType, data: image.data },
   }))
-  conv.queue.push([...blocks, { type: 'text', text }])
+  const uuid = conv.queue.push(images.length ? [...blocks, { type: 'text', text }] : text)
+  conv.owed.set(uuid, from)
 }
 
 /**
@@ -2387,6 +2420,12 @@ class LineStreamer {
   }
 }
 
+/** The messages a frame says its turn took, from the uuids `MessageQueue.push` gave them. */
+function stampedUuids(m: any): string[] {
+  if (Array.isArray(m.user_message_uuids) && m.user_message_uuids.length) return m.user_message_uuids
+  return typeof m.user_message_uuid === 'string' ? [m.user_message_uuid] : []
+}
+
 /**
  * Run one agent session for `conv` until it ends. Returns when the query
  * closes.
@@ -2399,10 +2438,12 @@ async function runSession(conv: Conversation): Promise<void> {
   log(`[${conv.key}] ${resume ? `resuming session ${resume}` : 'starting a new session'}`)
 
   // Whatever the last session took and never answered went with it; only what
-  // is still queued is owed an answer by this one. Counted before query()
+  // is still queued is owed an answer by this one. Settled before query()
   // exists: the queue may be read from the moment it does.
   conv.inTurn = false
-  conv.answered = conv.inputs - conv.queue.size
+  conv.turn = { human: false, agent: false }
+  const queued = conv.queue.bufferedUuids()
+  for (const id of conv.owed.keys()) if (!queued.has(id)) conv.owed.delete(id)
 
   const q = query({
     prompt: conv.queue,
@@ -2572,6 +2613,18 @@ async function runSession(conv: Conversation): Promise<void> {
   const subagents = new Map<string, { description: string; startedAt: number }>()
   conv.backgroundTasks = () => subagents.size
 
+  /** Tasks still running, by id, with who the turn that launched them answered. */
+  const launchedBy = new Map<string, InputKind>()
+  /**
+   * Who launched each task that reported finishing since the last model call
+   * began. Claude Code queues a finished task's notification like a message:
+   * folded into a running turn at its next model call, or else the start of a
+   * turn of its own, which carries no message uuid and is classed by these.
+   */
+  let wakes: InputKind[] = []
+  /** Whether this Claude Code reports taking and finishing messages; see the result. */
+  let reportsMessages = false
+
   async function traceSubagent(line: string): Promise<void> {
     await traceBreak()
     await trace(`${line}\n`)
@@ -2618,6 +2671,23 @@ async function runSession(conv: Conversation): Promise<void> {
     // Agent call itself is a top-level frame and is still traced.
     if (m.parent_tool_use_id) continue
 
+    // Which messages the turn under way took. `command_lifecycle` is not in the
+    // SDK's types but is emitted (measured on 0.3.285): `started` when a turn
+    // takes a message, as its prompt or folded in at a tool-result boundary,
+    // and `completed` after that turn's result. The documented stamp —
+    // user_message_uuid(s) on a turn's first frames and on its result — covers
+    // turn starts and coalesced batches, but a fold into a turn a message
+    // started shows up only on the result, too late for the text after it.
+    if (m.type === 'command_lifecycle') {
+      reportsMessages = true
+      if (m.state === 'started') conv.take(m.command_uuid)
+      else if (m.state === 'completed' || m.state === 'cancelled') conv.owed.delete(m.command_uuid)
+      continue
+    }
+    if (m.type === 'stream_event' || m.type === 'assistant' || m.type === 'result') {
+      for (const id of stampedUuids(m)) conv.take(id)
+    }
+
     // System messages are left out: a background task reporting in after the
     // turn ended is not a turn, and would leave the flag set with no result
     // coming to clear it.
@@ -2628,6 +2698,7 @@ async function runSession(conv: Conversation): Promise<void> {
       // a resumable session behind.
       if (m.session_id) conv.setSessionId(m.session_id)
     } else if (m.type === 'system' && m.subtype === 'task_started') {
+      if (!m.ambient) launchedBy.set(m.task_id, conv.silent() ? 'agent' : 'human')
       if (m.task_type === 'local_agent' && !m.ambient) {
         subagents.set(m.task_id, { description: m.description, startedAt: Date.now() })
         await traceSubagent(`🤖 已创建子代理：${m.description}（当前 ${subagents.size} 个）`)
@@ -2636,12 +2707,21 @@ async function runSession(conv: Conversation): Promise<void> {
       // A task can report its end both ways; whichever lands first removes it,
       // so the other finds nothing and says nothing.
       const status: string | undefined = m.subtype === 'task_notification' ? m.status : m.patch?.status
+      const launcher = launchedBy.get(m.task_id)
+      if (m.subtype === 'task_notification' && launcher) {
+        launchedBy.delete(m.task_id)
+        wakes.push(launcher)
+      }
       const agent = subagents.get(m.task_id)
       const outcome = status ? SUBAGENT_OUTCOMES[status] : undefined
       if (agent && outcome) {
         subagents.delete(m.task_id)
         const took = formatDuration(m.usage?.duration_ms ?? Date.now() - agent.startedAt)
-        await traceSubagent(`${outcome}：${agent.description}，用时 ${took}（剩 ${subagents.size} 个）`)
+        // Between turns nothing is silent, so a subagent a silent turn
+        // launched would announce its end in the chat.
+        if (launcher !== 'agent') {
+          await traceSubagent(`${outcome}：${agent.description}，用时 ${took}（剩 ${subagents.size} 个）`)
+        }
       }
     } else if (m.type === 'stream_event') {
       // Everything the operator sees is driven from here rather than from the
@@ -2650,6 +2730,13 @@ async function runSession(conv: Conversation): Promise<void> {
       // thought. Reading tool calls off the finished message instead would
       // stack them after their own reasoning.
       const ev = m.event
+      if (ev?.type === 'message_start') {
+        // Every model call begins here, after Claude Code folded in whatever
+        // was queued. A turn that took no message was started by these.
+        const woke = wakes
+        wakes = []
+        if (!conv.turn.human && !conv.turn.agent) for (const kind of woke) conv.turn[kind] = true
+      }
       if (ev?.type === 'content_block_delta') {
         if (ev.delta?.type === 'text_delta') blockTextChars += ev.delta.text.length
       } else if (ev?.type === 'content_block_stop') {
@@ -2814,12 +2901,15 @@ async function runSession(conv: Conversation): Promise<void> {
       // the next turn's first words would spread one mistake across two.
       carriedFence = null
       toolNames.clear()
-      // Everything handed over so far is covered: a message that arrived
-      // mid-turn was folded into this one. One that arrives after still counts
-      // as owed until the next result, which keeps an idle check from closing
-      // a session that is about to start a turn on it.
+      // Only the messages this turn took are answered. One that arrived during
+      // its last model call is still owed: Claude Code starts the next turn on
+      // it, and an idle check must not close the session before it does.
       conv.inTurn = false
-      conv.answered = conv.inputs
+      const settled = stampedUuids(m)
+      for (const id of settled) conv.owed.delete(id)
+      // A Claude Code that reports neither covers everything handed over by now.
+      if (!reportsMessages && !settled.length) conv.owed.clear()
+      conv.turn = { human: false, agent: false }
       log(`[${conv.key}] turn finished: ${m.subtype}, turns=${m.num_turns}`)
     }
   }
@@ -2960,9 +3050,9 @@ const GROUP_IDLE_MS = (Number(process.env.QQ_GROUP_IDLE_MINUTES) || 30) * 60_000
 
 /**
  * How long a session must have been quiet before a waiting group may take its
- * slot. `busy` cannot see a message that slipped in just as a turn ended, which
- * Claude Code is about to start a fresh turn on; the session is silent only
- * for the moment before that turn shows, so a minute of silence rules it out.
+ * slot. `busy` already covers everything that could be cut; this keeps a slot
+ * from changing hands while the people in a group that was just answered are
+ * still typing their next message.
  */
 const PREEMPT_QUIET_MS = 60_000
 
