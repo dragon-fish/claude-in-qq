@@ -11,8 +11,12 @@
 import type { HistoryMessage } from './history.js'
 import type { InboundGroupMessage } from './qq.js'
 
-/** The run of @'s a message opens with, e.g. `<@a> <@b> ` in `<@a> <@b> hi`. */
-const LEADING_MENTIONS = /^\s*((?:<@!?[^>\s]+>\s*)+)/
+/**
+ * The run of @'s a message opens with, e.g. `<@a> <@b> ` in `<@a> <@b> hi`.
+ * QQ rewrites an @ that a bot sends into plain `[@名字]` text before other
+ * bots see it (measured; `mentions` still lists it), so both forms count.
+ */
+const LEADING_MENTIONS = /^\s*((?:(?:<@!?[^>\s]+>|\[@[^\]\n]+\])\s*)+)/
 
 /**
  * Whether this message is addressed to this bot by an @: its @ is in the run of
@@ -26,7 +30,11 @@ export function mentionsMe(msg: InboundGroupMessage): boolean {
   const me = msg.mentions.find(m => m.isYou)
   if (!me) return false
   const lead = LEADING_MENTIONS.exec(msg.content)?.[1] ?? ''
-  return lead.includes(`<@${me.openid}>`) || lead.includes(`<@!${me.openid}>`)
+  return (
+    lead.includes(`<@${me.openid}>`) ||
+    lead.includes(`<@!${me.openid}>`) ||
+    (me.name !== '' && lead.includes(`[@${me.name}]`))
+  )
 }
 
 /** What may follow a nickname before the words addressed to the bot begin. */

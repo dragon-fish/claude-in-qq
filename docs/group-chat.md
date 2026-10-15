@@ -19,6 +19,9 @@ agent 查询。两台 bridge 拉进同一个群后，就能互相 @ 对话。私
 
 ## 实测确认的 QQ 行为（2026-10）
 
+- bot 发出的 `<@member_openid>` 在别的 bot 收到时，content 里被 QQ 改写成纯文本 `[@名字]`，`mentions` 仍列出被 @ 的人
+  （带 `is_you`）。所以开头 @ 的判断同时认 `<@id>` 和 `[@名字]`。
+
 - 引用回复：`message_type` 103，`msg_elements[0].content` 是被引用消息原文，`message_scene.ext` 的 `ref_msg_idx=` 指向
   被引用消息。事件里**没有被引用消息的作者**。本 bot 发送时返回的 `ext_info.ref_idx` 只在同一进程内与之相等，bridge
   重启后同一条消息的引用编号会变（03:37 未重启时一致，03:41 隔了一次重启后不一致）。所以：编号对得上直接认；
