@@ -33,8 +33,12 @@ harness 本身：同一套工具、同样的 skills 和 hooks、一样的权限�
   所以长任务不会把答案埋掉，也不额外花消息条数。`/verbose` 可切三档：完整过程 / 只报进度 / 只要答案
 - **审批**：工具调用弹按钮，点「允许」或「拒绝」。默认 `auto` 模式，只有模型判定有风险的操作才问
 - **提问**：Claude 需要你拿主意时会推一组按钮出来，等同于 TUI 里的 AskUserQuestion
-- **斜杠指令**：`/help` `/stop` `/clear` `/context` `/usage` `/model` `/mode` `/verbose` `/resume` `/cwd` `/status` `/version` `/op` `/reload` `/restart`。`/reload` 立即重启进程、加载新代码；`/restart` 同样效果，但要先回一个 6 位确认码（60 秒内，码必须在消息开头）。两者都只在以服务方式运行时可用（launchd 或 Windows 计划任务）。`/reload 附言`、`/restart 附言` 或「确认码 附言」会把附言写进唤醒便条 `wake.md`：新进程起来后若该文件非空，就把内容交给 agent 自动接续并通知你，随后清空文件，原文留在 `wake.md.last`。agent 自己重启前也会往里写交接。
-  启动时自动注册进 QQ 的指令面板，在聊天里点「/」直接选，不用记也不用手动同步。
+- **斜杠指令**：`/help` `/stop` `/clear` `/context` `/usage` `/model` `/mode` `/verbose` `/resume` `/cwd` `/status` `/version` `/op` `/nick` `/group` `/restart`。
+  `/restart`（别名 `/reload`）立即重启进程、加载新代码，只在以服务方式运行时可用（launchd 或 Windows 计划任务）。
+  `/restart 附言` 会把附言写进唤醒便条 `wake.md`：新进程起来后若该文件非空，就把内容交给私聊里的 agent 自动接续并
+  通知你，随后清空文件，原文留在 `wake.md.last`。agent 自己重启前也会往里写交接。
+  `/restart`、`/resume` 是进程级命令，只能在私聊里用；`/group` 只能在群里用；其余命令作用于发出它的那个对话。
+  启动时自动注册进 QQ 的指令面板（私聊、群各一份，群面板只列群里能用的），在聊天里点「/」直接选。
   常用的另有手打别名（`/cl` `/new` → `/clear`，`/cd` → `/cwd`，`/ctx` → `/context` 等，`/help` 里列全）；
   别名不进面板，撞上正式命令名时正式的优先
 - **图片进出**：发图给它看；它用**顶头独占一行**的 `MEDIA:/绝对路径` 把文件发回来，文件会插在正文
@@ -44,11 +48,19 @@ harness 本身：同一套工具、同样的 skills 和 hooks、一样的权限�
   扩展的话，它能直接操作你本机的 Chrome，沿用里面的登录状态。要求 CC 用 `/login` 登录（API Key 和
   `setup-token` 的长期 token 不行）；没装扩展或 Chrome 没开时，浏览器工具只会报未连接，其余照常
 - **不掉线**：会话 ID 落盘，重启机器后接着上次的上下文聊
-- **群聊**：把 bot 拉进群，op（主人，加上主人用 `/op add` 指定的人或其他 bot）@ 它就开一轮对话，
-  每个群一个独立会话，工作目录、模型、权限模式、verbose 按群分别保存（新群默认 `~`、verbose `off`）。
+- **群聊**：把 bot 拉进群，op（主人，加上主人用 `/op add` 指定的人或其他 bot）@ 它、或用 `/nick` 设的昵称开头
+  叫它，就开一轮对话。每个群一个独立会话，工作目录、权限模式、verbose 按群分别保存；新群默认在自己的目录
+  `<状态目录>/groups/<群 openid>/`（记忆因此与私聊、与别的群隔开）、verbose `off`。群会话同时最多跑 2 个
+  （`QQ_GROUP_CONCURRENCY`），多出的排队；空闲 30 分钟（`QQ_GROUP_IDLE_MINUTES`）自动关闭，下次按 session id 接回。
+  群名自动从 QQ 取，`/group name set` 可自定义，`/group info` 看群信息。
   群里所有消息（含其他 bot 的）存进本地 `history.db` 保留 30 天，agent 用 `qq_group_history` 查；每轮还会
-  附上触发前的 10 条。群消息不能流式，一轮的回复攒成一条发出；`MEDIA:` 照样能发文件。审批和提问仍发到
-  主人私聊，群里只有主人能用斜杠指令。详见 [docs/group-chat.md](docs/group-chat.md)
+  附上触发前的 10 条。群消息不能流式，每段文字写完就发一条；`MEDIA:` 照样能发文件。bot 之间连续来回超过 6 轮、
+  中间没有人类 op 说话，就暂停回应 bot 并 @ 主人。审批和提问仍发到主人私聊，群里只有主人能用斜杠指令。
+  详见 [docs/group-chat.md](docs/group-chat.md)
+- **agent 之间传话**：私聊和每个群各由一个 agent 负责，它们可以用 `qq_list_agents` / `qq_message_agent` 互相发
+  消息（只在本 bridge 的 agent 之间，不发给 QQ 用户），比如在私聊里让它去某个群问另一个 bot，群里那个 agent 问完再
+  把结果传回私聊。由 agent 消息开启的一轮是静默的，要在自己的聊天里说话得显式调 `qq_say`。由同一条消息引起的连续
+  传话超过 6 层就停止并通知主人
 - **捎话**（可选）：本机任意目录的其他 CC 会话可以借这条通道给你发通知（见下）
 
 ## 架构
@@ -75,7 +87,7 @@ src/index.ts ──── Claude Agent SDK ──── Claude Code（订阅额�
 | `src/index.ts`    | 主循环：消息进 SDK、事件出 QQ、审批与提问的中继 |
 | `src/qq.ts`       | 协议层，只认 QQ 不认 Claude                     |
 | `src/commands.ts` | 斜杠指令注册表                                  |
-| `src/turn.ts`     | 哪些群消息触发一轮、每条消息怎么包装给 agent    |
+| `src/turn.ts`     | 哪些群消息触发一轮、何时停止回应 bot、消息和会话留言怎么包装给 agent |
 | `src/history.ts`  | 群消息历史（`node:sqlite`）                     |
 | `src/notify.ts`   | 单向通知入口，不经过主进程                      |
 | `src/onboard.ts`  | 扫码配置                                        |
@@ -259,7 +271,7 @@ skills/install.sh --uninstall   # 卸
 ## 安全模型
 
 - **白名单即审批权**。能发消息的人就能批准工具调用，所以只加自己
-- **群里的 op 只能 @ 它开一轮对话**：不能审批、不能回答提问、不能用斜杠指令。agent 知道每条消息是谁发的、
+- **群里的 op 只能 @ 它（或用昵称叫它）开一轮对话**：不能审批、不能回答提问、不能用斜杠指令。agent 知道每条消息是谁发的、
   是不是主人，会拒绝可能损害主人的请求——但这一层只靠提示词约束，工具调用本身照常走审批
 - `access.json` 缺失或损坏时按空白名单处理（拒绝所有），不是放行
 - 待审批的工具入参放在围栏代码块里，免得内容自己伪装成 markdown，让你看不清在批什么
