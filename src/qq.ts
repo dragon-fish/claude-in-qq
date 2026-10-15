@@ -1581,6 +1581,13 @@ export type InboundGroupMessage = {
    * `is_you` in mentions instead, and no AT event alongside it (measured).
    */
   atEvent: boolean
+  /**
+   * The message this one quotes (message_type 103, measured): its text from
+   * `msg_elements[0].content` and the `ref_msg_idx` scene entry, which equals
+   * the quoted message's own `msg_idx` — or, for one this bot sent, the
+   * `ext_info.ref_idx` its send returned.
+   */
+  quote: { refIdx: string | null; text: string } | null
   attachments: Attachment[]
   /** `msg_idx` from message_scene.ext: the id a quote of this message carries. */
   msgIdx: string | null
@@ -1617,6 +1624,10 @@ export function parseGroupEvent(type: string, d: Record<string, any>): InboundGr
       isYou: m?.is_you === true,
     })),
     atEvent: type === 'GROUP_AT_MESSAGE_CREATE',
+    quote:
+      d.message_type === 103 || Array.isArray(d.msg_elements)
+        ? { refIdx: sceneExt(d, 'ref_msg_idx'), text: String(d.msg_elements?.[0]?.content ?? '') }
+        : null,
     attachments: Array.isArray(d.attachments) ? d.attachments : [],
     msgIdx: sceneExt(d, 'msg_idx'),
     at: Number.isFinite(at) ? at : Date.now(),

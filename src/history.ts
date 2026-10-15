@@ -155,6 +155,14 @@ export class History {
     return rows.reverse().map(fromRow)
   }
 
+  /** The message a quote points at, by its `ref_idx`. */
+  byRef(group: string, refIdx: string): HistoryMessage | null {
+    const row = this.db
+      .prepare(`SELECT ${COLUMNS} FROM messages WHERE group_openid = ? AND ref_idx = ? ORDER BY rowid DESC LIMIT 1`)
+      .get(group, refIdx) as Row | undefined
+    return row ? fromRow(row) : null
+  }
+
   /** This bot's own messages in a group, newest first. */
   ownRecent(group: string, limit: number): HistoryMessage[] {
     const rows = this.db

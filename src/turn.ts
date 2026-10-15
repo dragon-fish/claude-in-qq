@@ -49,8 +49,11 @@ export function routeGroupMessage(
   msg: InboundGroupMessage,
   isOp: (openid: string) => boolean,
   nicknames: string[] = [],
+  quotesMe = false,
 ): 'trigger' | 'history' {
-  const addressed = mentionsMe(msg) || stripNickname(msg.content, nicknames) !== null
+  // A quote of this bot's message addresses it even without an @: some QQ
+  // clients add the @ to a quote-reply and some do not.
+  const addressed = mentionsMe(msg) || quotesMe || stripNickname(msg.content, nicknames) !== null
   return addressed && isOp(msg.author.openid) ? 'trigger' : 'history'
 }
 
@@ -184,7 +187,12 @@ export type TurnInput = MemberLookup & {
    * Group only: what made this message start a turn — an @ of this bot, or
    * one of its nicknames opening the message (which stays in the text).
    */
-  trigger?: { kind: 'mention' } | { kind: 'nickname'; nickname: string }
+  trigger?: { kind: 'mention' } | { kind: 'nickname'; nickname: string } | { kind: 'quote' }
+  /**
+   * Group only: the message this one quotes. `found` is its history row when
+   * the quote could be traced; otherwise only the text QQ sent along.
+   */
+  quoted?: { text: string; found: HistoryMessage | null }
   speaker: Speaker
   at: number
   /** Group only: the messages before the trigger, oldest first. */
@@ -251,9 +259,7 @@ export function wrapTurn(input: TurnInput): string {
         : { kind: 'private' },
     trigger:
       source.kind === 'group'
-        ? input.trigger?.kind === 'nickname'
-          ? { kind: 'nickname', nickname: input.trigger.nickname }
-          : { kind: 'mention' }
+        ? (input.trigger ?? { kind: 'mention' })
         : undefined,
     speaker: {
       openid: speaker.openid,
@@ -263,6 +269,11 @@ export function wrapTurn(input: TurnInput): string {
       is_bot: speaker.isBot,
     },
     time: fullTime(input.at),
+    quoted: input.quoted
+      ? input.quoted.found
+        ? historyEntry(input.quoted.found, { ...input, ref: input.at, withId: true })
+        : { text: input.quoted.text, traced: false }
+      : undefined,
     // Repeated here on purpose, every turn, beside the question. Stated once in
     // the system prompt it lost to the owner asking in person: an untrusted
     // group got the owner's employer and repo list because the owner asked.

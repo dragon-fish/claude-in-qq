@@ -1523,8 +1523,10 @@ async function handleGroupMessage(msg: InboundGroupMessage): Promise<void> {
   if (!msg.author.bot && isOp(msg.author.openid, access) && botRounds.human(msg.group)) {
     log(`${where}: a human op spoke, answering bots again`)
   }
-  if (routeGroupMessage(msg, id => isOp(id, access), nicknames) !== 'trigger') {
-    if (mentionsMe(msg) || stripNickname(msg.content, nicknames) !== null) {
+  const quotedRow = msg.quote?.refIdx ? history.byRef(msg.group, msg.quote.refIdx) : null
+  const quotesMe = quotedRow?.is_self === true
+  if (routeGroupMessage(msg, id => isOp(id, access), nicknames, quotesMe) !== 'trigger') {
+    if (mentionsMe(msg) || quotesMe || stripNickname(msg.content, nicknames) !== null) {
       log(`${where}: addressed by non-op ${msg.author.openid.slice(0, 8)}, recorded only`)
     }
     return
@@ -1565,7 +1567,13 @@ async function handleGroupMessage(msg: InboundGroupMessage): Promise<void> {
   const label = groupLabel(msg.group)
   const wrapped = wrapTurn({
     source: { kind: 'group', label, key: conv.key, trusted: conv.trusted },
-    trigger: nickname === null ? { kind: 'mention' } : { kind: 'nickname', nickname },
+    trigger:
+      nickname !== null
+        ? { kind: 'nickname', nickname }
+        : mentionsMe(msg)
+          ? { kind: 'mention' }
+          : { kind: 'quote' },
+    quoted: msg.quote ? { text: msg.quote.text, found: quotedRow } : undefined,
     speaker,
     at: msg.at,
     recent: history.query({ group: msg.group, beforeMessageId: msg.id, limit: RECENT_IN_CONTEXT }),
