@@ -344,7 +344,7 @@ export async function sendToQQ(
   replyTo?: string,
   keyboard?: Record<string, unknown>,
 ): Promise<void> {
-  await beforeSend()
+  await beforeSend(openid)
   const chunks = chunkText(text)
 
   for (const [i, chunk] of chunks.entries()) {
@@ -410,10 +410,13 @@ export async function sendToQQ(
  * Sealing does not cut anything short. `finish()` drains the queued appends
  * before it closes, so by the time the message goes out the bubble above it is
  * complete — the card cannot land over text still on its way.
+ *
+ * Handed the recipient, because only the stream open in that chat is above the
+ * message; a stream in another chat is not in its way.
  */
-let beforeSend: () => Promise<void> = async () => {}
+let beforeSend: (openid: string) => Promise<void> = async () => {}
 
-export function onBeforeSend(fn: () => Promise<void>): void {
+export function onBeforeSend(fn: (openid: string) => Promise<void>): void {
   beforeSend = fn
 }
 
@@ -976,7 +979,7 @@ export async function sendFile(
   replyTo?: string,
   caption?: string,
 ): Promise<void> {
-  await beforeSend()
+  await beforeSend(openid)
   const buf = readFileSync(path)
   if (buf.byteLength > MAX_UPLOAD_BYTES) {
     throw new Error(`文件太大（${Math.round(buf.byteLength / 1024 / 1024)}MB）`)
