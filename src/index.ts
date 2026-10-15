@@ -49,13 +49,6 @@ import {
 } from './qq.js'
 
 /**
- * Mutable and persisted. A value chosen with /cwd or /mode outranks the env
- * default: it is the operator's most recent explicit decision, and the env var
- * only describes how this process happened to be launched.
- */
-let workdir = ''
-let permissionMode = ''
-/**
  * How much of the work rides along with the answer.
  *
  * `full` is the whole trace — thinking summaries, each tool with its
@@ -70,60 +63,9 @@ let permissionMode = ''
  * worth the screen.
  */
 type TraceLevel = 'full' | 'balanced' | 'off'
-let traceLevel: TraceLevel = 'full'
 
 const APPROVAL_TIMEOUT_MS = 30 * 60 * 1000
 const QUESTION_TIMEOUT_MS = 15 * 60 * 1000
-
-/**
- * End the turn's growing message, so whatever comes next starts a new one.
- *
- * Ordering in QQ is positional, so anything sent as its own message — a slash
- * command's answer, an approval card, a question, a file — lands below a stream
- * that would otherwise go on growing above it. Sealing first puts the reply
- * underneath the thing it is replying to, where it happened.
- *
- * Returns whether there was anything to seal.
- *
- * Assigned per turn by `runSession`; a no-op between turns.
- */
-let sealStream: () => Promise<boolean> = async () => false
-
-/**
- * An inbound message is waiting to enter the conversation, and the stream open
- * above it should be sealed once it does.
- *
- * Deliberately not sealed on arrival. A queued message does not reach the model
- * when it is typed — Claude Code folds it in at the next tool-result boundary,
- * or at the end of the turn if no tool runs before then — and until that
- * happens the reply above is still answering the message before it. Cutting on
- * arrival severs a sentence mid-word, and the two halves then read as two
- * separate replies, neither of which answers the message now sitting between
- * them. That destroys the ordering the cut was meant to preserve.
- *
- * A bubble that goes on growing above the operator's words is the accepted
- * cost. It is one reply, still finishing what it had already started saying.
- *
- * Only armed when a stream is actually open, and cleared by `sealStream` so a
- * seal from any cause settles it. Both matter: left armed with nothing to cut,
- * it would fire on the *next* reply instead, severing that one at its first
- * tool result over a message it was already answering.
- *
- * This is one of the two rules that decide where a message ends, one per
- * direction. Outbound is `beforeSend` in qq.ts: anything not written into the
- * open stream seals it on the way out, enforced at the transport so a sender
- * added later inherits it. Inbound is this: the seal waits for the moment the
- * message actually reaches the model. Answering a card is an inbound message
- * that happens to arrive as a tool result, and needs nothing of its own —
- * posting the card already sealed under the outbound rule.
- */
-let sealPending = false
-
-/**
- * Whether a stream is open right now. Assigned per turn by `runSession`;
- * between turns there is nothing open, so the default is the honest answer.
- */
-let streamOpen: () => boolean = () => false
 
 /**
  * Appended to Claude Code's own system prompt. Without it the agent assumes a
@@ -145,25 +87,28 @@ const contextMtime = () => statSync(CONTEXT_FILE).mtimeMs
 const OPERATOR_CONTEXT = readOperatorContext()
 
 /**
- * The mtime the live session's system prompt was read from.
+ * The mtime `OPERATOR_CONTEXT` was read at, which is what every session this
+ * process starts has in its system prompt. Each conversation tracks its own
+ * catch-up from here, since each one's agent has to be told separately.
  *
  * Deliberately not persisted: a restart re-reads the file, so a fresh process
  * is never behind and has nothing to catch up on.
  */
-let seenContextMtime = contextMtime()
+const OPERATOR_CONTEXT_MTIME = contextMtime()
 
 /**
- * The operator context as it stands now, if it changed under a running session.
+ * The operator context as it stands now, if it changed under the
+ * conversation's running session.
  *
  * Returns the whole text rather than a diff. A diff would have to be applied
  * against a prompt the agent cannot re-read, and edits are rare enough that
  * paying for the full text once beats the ambiguity.
  */
-function drainContextChange(): string | null {
+function drainContextChange(conv: Conversation): string | null {
   const now = contextMtime()
-  if (now === seenContextMtime) return null
-  seenContextMtime = now
-  log('operator context changed on disk; folding it into the next message')
+  if (now === conv.seenContextMtime) return null
+  conv.seenContextMtime = now
+  log(`[${conv.key}] operator context changed on disk; folding it into the next message`)
   return readOperatorContext()
 }
 
@@ -177,12 +122,15 @@ function drainContextChange(): string | null {
  * in flight is still in flight. Restarts are frequent here, since the bridge is
  * often what is being edited.
  *
- * Armed once at startup, deliberately not per session: `runSession` also reruns
- * for /clear and /cwd, and neither of those is a restart. A missing session_id
- * means either a first run or a /clear, and in both the conversation starts
- * from nothing — there is no earlier state to warn about.
+ * Built once at startup by `main` from how the previous process ended, and
+ * armed on each conversation as it is opened — only if that conversation has a
+ * session on disk to resume. A missing session_id means either a first run or
+ * a /clear, and in both the conversation starts from nothing — there is no
+ * earlier state to warn about. Deliberately not re-armed per session:
+ * `runSession` also reruns for /clear and /cwd, and neither of those is a
+ * restart.
  *
- * Set by `main`; drained into the first message that follows.
+ * Drained into the first message that conversation receives.
  */
 type RestartNotice = {
   at: number
@@ -204,11 +152,11 @@ type RestartNotice = {
   rebooted: boolean
 }
 
-let restartNotice: RestartNotice | null = null
+let startupNotice: RestartNotice | null = null
 
-function drainRestartNotice(): RestartNotice | null {
-  const notice = restartNotice
-  restartNotice = null
+function drainRestartNotice(conv: Conversation): RestartNotice | null {
+  const notice = conv.restartNotice
+  conv.restartNotice = null
   return notice
 }
 
@@ -219,20 +167,28 @@ function spokenGap(ms: number): string {
   return `${(ms / 3_600_000).toFixed(1)} 小时`
 }
 
-/** Whoever last wrote in. Single-operator by design; the allowlist enforces it. */
+/**
+ * Whoever last wrote in privately. Single-operator by design; the allowlist
+ * enforces it. Approvals and questions go here whichever conversation raised
+ * them, and the private conversation's replies do too.
+ */
 let currentUser: string | null = null
 
+/** The operator's openid, or null when nobody is allowlisted yet. */
+function operatorOpenid(): string | null {
+  return currentUser ?? loadAccess().allowed[0] ?? null
+}
+
 function requireUser(): string {
-  if (currentUser) return currentUser
-  const allowed = loadAccess().allowed
-  if (allowed.length === 0) throw new Error('no allowlisted QQ user to talk to')
-  return allowed[0]
+  const user = operatorOpenid()
+  if (!user) throw new Error('no allowlisted QQ user to talk to')
+  return user
 }
 
 // ------------------------------------------------------------- message stream
 //
-// query() consumes an AsyncIterable, so inbound QQ messages are pushed into
-// this queue and pulled by the SDK as the conversation advances.
+// query() consumes an AsyncIterable, so inbound QQ messages are pushed into a
+// queue — one per conversation — and pulled by the SDK as it advances.
 
 /** A text block or an inline image, the two shapes an inbound QQ message takes. */
 type ContentBlock =
@@ -285,10 +241,8 @@ class MessageQueue implements AsyncIterable<SDKUserMessage> {
   }
 }
 
-const queue = new MessageQueue()
-
 /**
- * Slash commands the operator ran since the agent last heard from them.
+ * A slash command the operator ran since the agent last heard from them.
  *
  * The bridge handles commands entirely on its own — the agent never sees the
  * command, its arguments, or its output. Left unsaid, that produces an agent
@@ -299,33 +253,231 @@ const queue = new MessageQueue()
  */
 type CommandRecord = { name: string; args: string; at: number; note?: string }
 
-const commandLog: CommandRecord[] = []
+// -------------------------------------------------------------- conversations
+//
+// One conversation is one chat with its own agent session: its own query,
+// queue, streamer, session id, workdir, permission mode and trace level. Two of
+// them never share a stream or a session, so they can run side by side.
+//
+// Process-wide, and deliberately not on a conversation: the QQ gateway and
+// passive quota, the allowlist, approvals and questions (always posted to the
+// operator's private chat, tagged with the conversation that raised them), the
+// wake note (delivered to the private conversation), crash bookkeeping, and
+// shutdown.
 
-function recordCommand(name: string, args: string): void {
-  commandLog.push({ name, args, at: Date.now() })
+/**
+ * The operator's private chat. One key, not one per openid: the bridge is
+ * single-operator, and every allowlisted sender shares this session and gets
+ * its replies — keying it by sender would split that session in two.
+ */
+const PRIVATE_KEY = 'c2c'
+
+/**
+ * Where a conversation's output goes. Every send resolves its target and the
+ * inbound message it replies to at the moment it is made, so a reply follows
+ * the newest message rather than the one the turn started on.
+ */
+type Chat = {
+  send(text: string): Promise<void>
+  sendFile(path: string, caption?: string): Promise<void>
+  openStream(): StreamHandle
+  /** The inbound message replies currently attach to, for the log. */
+  replyTo(): string | undefined
+  /** Whether a standalone message to this openid lands in this chat. */
+  owns(openid: string): boolean
+}
+
+const privateChat: Chat = {
+  send: text => {
+    const user = requireUser()
+    return sendToQQ(user, text, lastInboundMsgId.get(user))
+  },
+  sendFile: (path, caption) => {
+    const user = requireUser()
+    return sendFile(user, path, lastInboundMsgId.get(user), caption)
+  },
+  openStream: () => {
+    const user = requireUser()
+    return createStream(user, lastInboundMsgId.get(user))
+  },
+  replyTo: () => {
+    const user = operatorOpenid()
+    return user ? lastInboundMsgId.get(user) : undefined
+  },
+  owns: openid => openid === operatorOpenid(),
+}
+
+class Conversation {
+  readonly key: string
+  readonly chat: Chat
+
+  /**
+   * Mutable and persisted. A value chosen with /cwd or /mode outranks the env
+   * default: it is the operator's most recent explicit decision, and the env
+   * var only describes how this process happened to be launched.
+   */
+  workdir: string
+  permissionMode: string
+  traceLevel: TraceLevel
+
+  /** The live query, or null before the first message starts a session. */
+  query: any = null
+  /** Set when a command needs the query torn down and rebuilt. */
+  restartReason: string | null = null
+
+  /**
+   * Kept across this conversation's sessions: a message typed while /cwd
+   * rebuilds the query waits here for the next one.
+   */
+  readonly queue = new MessageQueue()
+
+  /**
+   * End the turn's growing message, so whatever comes next starts a new one.
+   *
+   * Ordering in QQ is positional, so anything sent as its own message — a
+   * slash command's answer, an approval card, a question, a file — lands below
+   * a stream that would otherwise go on growing above it. Sealing first puts
+   * the reply underneath the thing it is replying to, where it happened.
+   *
+   * Returns whether there was anything to seal.
+   *
+   * Assigned per session by `runSession`; a no-op before the first one.
+   */
+  sealStream: () => Promise<boolean> = async () => false
+
+  /**
+   * An inbound message is waiting to enter the conversation, and the stream
+   * open above it should be sealed once it does.
+   *
+   * Deliberately not sealed on arrival. A queued message does not reach the
+   * model when it is typed — Claude Code folds it in at the next tool-result
+   * boundary, or at the end of the turn if no tool runs before then — and until
+   * that happens the reply above is still answering the message before it.
+   * Cutting on arrival severs a sentence mid-word, and the two halves then read
+   * as two separate replies, neither of which answers the message now sitting
+   * between them. That destroys the ordering the cut was meant to preserve.
+   *
+   * A bubble that goes on growing above the operator's words is the accepted
+   * cost. It is one reply, still finishing what it had already started saying.
+   *
+   * Only armed when a stream is actually open, and cleared by `sealStream` so
+   * a seal from any cause settles it. Both matter: left armed with nothing to
+   * cut, it would fire on the *next* reply instead, severing that one at its
+   * first tool result over a message it was already answering.
+   *
+   * This is one of the two rules that decide where a message ends, one per
+   * direction. Outbound is `beforeSend` in qq.ts: anything not written into the
+   * open stream seals it on the way out, enforced at the transport so a sender
+   * added later inherits it. Inbound is this: the seal waits for the moment the
+   * message actually reaches the model. Answering a card is an inbound message
+   * that happens to arrive as a tool result, and needs nothing of its own —
+   * posting the card already sealed under the outbound rule.
+   */
+  sealPending = false
+
+  /**
+   * Whether a stream is open right now. Assigned per session by `runSession`;
+   * before it there is nothing open, so the default is the honest answer.
+   */
+  streamOpen: () => boolean = () => false
+
+  /** Slash commands run here since the agent last heard from the operator. */
+  readonly commandLog: CommandRecord[] = []
+
+  /** The operator-context mtime this conversation's agent has last been shown. */
+  seenContextMtime = OPERATOR_CONTEXT_MTIME
+
+  /** See `RestartNotice`. */
+  restartNotice: RestartNotice | null
+
+  /**
+   * This conversation's own instance of the bridge's tools, so a question the
+   * agent asks is recorded against the conversation that asked it.
+   */
+  readonly tools: ReturnType<typeof createSdkMcpServer>
+
+  constructor(key: string, chat: Chat) {
+    this.key = key
+    this.chat = chat
+    const saved = loadConversationState(key)
+    this.workdir = saved.workdir ?? process.env.QQ_BRIDGE_CWD ?? homedir()
+    this.permissionMode = saved.permission_mode ?? process.env.QQ_PERMISSION_MODE ?? 'auto'
+    this.traceLevel = saved.trace_level ?? 'full'
+    this.restartNotice = saved.session_id ? startupNotice : null
+    this.tools = qqToolsFor(this)
+  }
+
+  sessionId(): string | null {
+    return loadConversationState(this.key).session_id ?? null
+  }
+
+  setSessionId(id: string | null): void {
+    patchConversationState(this.key, { session_id: id })
+  }
+
+  setWorkdir(path: string): void {
+    this.workdir = path
+    patchConversationState(this.key, { workdir: path })
+  }
+
+  setPermissionMode(mode: string): void {
+    this.permissionMode = mode
+    patchConversationState(this.key, { permission_mode: mode })
+  }
+
+  setTraceLevel(level: TraceLevel): void {
+    this.traceLevel = level
+    patchConversationState(this.key, { trace_level: level })
+  }
+}
+
+const conversations = new Map<string, Conversation>()
+
+/** The conversation for `key`, opened from its persisted state on first use. */
+function openConversation(key: string, chat: Chat): Conversation {
+  let conv = conversations.get(key)
+  if (!conv) {
+    conv = new Conversation(key, chat)
+    conversations.set(key, conv)
+  }
+  return conv
+}
+
+function privateConversation(): Conversation {
+  return openConversation(PRIVATE_KEY, privateChat)
+}
+
+function recordCommand(conv: Conversation, name: string, args: string): void {
+  conv.commandLog.push({ name, args, at: Date.now() })
 }
 
 /** Attach an explanation to the command currently running. */
-function noteToAgent(text: string): void {
-  const last = commandLog[commandLog.length - 1]
+function noteToAgent(conv: Conversation, text: string): void {
+  const last = conv.commandLog[conv.commandLog.length - 1]
   if (last) last.note = last.note ? `${last.note}\n${text}` : text
-  else commandLog.push({ name: 'unknown', args: '', at: Date.now(), note: text })
-  log(`command note: ${text}`)
+  else conv.commandLog.push({ name: 'unknown', args: '', at: Date.now(), note: text })
+  log(`[${conv.key}] command note: ${text}`)
 }
 
 const xmlAttr = (v: string) => v.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;')
 
 /**
- * Prepend the command log to the operator's message.
+ * Prepend the command log, and whatever else the agent missed, to the
+ * operator's message.
  *
  * It rides along with a real message rather than arriving as its own turn: a
  * turn of its own would have the agent respond to the event instead of to the
  * person.
+ *
+ * Relayed notes went out in the operator's private chat, so only the private
+ * conversation drains them; another conversation taking them would leave the
+ * one the operator is reading them in with no record.
  */
-function withCommandLog(text: string): string {
-  const relayed = drainRelayed()
-  const context = drainContextChange()
-  const restarted = drainRestartNotice()
+function withCommandLog(conv: Conversation, text: string): string {
+  const relayed = conv.key === PRIVATE_KEY ? drainRelayed() : []
+  const context = drainContextChange(conv)
+  const restarted = drainRestartNotice(conv)
+  const commandLog = conv.commandLog
   if (!commandLog.length && !relayed.length && !context && !restarted) return text
 
   const hhmm = (at: number) =>
@@ -403,7 +555,15 @@ function withCommandLog(text: string): string {
 
 // ------------------------------------------------------------------ approvals
 
-type Pending<T> = { resolve: (v: T) => void; timer: ReturnType<typeof setTimeout> }
+/**
+ * Process-wide: every card goes to the operator's private chat, whichever
+ * conversation's agent is blocked on it. `conversation` names that one.
+ */
+type Pending<T> = {
+  resolve: (v: T) => void
+  timer: ReturnType<typeof setTimeout>
+  conversation: string
+}
 
 const pendingApprovals = new Map<string, Pending<boolean>>()
 
@@ -486,7 +646,11 @@ function sanitize(value: string, limit: number): string {
  * unanswered prompt must not leave the agent running unattended forever, and
  * denying is the recoverable direction.
  */
-async function askApproval(toolName: string, input: Record<string, unknown>): Promise<boolean> {
+async function askApproval(
+  conv: Conversation,
+  toolName: string,
+  input: Record<string, unknown>,
+): Promise<boolean> {
   const user = requireUser()
   const id = randomId()
 
@@ -511,79 +675,81 @@ async function askApproval(toolName: string, input: Record<string, unknown>): Pr
       log(`approval ${id} timed out, denying`)
       resolve(false)
     }, APPROVAL_TIMEOUT_MS)
-    pendingApprovals.set(id, { resolve, timer })
+    pendingApprovals.set(id, { resolve, timer, conversation: conv.key })
   })
 }
 
 // ---------------------------------------------------------------- qq_ask tool
 
-const qqTools = createSdkMcpServer({
-  name: 'qq',
-  version: '0.1.0',
-  tools: [
-    tool(
-      'qq_ask',
-      'Ask the operator a multiple-choice question and wait for their answer. Renders the ' +
-        'options as tappable buttons on their phone and blocks until they respond, so use it ' +
-        'whenever you would otherwise stop and ask — a fork in the approach, a missing detail, ' +
-        'a confirmation before something hard to undo. They may also reply with free text ' +
-        'instead of picking an option, in which case you get their words verbatim, along with ' +
-        'any images they send. ' +
-        'Keep options short: 20 characters or less renders the text on the button itself.',
-      {
-        question: z.string().describe('The question, stated plainly'),
-        details: z
-          .string()
-          .optional()
-          .describe(
-            'Markdown shown under the question: whatever the operator needs in order to answer — ' +
-              'what you found, the trade-offs, what each option leads to. Put that context here ' +
-              'rather than in prose before the call; the card is the one thing sure to reach them.',
-          ),
-        options: z.array(z.string()).min(2).max(8).describe('Between 2 and 8 choices'),
-      },
-      async ({ question, details, options }) => {
-        const user = requireUser()
-        const id = randomId()
+function qqToolsFor(conv: Conversation) {
+  return createSdkMcpServer({
+    name: 'qq',
+    version: '0.1.0',
+    tools: [
+      tool(
+        'qq_ask',
+        'Ask the operator a multiple-choice question and wait for their answer. Renders the ' +
+          'options as tappable buttons on their phone and blocks until they respond, so use it ' +
+          'whenever you would otherwise stop and ask — a fork in the approach, a missing detail, ' +
+          'a confirmation before something hard to undo. They may also reply with free text ' +
+          'instead of picking an option, in which case you get their words verbatim, along with ' +
+          'any images they send. ' +
+          'Keep options short: 20 characters or less renders the text on the button itself.',
+        {
+          question: z.string().describe('The question, stated plainly'),
+          details: z
+            .string()
+            .optional()
+            .describe(
+              'Markdown shown under the question: whatever the operator needs in order to answer — ' +
+                'what you found, the trade-offs, what each option leads to. Put that context here ' +
+                'rather than in prose before the call; the card is the one thing sure to reach them.',
+            ),
+          options: z.array(z.string()).min(2).max(8).describe('Between 2 and 8 choices'),
+        },
+        async ({ question, details, options }) => {
+          const user = requireUser()
+          const id = randomId()
 
-        const render = (mode: AskLayout['mode']) => {
-          const lines = [`**${question}**`, '']
-          if (details?.trim()) lines.push(details.trim(), '')
-          if (mode === 'letters') {
-            // Buttons carry only a letter, so the list has to carry the meaning.
-            options.forEach((opt, i) => lines.push(`${LETTERS[i]}：${opt}`))
-            lines.push('')
-          } else if (mode === 'truncated') {
-            // Buttons are recognisable but clipped; show the full text once.
-            options.forEach(opt => lines.push(`· ${opt}`))
-            lines.push('')
+          const render = (mode: AskLayout['mode']) => {
+            const lines = [`**${question}**`, '']
+            if (details?.trim()) lines.push(details.trim(), '')
+            if (mode === 'letters') {
+              // Buttons carry only a letter, so the list has to carry the meaning.
+              options.forEach((opt, i) => lines.push(`${LETTERS[i]}：${opt}`))
+              lines.push('')
+            } else if (mode === 'truncated') {
+              // Buttons are recognisable but clipped; show the full text once.
+              options.forEach(opt => lines.push(`· ${opt}`))
+              lines.push('')
+            }
+            lines.push('点按钮选择，或直接打字回答')
+            return lines.join('\n')
           }
-          lines.push('点按钮选择，或直接打字回答')
-          return lines.join('\n')
-        }
 
-        log(`question ${id} posting: ${question.slice(0, 60)}`)
-        await postQuestion(user, id, options, render)
-        log(`question ${id} posted`)
+          log(`question ${id} posting: ${question.slice(0, 60)}`)
+          await postQuestion(user, id, options, render)
+          log(`question ${id} posted`)
 
-        const answer = await new Promise<QuestionAnswer>(resolve => {
-          const timer = setTimeout(() => {
-            pendingQuestions.delete(id)
-            resolve({ text: '(操作者未在 15 分钟内回答)', images: [] })
-          }, QUESTION_TIMEOUT_MS)
-          pendingQuestions.set(id, { resolve, timer, options, render })
-        })
+          const answer = await new Promise<QuestionAnswer>(resolve => {
+            const timer = setTimeout(() => {
+              pendingQuestions.delete(id)
+              resolve({ text: '(操作者未在 15 分钟内回答)', images: [] })
+            }, QUESTION_TIMEOUT_MS)
+            pendingQuestions.set(id, { resolve, timer, options, render, conversation: conv.key })
+          })
 
-        return {
-          content: [
-            ...answer.images.map(img => ({ type: 'image' as const, data: img.data, mimeType: img.mediaType })),
-            { type: 'text' as const, text: answer.text },
-          ],
-        }
-      },
-    ),
-  ],
-})
+          return {
+            content: [
+              ...answer.images.map(img => ({ type: 'image' as const, data: img.data, mimeType: img.mediaType })),
+              { type: 'text' as const, text: answer.text },
+            ],
+          }
+        },
+      ),
+    ],
+  })
+}
 
 // -------------------------------------------------------------- inbound routing
 
@@ -613,6 +779,8 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
 
   currentUser = msg.openid
   rememberInbound(msg.openid, msg.id)
+  // Private chat is the only conversation an inbound message reaches today.
+  const conv = privateConversation()
 
   // A stream is bound to the inbound message it replies to and cannot be moved
   // to a newer one, so the reply above goes on growing over the operator's
@@ -624,12 +792,12 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
   // answered from here with an ordinary message, and every ordinary message
   // seals on its way out through the `onBeforeSend` invariant — so its answer
   // still lands below, and below a reply that was left whole.
-  sealPending = streamOpen()
+  conv.sealPending = conv.streamOpen()
 
   // Commands outrank a pending prompt: an open question swallows arbitrary text
   // as its answer, so /stop would never reach anything if it were checked after.
-  if (await dispatch(msg.content, commandDeps(msg.openid))) return
-  if (await confirmRestart(msg.content, commandDeps(msg.openid))) return
+  if (await dispatch(msg.content, commandDeps(conv))) return
+  if (await confirmRestart(msg.content, commandDeps(conv))) return
 
   // An open approval or question takes precedence: the agent is blocked on it,
   // so this message is the answer rather than a new instruction.
@@ -666,14 +834,14 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
     source: { type: 'base64', media_type: image.mediaType, data: image.data },
   }))
 
-  const text = withCommandLog([msg.content, ...notes].filter(Boolean).join('\n'))
+  const text = withCommandLog(conv, [msg.content, ...notes].filter(Boolean).join('\n'))
   log(`inbound from ${msg.openid.slice(0, 8)}: ${msg.content.slice(0, 60)}${blocks.length ? ` (+${blocks.length} 图)` : ''}`)
 
   if (blocks.length) {
     // Image first, then the words about it — the order the person sent them in.
-    queue.push([...blocks, { type: 'text', text: text || '(图片)' }])
+    conv.queue.push([...blocks, { type: 'text', text: text || '(图片)' }])
   } else {
-    queue.push(text)
+    conv.queue.push(text)
   }
 }
 
@@ -749,18 +917,31 @@ async function handleButton(openid: string, buttonData: string): Promise<void> {
 const STATE_FILE = join(STATE_DIR, 'session.json')
 
 /**
- * What survives a restart.
+ * What survives a restart, per conversation.
  *
  * The session id matters most — without it every restart starts a fresh
  * conversation — but workdir and permission mode are just as load-bearing:
  * a bridge that forgets them silently runs the next task in the wrong
  * directory, or under stricter rules than the operator last chose.
  */
-type BridgeState = {
+type ConversationState = {
   session_id?: string | null
   workdir?: string
   permission_mode?: string
   trace_level?: TraceLevel
+}
+
+/**
+ * The whole file. The private conversation's fields sit at the top level and
+ * every other conversation's live under `conversations`, by key.
+ *
+ * Do not move the private one into the map. The crash rollback in service/ can
+ * check out a commit that only knows the top-level shape, and that commit would
+ * find no session id and start the operator over with no context — the one
+ * failure this file exists to prevent.
+ */
+type BridgeState = ConversationState & {
+  conversations?: Record<string, ConversationState>
   /**
    * When the previous process last shut down cleanly, and on what signal.
    *
@@ -791,19 +972,20 @@ function patchState(patch: BridgeState): void {
   }
 }
 
-function loadSessionId(): string | null {
-  return loadState().session_id ?? null
+function loadConversationState(key: string): ConversationState {
+  const state = loadState()
+  if (key !== PRIVATE_KEY) return state.conversations?.[key] ?? {}
+  const { session_id, workdir, permission_mode, trace_level } = state
+  return { session_id, workdir, permission_mode, trace_level }
 }
 
-function saveSessionId(id: string | null): void {
-  patchState({ session_id: id })
+function patchConversationState(key: string, patch: ConversationState): void {
+  if (key === PRIVATE_KEY) return patchState(patch)
+  const all = loadState().conversations ?? {}
+  patchState({ conversations: { ...all, [key]: { ...all[key], ...patch } } })
 }
 
 // ------------------------------------------------------------------- commands
-
-/** Set when a command needs the query torn down and rebuilt. */
-let restartReason: string | null = null
-let activeQuery: any = null
 
 /**
  * Present options as buttons and wait for a choice.
@@ -813,6 +995,7 @@ let activeQuery: any = null
  * and free text.
  */
 async function askChoice(
+  conv: Conversation,
   options: string[],
   renderBody: (mode: AskLayout['mode']) => string,
   buttonsOnly = false,
@@ -827,40 +1010,34 @@ async function askChoice(
       pendingQuestions.delete(id)
       resolve({ text: '', images: [] })
     }, QUESTION_TIMEOUT_MS)
-    pendingQuestions.set(id, { options, resolve, timer, render: renderBody, buttonsOnly })
+    pendingQuestions.set(id, { options, resolve, timer, render: renderBody, buttonsOnly, conversation: conv.key })
   })
   return options.indexOf(answer.text)
 }
 
-/** Everything the command layer is allowed to touch, and nothing more. */
-function commandDeps(user: string): CommandDeps {
+/**
+ * Everything the command layer is allowed to touch, and nothing more. A
+ * command acts on the conversation it was sent in.
+ */
+function commandDeps(conv: Conversation): CommandDeps {
   return {
-    reply: text => sendToQQ(user, text, lastInboundMsgId.get(user)),
-    askChoice: (options, render) => askChoice(options, render, true),
-    query: () => activeQuery,
-    workdir: () => workdir,
-    setWorkdir: path => {
-      workdir = path
-      patchState({ workdir: path })
-    },
+    reply: text => conv.chat.send(text),
+    askChoice: (options, render) => askChoice(conv, options, render, true),
+    query: () => conv.query,
+    workdir: () => conv.workdir,
+    setWorkdir: path => conv.setWorkdir(path),
     restartSession: reason => {
-      restartReason = reason
-      activeQuery?.close()
+      conv.restartReason = reason
+      conv.query?.close()
     },
-    sessionId: loadSessionId,
-    setSessionId: saveSessionId,
-    noteToAgent,
-    recordCommand,
-    permissionMode: () => permissionMode,
-    setPermissionMode: mode => {
-      permissionMode = mode
-      patchState({ permission_mode: mode })
-    },
-    verbose: () => traceLevel,
-    setVerbose: level => {
-      traceLevel = level as TraceLevel
-      patchState({ trace_level: level as TraceLevel })
-    },
+    sessionId: () => conv.sessionId(),
+    setSessionId: id => conv.setSessionId(id),
+    noteToAgent: text => noteToAgent(conv, text),
+    recordCommand: (name, args) => recordCommand(conv, name, args),
+    permissionMode: () => conv.permissionMode,
+    setPermissionMode: mode => conv.setPermissionMode(mode),
+    verbose: () => conv.traceLevel,
+    setVerbose: level => conv.setTraceLevel(level),
     counts: () => ({
       allowed: loadAccess().allowed.length,
       approvals: pendingApprovals.size,
@@ -903,7 +1080,7 @@ function oneLine(value: unknown, limit = TRACE_ARG_LIMIT): string {
 }
 
 /** Paths are usually inside the workdir; the prefix is noise once it repeats. */
-function shortPath(value: unknown): string {
+function shortPath(value: unknown, workdir: string): string {
   const path = String(value ?? '')
   const rel = workdir && path.startsWith(workdir) ? path.slice(workdir.length + 1) : path
   return oneLine(rel || path)
@@ -934,7 +1111,7 @@ function isSubagentTool(name: string): boolean {
  * narrating "asking you a question" directly above the question is telling
  * someone what you are about to tell them.
  */
-function summariseTool(name: string, input: Record<string, any>): string | null {
+function summariseTool(name: string, input: Record<string, any>, workdir: string): string | null {
   if (name.startsWith('mcp__qq__') || isSubagentTool(name)) return null
 
   const arg = (() => {
@@ -943,10 +1120,10 @@ function summariseTool(name: string, input: Record<string, any>): string | null 
         return oneLine(input.command)
       case 'Read':
       case 'Write':
-        return shortPath(input.file_path)
+        return shortPath(input.file_path, workdir)
       case 'Edit': {
         const delta = String(input.new_string ?? '').length - String(input.old_string ?? '').length
-        return `${shortPath(input.file_path)} ${delta >= 0 ? '+' : '−'}${Math.abs(delta)}`
+        return `${shortPath(input.file_path, workdir)} ${delta >= 0 ? '+' : '−'}${Math.abs(delta)}`
       }
       case 'Grep':
         return oneLine(input.pattern)
@@ -988,11 +1165,7 @@ function summariseResult(name: string, content: unknown): string | null {
 }
 
 /** Send a reply, pulling out any MEDIA: lines and uploading those files. */
-async function deliverReply(text: string): Promise<void> {
-  const user = requireUser()
-  const replyTo = lastInboundMsgId.get(user)
-
-
+async function deliverReply(conv: Conversation, text: string): Promise<void> {
   const paths: string[] = []
   const prose = text.replace(MEDIA_LINE_RE, (_m, p: string) => {
     paths.push(p.trim())
@@ -1005,11 +1178,11 @@ async function deliverReply(text: string): Promise<void> {
   // belongs to the file. Longer prose goes separately so it keeps its markdown,
   // which a caption does not render.
   const asCaption = paths.length === 1 && remaining.length > 0 && remaining.length <= CAPTION_LIMIT
-  if (remaining && !asCaption) await sendToQQ(user, remaining, replyTo)
+  if (remaining && !asCaption) await conv.chat.send(remaining)
 
   for (const [i, path] of paths.entries()) {
     try {
-      await sendFile(user, nativePath(path, workdir), replyTo, asCaption && i === 0 ? remaining : undefined)
+      await conv.chat.sendFile(nativePath(path, conv.workdir), asCaption && i === 0 ? remaining : undefined)
       log(`sent file ${path}`)
     } catch (err) {
       // Logged, not reported: the operator asked for a file, not for an
@@ -1516,23 +1689,26 @@ class LineStreamer {
   }
 }
 
-/** Run one agent session until it ends. Returns when the query closes. */
-async function runSession(): Promise<void> {
+/**
+ * Run one agent session for `conv` until it ends. Returns when the query
+ * closes.
+ */
+async function runSession(conv: Conversation): Promise<void> {
   // The previous session's iterator may still be parked on this queue.
-  queue.detachWaiters()
+  conv.queue.detachWaiters()
 
-  const resume = loadSessionId()
-  log(resume ? `resuming session ${resume}` : 'starting a new session')
+  const resume = conv.sessionId()
+  log(`[${conv.key}] ${resume ? `resuming session ${resume}` : 'starting a new session'}`)
 
   const q = query({
-    prompt: queue,
+    prompt: conv.queue,
     options: {
       systemPrompt: { type: 'preset', preset: 'claude_code', append: OPERATOR_CONTEXT },
-      cwd: workdir,
+      cwd: conv.workdir,
       // 'auto' lets a classifier clear the routine calls and only escalate what
       // it considers risky. 'default' escalates every write and every command,
       // which on a phone means approving your way through the whole task.
-      permissionMode,
+      permissionMode: conv.permissionMode,
       resume: resume ?? undefined,
       // The terminal question tool has no UI here — nobody is watching a
       // terminal. Left enabled it renders into the void and comes back
@@ -1558,15 +1734,15 @@ async function runSession(): Promise<void> {
         if (toolName.startsWith('mcp__qq__')) {
           return { behavior: 'allow' as const, updatedInput: input }
         }
-        const allow = await askApproval(toolName, input)
+        const allow = await askApproval(conv, toolName, input)
         return allow
           ? { behavior: 'allow' as const, updatedInput: input }
           : { behavior: 'deny' as const, message: '操作者在 QQ 上拒绝了这次调用' }
       },
-      mcpServers: { qq: qqTools },
+      mcpServers: { qq: conv.tools },
     } as any,
   })
-  activeQuery = q
+  conv.query = q
 
   /**
    * One stream per turn, not per assistant message.
@@ -1609,7 +1785,7 @@ async function runSession(): Promise<void> {
     // Settled either way: with no stream open there is nothing left for a
     // pending seal to wait for, and leaving it armed would cut the *next*
     // reply at its first tool result for no reason.
-    sealPending = false
+    conv.sealPending = false
     // The trace block does not survive the stream that held it. Whatever opens
     // next starts on an empty one, so the bookkeeping that decides whether an
     // entry is already there — and how its last line ended — has to start
@@ -1672,8 +1848,8 @@ async function runSession(): Promise<void> {
     if (traceStarted && !traceTail.endsWith('\n')) await trace('\n')
   }
 
-  sealStream = closeStreamer
-  streamOpen = () => streamer !== null
+  conv.sealStream = closeStreamer
+  conv.streamOpen = () => streamer !== null
 
 
   /** Which content block the deltas currently belong to. */
@@ -1698,15 +1874,11 @@ async function runSession(): Promise<void> {
 
   function newStreamer(): LineStreamer {
     const s = new LineStreamer(
-      () => {
-        const user = requireUser()
-        return createStream(user, lastInboundMsgId.get(user))
-      },
+      () => conv.chat.openStream(),
       async path => {
         sendingOwnMedia = true
         try {
-          const user = requireUser()
-          await sendFile(user, nativePath(path, workdir), lastInboundMsgId.get(user))
+          await conv.chat.sendFile(nativePath(path, conv.workdir))
           log(`sent file ${path}`)
         } catch (err) {
           log(`failed to send ${path}:`, err)
@@ -1715,8 +1887,7 @@ async function runSession(): Promise<void> {
         }
       },
       async text => {
-        const user = requireUser()
-        await sendToQQ(user, text, lastInboundMsgId.get(user))
+        await conv.chat.send(text)
       },
     )
     // Before anything else reaches it, so the reopened fence is the first thing
@@ -1741,7 +1912,7 @@ async function runSession(): Promise<void> {
     if (m.type === 'system' && m.subtype === 'init') {
       // Persist immediately: a crash before the first reply should still leave
       // a resumable session behind.
-      if (m.session_id) saveSessionId(m.session_id)
+      if (m.session_id) conv.setSessionId(m.session_id)
     } else if (m.type === 'system' && m.subtype === 'task_started') {
       if (m.task_type === 'local_agent' && !m.ambient) {
         subagents.set(m.task_id, { description: m.description, startedAt: Date.now() })
@@ -1775,12 +1946,12 @@ async function runSession(): Promise<void> {
       if (ev?.type === 'content_block_start') {
         blockTextChars = 0
         block = ev.content_block?.type ?? null
-        if (block === 'thinking' && traceLevel === 'full') {
+        if (block === 'thinking' && conv.traceLevel === 'full') {
           await traceBreak()
           await trace('💭 ')
           traceStarted = true
           lastKind = 'thinking'
-        } else if (block === 'thinking' && traceLevel === 'balanced') {
+        } else if (block === 'thinking' && conv.traceLevel === 'balanced') {
           // One entry per stretch of thinking, not per block. The line is left
           // open and extended in place, so a long stretch reads as one thing
           // still going rather than as a stack of identical lines.
@@ -1798,7 +1969,7 @@ async function runSession(): Promise<void> {
         if (delta?.type === 'text_delta') {
           if (!streamer) {
             streamer = newStreamer()
-            log(`streamer #${streamer.id} created for ${currentUser ? lastInboundMsgId.get(currentUser)?.slice(-8) : 'none'}`)
+            log(`[${conv.key}] streamer #${streamer.id} created for ${conv.chat.replyTo()?.slice(-8) ?? 'none'}`)
           }
           streamedText = true
           // Prose closes the block; a later one starts its own entry list.
@@ -1809,14 +1980,14 @@ async function runSession(): Promise<void> {
           } catch (err) {
             log('stream push failed:', err)
           }
-        } else if (delta?.type === 'thinking_delta' && traceLevel === 'full') {
+        } else if (delta?.type === 'thinking_delta' && conv.traceLevel === 'full') {
           await trace(delta.thinking)
         }
       } else if (ev?.type === 'content_block_stop') {
         // A thinking summary may or may not end its own last line, and the
         // trace only flushes whole lines — without this the last thought can
         // sit in the buffer until something else happens to end one.
-        if (block === 'thinking' && traceLevel === 'full') await traceEndLine()
+        if (block === 'thinking' && conv.traceLevel === 'full') await traceEndLine()
         block = null
       }
     } else if (m.type === 'assistant') {
@@ -1837,21 +2008,21 @@ async function runSession(): Promise<void> {
       for (const b of m.message?.content ?? []) {
         if (b.type === 'text' && b.text.trim() && !streamedText) {
           try {
-            await deliverReply(b.text.trim())
+            await deliverReply(conv, b.text.trim())
           } catch (err) {
             log('failed to deliver reply:', err)
           }
         } else if (b.type === 'tool_use') {
           toolNames.set(b.id, b.name)
-          if (traceLevel === 'full') {
-            const line = summariseTool(b.name, b.input ?? {})
+          if (conv.traceLevel === 'full') {
+            const line = summariseTool(b.name, b.input ?? {}, conv.workdir)
             if (line) {
               await traceBreak()
               await trace(`${line}\n`)
               traceStarted = true
               lastKind = 'tools'
             }
-          } else if (traceLevel === 'balanced' && !b.name.startsWith('mcp__qq__') && !isSubagentTool(b.name)) {
+          } else if (conv.traceLevel === 'balanced' && !b.name.startsWith('mcp__qq__') && !isSubagentTool(b.name)) {
             // Names accumulate along one line — a stream can only append, so
             // the line is built as it goes rather than rewritten at the end.
             // Written straight through: without a newline to end it, a
@@ -1877,7 +2048,7 @@ async function runSession(): Promise<void> {
         sawToolResult = true
         const name = toolNames.get(b.tool_use_id)
         toolNames.delete(b.tool_use_id)
-        if (!name || traceLevel !== 'full') continue
+        if (!name || conv.traceLevel !== 'full') continue
         const out = summariseResult(name, b.content)
         if (out) await trace(`${out}\n`)
       }
@@ -1900,7 +2071,7 @@ async function runSession(): Promise<void> {
       //
       // After the summaries, not before. Those describe work that finished
       // ahead of the operator's message, so they belong to the stream above.
-      if (sawToolResult && sealPending && toolNames.size === 0) await closeStreamer('operator message joins')
+      if (sawToolResult && conv.sealPending && toolNames.size === 0) await closeStreamer('operator message joins')
     } else if (m.type === 'result') {
       // Where the stream closes when nothing closed it earlier. A turn can also
       // end without a final assistant message (interrupt, error), and this
@@ -1914,7 +2085,7 @@ async function runSession(): Promise<void> {
       // the next turn's first words would spread one mistake across two.
       carriedFence = null
       toolNames.clear()
-      log(`turn finished: ${m.subtype}, turns=${m.num_turns}`)
+      log(`[${conv.key}] turn finished: ${m.subtype}, turns=${m.num_turns}`)
     }
   }
 }
@@ -1930,7 +2101,8 @@ const WAKE_FILE = join(STATE_DIR, 'wake.md')
 /** How much of the note the operator sees in the wake notice. */
 const WAKE_PREVIEW = 300
 
-function deliverWakeNote(): void {
+/** Hand the note to `conv` — the private conversation, which the operator reads. */
+function deliverWakeNote(conv: Conversation): void {
   if (!existsSync(WAKE_FILE)) return
   const note = readFileSync(WAKE_FILE, 'utf8').trim()
   if (!note) return
@@ -1948,8 +2120,9 @@ function deliverWakeNote(): void {
   void sendToQQ(user, `⏰ 重启后按唤醒便条自动接续：\n\n${preview}`).catch(err =>
     log('wake notice failed:', err),
   )
-  queue.push(
+  conv.queue.push(
     withCommandLog(
+      conv,
       `<system-reminder>\n这是 \`${WAKE_FILE}\` 里的唤醒便条（最后写入于 ${spokenGap(Date.now() - writtenAt)}前），` +
         'bridge 重启后自动投递；操作者已收到「自动唤醒」的通知和便条开头。' +
         '没有标题的部分是你重启前写给自己的交接；「操作者附言」是操作者重启时附上的话，以附言为准。' +
@@ -1991,29 +2164,52 @@ function markHealthy(): void {
   }
 }
 
+/**
+ * Keep `conv` served for the life of the process.
+ *
+ * The session is rebuilt rather than the process restarted: /clear and /cwd
+ * both need a fresh query, and a crashed query should not take the QQ
+ * connection, or any other conversation, down with it.
+ */
+async function serve(conv: Conversation): Promise<never> {
+  while (true) {
+    try {
+      await runSession(conv)
+    } catch (err) {
+      log(`[${conv.key}] session ended with error:`, err)
+    }
+    conv.query = null
+    if (conv.restartReason) {
+      log(`[${conv.key}] rebuilding session after /${conv.restartReason}`)
+      conv.restartReason = null
+      continue
+    }
+    await new Promise(r => setTimeout(r, 1000))
+  }
+}
+
 async function main(): Promise<void> {
   const state = loadState()
-  workdir = state.workdir ?? process.env.QQ_BRIDGE_CWD ?? homedir()
-  permissionMode = state.permission_mode ?? process.env.QQ_PERMISSION_MODE ?? 'auto'
-  traceLevel = state.trace_level ?? 'full'
 
-  // A session on disk means this process is picking up a conversation rather
-  // than starting one, which the agent has no other way to find out.
-  if (state.session_id) {
-    const now = Date.now()
-    const bootedAt = now - uptime() * 1000
-    restartNotice = {
-      at: now,
-      stoppedAt: state.stopped_at ?? null,
-      signal: state.stopped_by ?? null,
-      error: state.stopped_error ?? null,
-      // With a recorded stop, a boot after it settles the question. Without
-      // one, coming up within a few minutes of boot is the tell — that is
-      // launchd starting its jobs, not someone restarting this one.
-      rebooted: state.stopped_at
-        ? bootedAt > state.stopped_at
-        : now - bootedAt < 5 * 60_000,
-    }
+  // A conversation with a session on disk is picking up where it left off
+  // rather than starting, which its agent has no other way to find out. Built
+  // before any conversation is opened, since opening one is what arms it.
+  const now = Date.now()
+  const bootedAt = now - uptime() * 1000
+  startupNotice = {
+    at: now,
+    stoppedAt: state.stopped_at ?? null,
+    signal: state.stopped_by ?? null,
+    error: state.stopped_error ?? null,
+    // With a recorded stop, a boot after it settles the question. Without
+    // one, coming up within a few minutes of boot is the tell — that is
+    // launchd starting its jobs, not someone restarting this one.
+    rebooted: state.stopped_at
+      ? bootedAt > state.stopped_at
+      : now - bootedAt < 5 * 60_000,
+  }
+  const priv = privateConversation()
+  if (priv.restartNotice) {
     log(`resuming an existing session; previous stop: ${state.stopped_by ?? 'none recorded'}`)
   }
   // Cleared whether or not it was reported, so the next restart cannot inherit
@@ -2022,10 +2218,13 @@ async function main(): Promise<void> {
     patchState({ stopped_at: null, stopped_by: null, stopped_error: null })
   }
 
-  // Sealing before a standalone message, installed once. Cards with buttons are
-  // exempt and take their own route — see `beforeSend` in qq.ts.
-  onBeforeSend(async () => {
-    await sealStream()
+  // Sealing before a standalone message, installed once: the stream sealed is
+  // the one open in the chat the message is going to. No exceptions — see
+  // `beforeSend` in qq.ts.
+  onBeforeSend(async openid => {
+    for (const conv of conversations.values()) {
+      if (conv.chat.owns(openid)) await conv.sealStream()
+    }
   })
 
   if (!HAS_CREDENTIALS) {
@@ -2034,13 +2233,13 @@ async function main(): Promise<void> {
   }
 
   await connectGateway({ onMessage: handleMessage, onButton: handleButton })
-  log(`bridge up, workdir=${workdir}, mode=${permissionMode}, state=${STATE_DIR}`)
+  log(`bridge up, workdir=${priv.workdir}, mode=${priv.permissionMode}, state=${STATE_DIR}`)
 
   setTimeout(markHealthy, HEALTHY_AFTER_MS).unref()
 
-  // After the restart notice is set, so the note and the notice arrive together.
+  // After the restart notice is armed, so the note and the notice arrive together.
   try {
-    deliverWakeNote()
+    deliverWakeNote(priv)
   } catch (err) {
     log('wake note unreadable, skipped:', err)
   }
@@ -2054,27 +2253,11 @@ async function main(): Promise<void> {
     .then(id => log(`command panel synced (${id})`))
     .catch(err => log('command panel sync failed, keeping the existing one:', err))
 
-  // The session is rebuilt rather than the process restarted: /clear and /cwd
-  // both need a fresh query, and a crashed query should not take the QQ
-  // connection down with it.
-  while (true) {
-    try {
-      await runSession()
-    } catch (err) {
-      log('session ended with error:', err)
-    }
-    activeQuery = null
-    if (restartReason) {
-      log(`rebuilding session after /${restartReason}`)
-      restartReason = null
-      continue
-    }
-    await new Promise(r => setTimeout(r, 1000))
-  }
+  await serve(priv)
 }
 
 /**
- * Leave the conversation in a finished state before going.
+ * Leave every conversation in a finished state before going.
  *
  * A stream is only over once QQ is told so; killed mid-write, the message
  * keeps its typing indicator blinking forever, and the operator is left
@@ -2100,16 +2283,19 @@ async function shutdown(signal: string): Promise<void> {
   // A deliberate stop is not a crash, however soon after start it comes.
   resetCrashCount()
   setTimeout(() => process.exit(0), SHUTDOWN_GRACE_MS).unref()
-  try {
-    // Only when a reply was actually in flight. A restart while idle needs no
-    // apology, and nobody wants a notification for one.
-    if (await sealStream()) {
-      const user = requireUser()
-      await sendToQQ(user, '⏸ claude-in-qq 正在断开连接。', lastInboundMsgId.get(user))
-    }
-  } catch (err) {
-    log('shutdown notice failed:', err)
-  }
+  // All at once: they share one grace period, and one slow chat must not use
+  // it up for the rest.
+  await Promise.all(
+    [...conversations.values()].map(async conv => {
+      try {
+        // Only where a reply was actually in flight. A restart while idle needs
+        // no apology, and nobody wants a notification for one.
+        if (await conv.sealStream()) await conv.chat.send('⏸ claude-in-qq 正在断开连接。')
+      } catch (err) {
+        log(`[${conv.key}] shutdown notice failed:`, err)
+      }
+    }),
+  )
   closeGateway()
   process.exit(0)
 }
