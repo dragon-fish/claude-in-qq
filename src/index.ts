@@ -12,7 +12,7 @@
 
 import { createSdkMcpServer, query, tool } from '@anthropic-ai/claude-agent-sdk'
 import { z } from 'zod'
-import { allCommands, buildHead, confirmRestart, dispatch, type CommandDeps } from './commands.js'
+import { buildHead, dispatch, panelEntries, type CommandDeps } from './commands.js'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { homedir, uptime } from 'node:os'
 import { join } from 'node:path'
@@ -20,15 +20,22 @@ import { fileURLToPath } from 'node:url'
 import { History } from './history.js'
 import { nativePath } from './paths.js'
 import {
+  BOT_ROUND_LIMIT,
+  BotRounds,
   commandText,
   describeMessage,
+  describeOrigin,
   mentionsMe,
   RECENT_IN_CONTEXT,
   renderMentions,
   routeGroupMessage,
+  type Speaker,
+  stripNickname,
+  wrapDelivery,
   wrapTurn,
 } from './turn.js'
 import {
+  addNickname,
   addOp,
   type Attachment,
   buildApprovalKeyboard,
@@ -41,6 +48,8 @@ import {
   type StreamHandle,
   drainRelayed,
   dropExpiredPending,
+  fetchGroupBotState,
+  fetchGroupInfo,
   fetchImage,
   groupReplyTarget,
   HAS_CREDENTIALS,
@@ -51,6 +60,7 @@ import {
   onGroupSent,
   rememberGroupInbound,
   rememberInbound,
+  removeNickname,
   removeOp,
   LETTERS,
   loadAccess,
@@ -252,6 +262,11 @@ class MessageQueue implements AsyncIterable<SDKUserMessage> {
     this.waiting.length = 0
   }
 
+  /** Messages no session has taken yet. */
+  get size(): number {
+    return this.buffered.length
+  }
+
   async *[Symbol.asyncIterator](): AsyncIterator<SDKUserMessage> {
     while (true) {
       const buffered = this.buffered.shift()
@@ -321,6 +336,38 @@ function groupOf(conv: Conversation): string | null {
   return conv.key.startsWith(GROUP_PREFIX) ? conv.key.slice(GROUP_PREFIX.length) : null
 }
 
+/** Where a group's shown name came from. */
+type GroupNameSource = 'owner' | 'qq' | 'openid'
+
+/**
+ * A group's shown name: the owner's override from /group name set, else the
+ * name QQ reports (see `refreshGroupName`), else the head of its openid.
+ */
+function groupName(group: string): { name: string; source: GroupNameSource } {
+  const key = groupKey(group)
+  const conv = conversations.get(key)
+  const saved = conv ? null : loadConversationState(key)
+  const override = conv ? conv.name : saved!.name
+  const qq = conv ? conv.qqName : saved!.qq_name
+  if (override) return { name: override, source: 'owner' }
+  if (qq) return { name: qq, source: 'qq' }
+  return { name: group.slice(0, 8), source: 'openid' }
+}
+
+/** How a group is shown anywhere — turn context, cards, forwards, tool output. */
+const groupLabel = (group: string) => groupName(group).name
+
+/** A conversation as named to people and agents: '私聊', or '群 ' and its label. */
+function conversationLabel(key: string): string {
+  return key.startsWith(GROUP_PREFIX) ? `群 ${groupLabel(key.slice(GROUP_PREFIX.length))}` : '私聊'
+}
+
+/**
+ * A group's own working directory, so its Claude Code auto-memory — kept per
+ * working directory — is its own and never the owner's private one.
+ */
+const groupWorkdir = (group: string) => join(STATE_DIR, 'groups', group)
+
 const privateChat: Chat = {
   send: text => {
     const user = requireUser()
@@ -375,7 +422,7 @@ async function forwardUndelivered(group: string, text: string, err: unknown): Pr
   const about = conversations.get(groupKey(group))?.lastTrigger
   await sendToQQ(
     owner,
-    `⚠️ 群 \`${group}\` 的回复没能发出（${String(err).slice(0, 120)}），转到这里。` +
+    `⚠️ 群 ${groupLabel(group)} 的回复没能发出（${String(err).slice(0, 120)}），转到这里。` +
       `${about ? `\n回复的是：${about}` : ''}\n\n${text}`,
     lastInboundMsgId.get(owner),
   )
@@ -390,13 +437,53 @@ class Conversation {
    * default: it is the operator's most recent explicit decision, and the env
    * var only describes how this process happened to be launched.
    *
-   * A new group starts in the home directory with no trace: `QQ_BRIDGE_CWD`
-   * describes the operator's own session, and every trace line in a group is
-   * read by everyone in it.
+   * A new group starts in its own directory under the state dir (see
+   * `groupWorkdir`) with no trace: `QQ_BRIDGE_CWD` describes the operator's
+   * own session, sharing it would share the operator's memory with the group,
+   * and every trace line in a group is read by everyone in it.
    */
   workdir: string
   permissionMode: string
   traceLevel: TraceLevel
+  /** Groups only: the owner's name for it from /group name set, which outranks QQ's; or null. */
+  name: string | null
+  /** Groups only: the name QQ last reported for it, or null. */
+  qqName: string | null
+
+  /**
+   * Set when the session is being closed for good rather than rebuilt: the
+   * serve loop sees it and returns instead of starting another one. The
+   * session id stays on disk, so the next start resumes it.
+   */
+  parking = false
+
+  /**
+   * Whether a turn is under way: set by every message that is part of one,
+   * cleared by its result. Messages handed to the session since the last
+   * result count as well — see `busy`.
+   */
+  inTurn = false
+  /** Messages handed to this conversation, and how many of them the last result covered. */
+  inputs = 0
+  answered = 0
+  /** The `inputs` count at the latest QQ message (or wake note), and at the latest agent message. */
+  lastHumanInput = 0
+  lastAgentInput = 0
+  /** When anything last happened here — a message in, or anything from the session. 0 for never. */
+  lastActivity = 0
+  /** Subagents of the live session still working. Assigned per session by `runSession`. */
+  backgroundTasks: () => number = () => 0
+
+  /**
+   * The chain of qq_message_agent deliveries the latest message here belongs
+   * to: the QQ message it started from, and how many deliveries deep this is.
+   * A QQ message starts a new chain at depth 0; a delivery carries its
+   * sender's chain one deeper. Read when this conversation's agent calls
+   * qq_message_agent, so a human message arriving in the middle of a chain
+   * starts that sender over — which is right, since what follows is then that
+   * message's doing.
+   */
+  chain: Chain = { id: '', depth: 0, origin: null }
 
   /** The live query, or null before the first message starts a session. */
   query: any = null
@@ -484,12 +571,40 @@ class Conversation {
     this.key = key
     this.chat = chat
     const saved = loadConversationState(key)
-    const isGroup = key !== PRIVATE_KEY
-    this.workdir = saved.workdir ?? (isGroup ? homedir() : (process.env.QQ_BRIDGE_CWD ?? homedir()))
+    const group = key.startsWith(GROUP_PREFIX) ? key.slice(GROUP_PREFIX.length) : null
+    this.workdir = saved.workdir ?? (group ? groupWorkdir(group) : (process.env.QQ_BRIDGE_CWD ?? homedir()))
+    if (group && !saved.workdir) mkdirSync(this.workdir, { recursive: true })
     this.permissionMode = saved.permission_mode ?? process.env.QQ_PERMISSION_MODE ?? 'auto'
-    this.traceLevel = saved.trace_level ?? (isGroup ? 'off' : 'full')
+    this.traceLevel = saved.trace_level ?? (group ? 'off' : 'full')
+    this.name = saved.name ?? null
+    this.qqName = saved.qq_name ?? null
+    // Armed once per process, here, and never again: the Conversation outlives
+    // its sessions, so a group parked and resumed later is not told twice.
     this.restartNotice = saved.session_id ? startupNotice : null
     this.tools = qqToolsFor(this)
+  }
+
+  /**
+   * Whether the turn under way answers only messages from other agents. Such
+   * a turn is silent, like a Claude Code subagent answering SendMessage: what
+   * it writes is not posted to this chat — it answers the sender with
+   * qq_message_agent, and posts here only on purpose, with qq_say. A QQ
+   * message in the mix makes the turn an ordinary one again, from the moment
+   * it is handed over.
+   */
+  silent(): boolean {
+    return this.lastAgentInput > this.answered && this.lastHumanInput <= this.answered
+  }
+
+  /**
+   * Whether closing the session now could lose or cut anything: a turn under
+   * way, messages handed over that no result has covered yet (the session may
+   * be about to start a turn on them), subagents still working, a card waiting
+   * on the owner, or messages queued for the next session.
+   */
+  busy(): boolean {
+    const carded = [...pendingApprovals.values(), ...pendingQuestions.values()].some(p => p.conversation === this.key)
+    return this.inTurn || this.answered < this.inputs || this.backgroundTasks() > 0 || carded || this.queue.size > 0
   }
 
   sessionId(): string | null {
@@ -514,7 +629,19 @@ class Conversation {
     this.traceLevel = level
     patchConversationState(this.key, { trace_level: level })
   }
+
+  /** Set or, with null, clear the owner's override. */
+  setName(name: string | null): void {
+    this.name = name
+    patchConversationState(this.key, { name })
+  }
 }
+
+/** See `Conversation.chain`. `origin` is from `describeOrigin`, null when no QQ message began it. */
+type Chain = { id: string; depth: number; origin: string | null }
+
+/** Deliveries one QQ message may set off in a row; the next one is refused and the owner told. */
+const MAX_CHAIN_DEPTH = 6
 
 const conversations = new Map<string, Conversation>()
 
@@ -532,8 +659,14 @@ function privateConversation(): Conversation {
   return openConversation(PRIVATE_KEY, privateChat)
 }
 
+/**
+ * Opening one is also a sighting: a group reached only by qq_message_agent
+ * still gets its name looked up.
+ */
 function groupConversation(group: string): Conversation {
-  return openConversation(groupKey(group), groupChat(group))
+  const conv = openConversation(groupKey(group), groupChat(group))
+  void refreshGroupName(group)
+  return conv
 }
 
 function recordCommand(conv: Conversation, name: string, args: string): void {
@@ -762,7 +895,7 @@ function settleQuestion(id: string, text: string, images: FetchedImage[] = []): 
  */
 function originNote(conv: Conversation): string | null {
   const group = groupOf(conv)
-  return group ? `（来自群 \`${group}\` 的会话）` : null
+  return group ? `（来自群 ${groupLabel(group)} 的会话）` : null
 }
 
 /** Strip control and bidi characters: tool input is untrusted text. */
@@ -895,13 +1028,14 @@ function qqToolsFor(conv: Conversation) {
         },
         async ({ group, limit, before_message_id, query }) => {
           const text = (t: string) => ({ content: [{ type: 'text' as const, text: t }] })
-          const target = group ?? groupOf(conv)
+          // A conversation key is accepted too, since that is how qq_list_agents names groups.
+          const target = group?.replace(GROUP_PREFIX, '') ?? groupOf(conv)
           if (!target) {
             const known = history.groups()
             return text(
               'This conversation is not a group; pass `group`. Groups on record:\n' +
                 (known.length
-                  ? known.map(g => `${g.group_openid} (${g.messages} messages)`).join('\n')
+                  ? known.map(g => `${g.group_openid} 群 ${groupLabel(g.group_openid)} (${g.messages} messages)`).join('\n')
                   : '(none)'),
             )
           }
@@ -915,9 +1049,10 @@ function qqToolsFor(conv: Conversation) {
           }
           const now = Date.now()
           return text(
-            rows
-              .map(m => describeMessage(m, { ref: now, withId: true, roleOf: memberRole, nameOf: memberName }))
-              .join('\n'),
+            [
+              `群 ${groupLabel(target)} (${target}), ${rows.length} message(s), oldest first:`,
+              ...rows.map(m => describeMessage(m, { ref: now, withId: true, roleOf: memberRole, nameOf: memberName })),
+            ].join('\n'),
           )
         },
       ),
@@ -949,8 +1084,167 @@ function qqToolsFor(conv: Conversation) {
           return text(`Removed ${name ?? member_openid} from the op list.`)
         },
       ),
+      tool(
+        'qq_say',
+        "Post text to this conversation's own QQ chat — the private chat, or this group. Only needed in a " +
+          'turn started by a message from another agent: such a turn is silent, and what you write in it ' +
+          'reaches nobody. Use it when the owner or this chat should see something then. In any other turn ' +
+          'just write; your words are posted anyway. MEDIA:/absolute/path lines in the text are sent as ' +
+          'files, as in an ordinary reply.',
+        { text: z.string().min(1).describe('What to post, markdown as in an ordinary reply') },
+        async ({ text }) => {
+          try {
+            await deliverReply(conv, text.trim())
+          } catch (err) {
+            return { content: [{ type: 'text' as const, text: `Not posted: ${err}` }], isError: true }
+          }
+          log(`[${conv.key}] qq_say: ${text.length} chars`)
+          return { content: [{ type: 'text' as const, text: `Posted to ${conversationLabel(conv.key)}.` }] }
+        },
+      ),
+      tool(
+        'qq_list_agents',
+        'List the other agents of this same bridge: one per conversation — the private chat with the owner ' +
+          '(key c2c) and one per QQ group (key group:<group_openid>) — you being one of them. These are ' +
+          'agents, not QQ users. Each line gives the key qq_message_agent takes, the group name, the state — ' +
+          'running (in a turn), idle (session open, between turns), waiting (queued for a free group slot), ' +
+          'parked (no live session; resumed by the next message) — and when it was last active.',
+        {},
+        async () => ({ content: [{ type: 'text' as const, text: listConversations(conv) }] }),
+      ),
+      tool(
+        'qq_message_agent',
+        'Send a message to another agent of this same bridge — the one serving the private chat or a QQ ' +
+          'group — not to any QQ user. It arrives there as a new message saying it came from you and which ' +
+          'QQ message set it off. The turn it starts there is silent: nothing that agent writes is posted ' +
+          'to its chat; it answers you with qq_message_agent, and posts to its own chat (the private chat, ' +
+          'or its group — never yours) only on purpose, with qq_say. A parked agent is resumed to take it. ' +
+          'Returns at once without waiting for an answer.',
+        {
+          to: z.string().describe('The agent\'s key from qq_list_agents: c2c, or group:<group_openid>'),
+          message: z
+            .string()
+            .min(1)
+            .describe('A self-contained handover: what you need, why, and what to send back'),
+        },
+        async ({ to, message }) => {
+          const result = deliver(conv, to.trim(), message)
+          return { content: [{ type: 'text' as const, text: result.text }], ...(result.error ? { isError: true } : {}) }
+        },
+      ),
     ],
   })
+}
+
+// ------------------------------------------------------ inter-conversation mail
+//
+// Each conversation's agent is a peer of the others, like agents messaging one
+// another in Claude Code: any one may message any other, each speaks only in
+// its own chat, and a turn a message starts is silent (`Conversation.silent`).
+// Nothing restricts who may send what to whom — the operator context covers
+// that — but a chain of deliveries one QQ message set off is cut at
+// MAX_CHAIN_DEPTH, so two agents cannot keep each other busy forever.
+
+/** Chains the owner has already been told were cut, so a stubborn sender is not one buzz per retry. */
+const chainsReported = new Set<string>()
+
+/**
+ * Every conversation qq_message_agent can reach: the private one, every one
+ * opened or on disk, and every group in history — a group this bot is in but
+ * was never @'d in gets its conversation opened by the first delivery.
+ */
+function knownConversationKeys(): string[] {
+  const keys = new Set<string>([PRIVATE_KEY])
+  for (const key of conversations.keys()) keys.add(key)
+  for (const key of Object.keys(loadState().conversations ?? {})) keys.add(key)
+  for (const g of history.groups()) keys.add(groupKey(g.group_openid))
+  return [...keys]
+}
+
+function conversationStatus(key: string): 'running' | 'idle' | 'waiting' | 'parked' {
+  const conv = conversations.get(key)
+  if (conv && serving.has(key)) return conv.inTurn || conv.answered < conv.inputs ? 'running' : 'idle'
+  return waiting.includes(key) ? 'waiting' : 'parked'
+}
+
+function listConversations(self: Conversation): string {
+  const now = Date.now()
+  const ago = (at: number | undefined) => (at ? `${spokenGap(now - at)}前` : 'none since the bridge started')
+  const groupActivity = new Map(history.groups().map(g => [groupKey(g.group_openid), g.last_at]))
+  return knownConversationKeys()
+    .map(key => {
+      const group = key.startsWith(GROUP_PREFIX) ? key.slice(GROUP_PREFIX.length) : null
+      const named = group ? groupName(group) : null
+      const parts = [
+        key,
+        named ? `群 ${named.name}${named.source === 'openid' ? ' (name unknown)' : ''}` : '私聊',
+        conversationStatus(key),
+        `last activity ${ago(conversations.get(key)?.lastActivity)}`,
+      ]
+      if (groupActivity.has(key)) parts.push(`last group message ${ago(groupActivity.get(key))}`)
+      if (key === self.key) parts.push('(this conversation)')
+      return parts.join(' | ')
+    })
+    .join('\n')
+}
+
+/** Hand `message` from `from` to the conversation `to`. Never waits for the target's turn. */
+function deliver(from: Conversation, to: string, message: string): { text: string; error?: boolean } {
+  if (to === from.key) return { text: 'That key is you; answer in your own chat instead.', error: true }
+  const keys = knownConversationKeys()
+  if (!keys.includes(to)) return { text: `No agent \`${to}\`. Valid keys:\n${keys.join('\n')}`, error: true }
+
+  const depth = from.chain.depth + 1
+  const route = `${conversationLabel(from.key)} → ${conversationLabel(to)}`
+  if (depth > MAX_CHAIN_DEPTH) {
+    log(`[${from.key}] delivery to ${to} refused at depth ${depth}`)
+    const owner = operatorOpenid()
+    if (owner && !chainsReported.has(from.chain.id)) {
+      chainsReported.add(from.chain.id)
+      void sendToQQ(
+        owner,
+        `⚠️ 会话留言连转了 ${MAX_CHAIN_DEPTH} 层，已停止投递（${route}）。` +
+          `${from.chain.origin ? `\n起因：${from.chain.origin}` : ''}`,
+        lastInboundMsgId.get(owner),
+      ).catch(err => log('chain limit notice failed:', err))
+    }
+    return {
+      text:
+        `Not delivered: one QQ message has already set off ${MAX_CHAIN_DEPTH} deliveries in a row, the limit. ` +
+        'The owner has been told in private chat. Stop relaying; if your own chat should hear of it, use qq_say.',
+      error: true,
+    }
+  }
+
+  const target = to === PRIVATE_KEY ? privateConversation() : groupConversation(to.slice(GROUP_PREFIX.length))
+  const wrapped = wrapDelivery({
+    from: { key: from.key, label: conversationLabel(from.key) },
+    origin: from.chain.origin,
+    depth,
+    limit: MAX_CHAIN_DEPTH,
+    at: Date.now(),
+    text: message,
+  })
+  const was = conversationStatus(to)
+  target.chain = { ...from.chain, depth }
+  if (groupOf(target)) target.lastTrigger = `会话留言（来自${conversationLabel(from.key)}）：${message}`.slice(0, 200)
+  // See handleMessage: the seal waits for the message to reach the model.
+  target.sealPending = target.streamOpen()
+  enqueue(target, withCommandLog(target, wrapped), [], 'agent')
+  ensureServing(target)
+  const now = conversationStatus(to)
+  log(`[${from.key}] delivered to ${to} at depth ${depth} (${was} → ${now})`)
+  const state =
+    now === 'waiting'
+      ? `It is waiting for one of the ${GROUP_CONCURRENCY} group session slots and takes the message when one frees up.`
+      : was === 'parked'
+        ? 'It was parked and is being resumed to take it.'
+        : `It was ${was}; the message joins its queue.`
+  return {
+    text:
+      `Delivered to ${to} (${conversationLabel(to)}). ${state} Its answer comes back to you as a ` +
+      'message from it; it posts in its own chat only if it chooses to.',
+  }
 }
 
 // -------------------------------------------------------------- inbound routing
@@ -1006,7 +1300,6 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
   // as its answer, so /stop would never reach anything if it were checked after.
   const deps = commandDeps(conv, { sender: msg.openid, mentions: [] })
   if (await dispatch(msg.content, deps)) return
-  if (await confirmRestart(msg.content, deps)) return
 
   // An open approval or question takes precedence: the agent is blocked on it,
   // so this message is the answer rather than a new instruction.
@@ -1039,18 +1332,24 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
 
   const { images, notes } = await readAttachments(msg.attachments)
   const said = [msg.content, ...notes].filter(Boolean).join('\n') || (images.length ? '(图片)' : '')
-  const wrapped = wrapTurn({
-    source: { kind: 'private' },
-    speaker: { openid: msg.openid, name: msg.name, isOwner: isOwner(msg.openid, access), isBot: false },
-    at: Date.now(),
-    text: said,
-  })
+  const speaker: Speaker = { openid: msg.openid, name: msg.name, isOwner: isOwner(msg.openid, access), isBot: false }
+  const wrapped = wrapTurn({ source: { kind: 'private' }, speaker, at: Date.now(), text: said })
   log(`inbound from ${msg.openid.slice(0, 8)}: ${msg.content.slice(0, 60)}${images.length ? ` (+${images.length} 图)` : ''}`)
+  conv.chain = { id: randomId(), depth: 0, origin: describeOrigin(speaker, '私聊', said) }
   enqueue(conv, withCommandLog(conv, wrapped), images)
 }
 
-/** Image first, then the words about it — the order the person sent them in. */
-function enqueue(conv: Conversation, text: string, images: FetchedImage[]): void {
+/**
+ * Hand a message to `conv`'s session, or to its queue until one runs. Image
+ * first, then the words about it — the order the person sent them in. `from`
+ * says whether a QQ message (or the wake note) or another agent sent it; see
+ * `Conversation.silent`.
+ */
+function enqueue(conv: Conversation, text: string, images: FetchedImage[], from: 'human' | 'agent' = 'human'): void {
+  conv.inputs++
+  if (from === 'human') conv.lastHumanInput = conv.inputs
+  else conv.lastAgentInput = conv.inputs
+  conv.lastActivity = Date.now()
   if (!images.length) {
     conv.queue.push(text)
     return
@@ -1091,11 +1390,27 @@ async function handleGroupMessage(msg: InboundGroupMessage): Promise<void> {
     return
   }
   rememberGroupInbound(msg.group, msg.id)
+  const naming = refreshGroupName(msg.group)
 
   const access = loadAccess()
-  if (routeGroupMessage(msg, id => isOp(id, access)) !== 'trigger') {
-    if (mentionsMe(msg)) log(`${where}: @ from non-op ${msg.author.openid.slice(0, 8)}, recorded only`)
+  const nicknames = access.nicknames
+  if (!msg.author.bot && isOp(msg.author.openid, access) && botRounds.human(msg.group)) {
+    log(`${where}: a human op spoke, answering bots again`)
+  }
+  if (routeGroupMessage(msg, id => isOp(id, access), nicknames) !== 'trigger') {
+    if (mentionsMe(msg) || stripNickname(msg.content, nicknames) !== null) {
+      log(`${where}: addressed by non-op ${msg.author.openid.slice(0, 8)}, recorded only`)
+    }
     return
+  }
+
+  if (msg.author.bot) {
+    const verdict = botRounds.bot(msg.group)
+    if (verdict !== 'answer') {
+      log(`${where}: bot ${msg.author.openid.slice(0, 8)} not answered, ${BOT_ROUND_LIMIT} bot rounds without a human op`)
+      if (verdict === 'trip') await announceBotPause(msg.group)
+      return
+    }
   }
 
   const conv = groupConversation(msg.group)
@@ -1104,18 +1419,26 @@ async function handleGroupMessage(msg: InboundGroupMessage): Promise<void> {
 
   const owner = isOwner(msg.author.openid, access)
   if (owner) {
-    const text = commandText(msg)
     const deps = commandDeps(conv, { sender: msg.author.openid, mentions: msg.mentions })
-    if (await dispatch(text, deps)) return
-    if (await confirmRestart(text, deps)) return
+    if (await dispatch(commandText(msg, nicknames), deps)) return
   }
 
+  // The first message from a group waits briefly for its name, so even the
+  // first turn's context can show it. Never for long: a name is cosmetic.
+  if (naming) await Promise.race([naming, new Promise(r => setTimeout(r, NAME_WAIT_MS))])
+
+  // Addressed by nickname, the nickname is how they got the bot's attention,
+  // not part of what they said — as an @ of this bot is, which stays in.
+  const content = stripNickname(msg.content, nicknames) ?? msg.content
   const { images, notes } = await readAttachments(msg.attachments)
-  const said = [msg.content, ...notes].filter(Boolean).join('\n') || (images.length ? '(图片)' : '')
-  conv.lastTrigger = `${msg.author.name}：${renderMentions(said, msg.mentions, memberName)}`.slice(0, 200)
+  const said = [content, ...notes].filter(Boolean).join('\n') || (images.length ? '(图片)' : '')
+  const rendered = renderMentions(said, msg.mentions, memberName)
+  conv.lastTrigger = `${msg.author.name}：${rendered}`.slice(0, 200)
+  const speaker: Speaker = { openid: msg.author.openid, name: msg.author.name, isOwner: owner, isBot: msg.author.bot }
+  const label = groupLabel(msg.group)
   const wrapped = wrapTurn({
-    source: { kind: 'group', group: msg.group },
-    speaker: { openid: msg.author.openid, name: msg.author.name, isOwner: owner, isBot: msg.author.bot },
+    source: { kind: 'group', label, key: conv.key },
+    speaker,
     at: msg.at,
     recent: history.query({ group: msg.group, beforeMessageId: msg.id, limit: RECENT_IN_CONTEXT }),
     roleOf: memberRole,
@@ -1124,8 +1447,63 @@ async function handleGroupMessage(msg: InboundGroupMessage): Promise<void> {
     mentions: msg.mentions,
   })
   log(`${where}: trigger from ${msg.author.openid.slice(0, 8)}: ${msg.content.slice(0, 60)}`)
+  conv.chain = { id: randomId(), depth: 0, origin: describeOrigin(speaker, `群 ${label}`, rendered) }
   enqueue(conv, withCommandLog(conv, wrapped), images)
   ensureServing(conv)
+}
+
+/** How often a group's name is asked for again; QQ allows the lookup 30 times a minute per app. */
+const GROUP_NAME_REFRESH_MS = 6 * 60 * 60 * 1000
+/** How long a trigger waits for a name lookup it set off. */
+const NAME_WAIT_MS = 3000
+
+/** Per group, when its name was last asked for; seeded from disk on first sight. */
+const nameCheckedAt = new Map<string, number>()
+
+/**
+ * Ask QQ for a group's name when it has not been asked for a while, and cache
+ * it in the group's conversation state. Returns the lookup when it started
+ * one, so a caller can wait for it, and null otherwise.
+ *
+ * Never throws and never fails the message: the lookup is whitelist-only
+ * (11253 without permission), and a group without a known name is shown by
+ * its openid. A failed lookup counts as asked, so it is retried after the
+ * same interval rather than on every message.
+ */
+function refreshGroupName(group: string): Promise<void> | null {
+  const key = groupKey(group)
+  if (!nameCheckedAt.has(group)) nameCheckedAt.set(group, loadConversationState(key).qq_name_checked_at ?? 0)
+  if (Date.now() - nameCheckedAt.get(group)! < GROUP_NAME_REFRESH_MS) return null
+  nameCheckedAt.set(group, Date.now())
+  return fetchGroupInfo(group).then(
+    info => {
+      const name = info.group_name?.trim() || null
+      patchConversationState(key, { qq_name: name, qq_name_checked_at: Date.now() })
+      const conv = conversations.get(key)
+      if (conv) conv.qqName = name
+      log(`group ${group.slice(0, 8)}: QQ name ${name ? `「${name}」` : 'empty'}`)
+    },
+    err => {
+      patchConversationState(key, { qq_name_checked_at: Date.now() })
+      log(`group ${group.slice(0, 8)}: name lookup failed, showing the openid:`, String(err))
+    },
+  )
+}
+
+/** Per group: how many bots in a row this bot has answered. */
+const botRounds = new BotRounds()
+
+/** Say, once, why this bot stopped answering bots here, and to whom. */
+async function announceBotPause(group: string): Promise<void> {
+  const owner = operatorOpenid()
+  try {
+    await groupChat(group).send(
+      `${owner ? `<@${owner}> ` : ''}已经和 bot 连续来回 ${BOT_ROUND_LIMIT} 轮，中间没有人类 op 说话，` +
+        '我先不回 bot 了。有人类 op 在群里说句话就恢复。',
+    )
+  } catch (err) {
+    log(`group ${group.slice(0, 8)}: bot pause notice failed:`, err)
+  }
 }
 
 /**
@@ -1212,6 +1590,11 @@ type ConversationState = {
   workdir?: string
   permission_mode?: string
   trace_level?: TraceLevel
+  /** Groups only: the owner's override, set with /group name set. */
+  name?: string | null
+  /** Groups only: the name QQ reported, and when it was last asked for, failed or not. */
+  qq_name?: string | null
+  qq_name_checked_at?: number
 }
 
 /**
@@ -1312,9 +1695,14 @@ function commandDeps(conv: Conversation, origin: CommandOrigin): CommandDeps {
     query: () => conv.query,
     workdir: () => conv.workdir,
     setWorkdir: path => conv.setWorkdir(path),
+    // With no live session — not started yet, waiting for a slot, or parked —
+    // there is nothing to rebuild: the next start already reads the new
+    // workdir or session id. A reason left set there would instead make the
+    // serve loop rebuild the session after it next parks.
     restartSession: reason => {
+      if (!conv.query) return
       conv.restartReason = reason
-      conv.query?.close()
+      conv.query.close()
     },
     sessionId: () => conv.sessionId(),
     setSessionId: id => conv.setSessionId(id),
@@ -1338,10 +1726,28 @@ function commandDeps(conv: Conversation, origin: CommandOrigin): CommandDeps {
       void shutdown('/restart')
     },
     senderIsOwner: () => isOwner(origin.sender),
+    where: () => (groupOf(conv) ? 'group' : 'private'),
+    groupName: () => {
+      const group = groupOf(conv)
+      return group ? groupName(group) : null
+    },
+    setGroupName: name => conv.setName(name),
+    groupInfo: async () => {
+      const group = groupOf(conv)
+      if (!group) throw new Error('not a group')
+      const [info, bot] = await Promise.allSettled([fetchGroupInfo(group), fetchGroupBotState(group)])
+      return {
+        info: info.status === 'fulfilled' ? info.value : String(info.reason),
+        bot: bot.status === 'fulfilled' ? bot.value : String(bot.reason),
+      }
+    },
     nameOf: openid => origin.mentions.find(m => m.openid === openid)?.name || memberName(openid),
     listOps: () => Object.entries(loadAccess().ops).map(([openid, remark]) => ({ openid, remark })),
     addOp,
     removeOp,
+    listNicknames: () => loadAccess().nicknames,
+    addNickname,
+    removeNickname,
   }
 }
 
@@ -1991,6 +2397,12 @@ async function runSession(conv: Conversation): Promise<void> {
   const resume = conv.sessionId()
   log(`[${conv.key}] ${resume ? `resuming session ${resume}` : 'starting a new session'}`)
 
+  // Whatever the last session took and never answered went with it; only what
+  // is still queued is owed an answer by this one. Counted before query()
+  // exists: the queue may be read from the moment it does.
+  conv.inTurn = false
+  conv.answered = conv.inputs - conv.queue.size
+
   const q = query({
     prompt: conv.queue,
     options: {
@@ -2097,6 +2509,7 @@ async function runSession(conv: Conversation): Promise<void> {
 
   /** Write into the fenced trace block. Newlines are the caller's to place. */
   async function trace(text: string): Promise<void> {
+    if (conv.silent()) return
     try {
       streamer ??= newStreamer()
       await streamer.push(text, 'trace')
@@ -2110,6 +2523,7 @@ async function runSession(conv: Conversation): Promise<void> {
 
   /** Write into the trace immediately, without waiting for a line to end. */
   async function traceNow(text: string): Promise<void> {
+    if (conv.silent()) return
     try {
       streamer ??= newStreamer()
       if (await streamer.pushNow(text, 'trace')) {
@@ -2155,6 +2569,7 @@ async function runSession(conv: Conversation): Promise<void> {
    * wait from a hang. Outlives turns: a background one ends in a later one.
    */
   const subagents = new Map<string, { description: string; startedAt: number }>()
+  conv.backgroundTasks = () => subagents.size
 
   async function traceSubagent(line: string): Promise<void> {
     await traceBreak()
@@ -2192,6 +2607,8 @@ async function runSession(conv: Conversation): Promise<void> {
 
   for await (const message of q as any) {
     const m = message as any
+    // Anything at all, a subagent's frames included, is the session not idle.
+    conv.lastActivity = Date.now()
 
     // A subagent's frames carry the Agent call that spawned it. They are its
     // own work, not the operator's conversation: tracing them floods the chat
@@ -2199,6 +2616,11 @@ async function runSession(conv: Conversation): Promise<void> {
     // drain `toolNames` and fire the mid-turn seal at the wrong boundary. The
     // Agent call itself is a top-level frame and is still traced.
     if (m.parent_tool_use_id) continue
+
+    // System messages are left out: a background task reporting in after the
+    // turn ended is not a turn, and would leave the flag set with no result
+    // coming to clear it.
+    if (m.type === 'stream_event' || m.type === 'assistant' || m.type === 'user') conv.inTurn = true
 
     if (m.type === 'system' && m.subtype === 'init') {
       // Persist immediately: a crash before the first reply should still leave
@@ -2257,7 +2679,11 @@ async function runSession(conv: Conversation): Promise<void> {
         }
       } else if (ev?.type === 'content_block_delta') {
         const delta = ev.delta
-        if (delta?.type === 'text_delta') {
+        if (delta?.type === 'text_delta' && conv.silent()) {
+          // Marked as streamed all the same, so the finished message does not
+          // go out the non-streamed way instead.
+          streamedText = true
+        } else if (delta?.type === 'text_delta') {
           if (!streamer) {
             streamer = newStreamer()
             log(`[${conv.key}] streamer #${streamer.id} created for ${conv.chat.replyTo()?.slice(-8) ?? 'none'}`)
@@ -2297,7 +2723,9 @@ async function runSession(conv: Conversation): Promise<void> {
           .join(', ')} streamedText=${streamedText}`,
       )
       for (const b of m.message?.content ?? []) {
-        if (b.type === 'text' && b.text.trim() && !streamedText) {
+        if (b.type === 'text' && b.text.trim() && conv.silent()) {
+          log(`[${conv.key}] silent turn: ${b.text.length} chars not posted`)
+        } else if (b.type === 'text' && b.text.trim() && !streamedText) {
           try {
             await deliverReply(conv, b.text.trim())
           } catch (err) {
@@ -2376,6 +2804,12 @@ async function runSession(conv: Conversation): Promise<void> {
       // the next turn's first words would spread one mistake across two.
       carriedFence = null
       toolNames.clear()
+      // Everything handed over so far is covered: a message that arrived
+      // mid-turn was folded into this one. One that arrives after still counts
+      // as owed until the next result, which keeps an idle check from closing
+      // a session that is about to start a turn on it.
+      conv.inTurn = false
+      conv.answered = conv.inputs
       log(`[${conv.key}] turn finished: ${m.subtype}, turns=${m.num_turns}`)
     }
   }
@@ -2387,6 +2821,10 @@ async function runSession(conv: Conversation): Promise<void> {
 // the operator writes in. So before restarting itself the agent can leave a
 // note; the next process hands it straight back as a message, which lets work
 // that needed a restart carry on without a prod from the phone.
+//
+// There is one note, and only the private conversation gets it: restarts are
+// made from there. Group sessions say nothing after a restart until the next
+// message for them arrives.
 
 const WAKE_FILE = join(STATE_DIR, 'wake.md')
 /** How much of the note the operator sees in the wake notice. */
@@ -2411,7 +2849,9 @@ function deliverWakeNote(conv: Conversation): void {
   void sendToQQ(user, `⏰ 重启后按唤醒便条自动接续：\n\n${preview}`).catch(err =>
     log('wake notice failed:', err),
   )
-  conv.queue.push(
+  conv.chain = { id: randomId(), depth: 0, origin: null }
+  enqueue(
+    conv,
     withCommandLog(
       conv,
       `<system-reminder>\n这是 \`${WAKE_FILE}\` 里的唤醒便条（最后写入于 ${spokenGap(Date.now() - writtenAt)}前），` +
@@ -2421,6 +2861,7 @@ function deliverWakeNote(conv: Conversation): void {
         '\n</system-reminder>\n\n' +
         note,
     ),
+    [],
   )
 }
 
@@ -2456,13 +2897,14 @@ function markHealthy(): void {
 }
 
 /**
- * Keep `conv` served for the life of the process.
+ * Keep `conv` served until it is parked — for the private conversation, which
+ * never is, the life of the process.
  *
  * The session is rebuilt rather than the process restarted: /clear and /cwd
  * both need a fresh query, and a crashed query should not take the QQ
  * connection, or any other conversation, down with it.
  */
-async function serve(conv: Conversation): Promise<never> {
+async function serve(conv: Conversation): Promise<void> {
   while (true) {
     try {
       await runSession(conv)
@@ -2470,6 +2912,12 @@ async function serve(conv: Conversation): Promise<never> {
       log(`[${conv.key}] session ended with error:`, err)
     }
     conv.query = null
+    if (conv.parking) {
+      conv.parking = false
+      conv.restartReason = null
+      log(`[${conv.key}] parked; the next message resumes it`)
+      return
+    }
     if (conv.restartReason) {
       log(`[${conv.key}] rebuilding session after /${conv.restartReason}`)
       conv.restartReason = null
@@ -2479,19 +2927,115 @@ async function serve(conv: Conversation): Promise<never> {
   }
 }
 
-/** Conversations whose session loop is running. */
-const serving = new Set<string>()
+// ------------------------------------------------------------- group sessions
+//
+// Every session is a Claude Code process. The private one always runs; groups
+// share GROUP_CONCURRENCY slots between them. A group triggered while every
+// slot is taken waits, its messages held in its queue, and takes the first
+// slot that frees up.
+//
+// A session gives its slot up by parking: it is closed, its id stays on disk,
+// and the next message for it — a trigger or a delivery — resumes it. That
+// happens after GROUP_IDLE_MS with nothing going on, or once a group is
+// waiting and the session has been quiet for PREEMPT_QUIET_MS: a slot held by
+// a session nobody is talking to would otherwise keep a group that is being
+// talked to waiting for half an hour.
+//
+// The Conversation outlives its sessions. That is what keeps a parked group's
+// queue, settings and already-delivered restart notice: parking only ever
+// closes the query, never replaces the object.
+
+const GROUP_CONCURRENCY = Math.max(1, Math.floor(Number(process.env.QQ_GROUP_CONCURRENCY)) || 2)
+const GROUP_IDLE_MS = (Number(process.env.QQ_GROUP_IDLE_MINUTES) || 30) * 60_000
 
 /**
- * Start `conv`'s session loop unless it has one. A group's starts on its first
- * trigger and then runs for the life of the process, like the private one.
- * A cap on concurrent group sessions, or closing idle ones, belongs here.
+ * How long a session must have been quiet before a waiting group may take its
+ * slot. `busy` cannot see a message that slipped in just as a turn ended, which
+ * Claude Code is about to start a fresh turn on; the session is silent only
+ * for the moment before that turn shows, so a minute of silence rules it out.
+ */
+const PREEMPT_QUIET_MS = 60_000
+
+/** Conversations whose session loop is running, private included. */
+const serving = new Set<string>()
+/** Groups waiting for a slot, first come first served. */
+const waiting: string[] = []
+
+const servingGroups = () =>
+  [...serving].filter(key => key !== PRIVATE_KEY).map(key => conversations.get(key)!)
+
+/**
+ * Start `conv`'s session loop unless it has one, or queue it for a slot. The
+ * private conversation's runs from startup; a group's starts when a message
+ * for it arrives.
  */
 function ensureServing(conv: Conversation): void {
   if (serving.has(conv.key)) return
-  serving.add(conv.key)
-  void serve(conv)
+  if (conv.key === PRIVATE_KEY || servingGroups().length < GROUP_CONCURRENCY) {
+    startServing(conv)
+    return
+  }
+  if (!waiting.includes(conv.key)) {
+    waiting.push(conv.key)
+    log(`[${conv.key}] waiting for a group session slot (${GROUP_CONCURRENCY} in use)`)
+  }
+  freeSlotsForWaiting()
 }
+
+function startServing(conv: Conversation): void {
+  serving.add(conv.key)
+  const at = waiting.indexOf(conv.key)
+  if (at >= 0) waiting.splice(at, 1)
+  void serve(conv).finally(() => {
+    serving.delete(conv.key)
+    while (waiting.length && servingGroups().length < GROUP_CONCURRENCY) {
+      startServing(conversations.get(waiting[0])!)
+    }
+    // Pushed while it was closing: buffered for the next session, not lost.
+    if (conv.queue.size) ensureServing(conv)
+  })
+}
+
+/**
+ * Close `conv`'s session for good; `serve` returns instead of rebuilding.
+ * Detached first, so a message pushed from here on is buffered for the next
+ * session rather than handed to the one closing — Claude Code would drop it.
+ */
+function park(conv: Conversation, why: string): void {
+  if (conv.parking || !conv.query) return
+  log(`[${conv.key}] parking: ${why}`)
+  conv.parking = true
+  conv.queue.detachWaiters()
+  conv.query.close()
+}
+
+/** Park quiet sessions until every waiting group has a slot coming. */
+function freeSlotsForWaiting(): void {
+  const now = Date.now()
+  const groups = servingGroups()
+  let short = waiting.length - groups.filter(c => c.parking).length
+  const quiet = groups
+    .filter(c => !c.parking && !c.busy() && now - c.lastActivity >= PREEMPT_QUIET_MS)
+    .sort((a, b) => a.lastActivity - b.lastActivity)
+  for (const conv of quiet) {
+    if (short <= 0) break
+    park(conv, `${waiting[0]} is waiting for a slot`)
+    short--
+  }
+}
+
+setInterval(
+  () => {
+    const now = Date.now()
+    for (const conv of servingGroups()) {
+      if (!conv.busy() && now - conv.lastActivity >= GROUP_IDLE_MS) {
+        park(conv, `idle for ${spokenGap(now - conv.lastActivity)}`)
+      }
+    }
+    if (waiting.length) freeSlotsForWaiting()
+  },
+  Math.min(15_000, GROUP_IDLE_MS / 2),
+).unref()
 
 async function main(): Promise<void> {
   const state = loadState()
@@ -2578,9 +3122,8 @@ async function main(): Promise<void> {
   // panel rather than adding one. Deliberately not awaited and never fatal — a
   // bridge that will not start because a cosmetic list failed to update would
   // be a bad trade, and the panel QQ already has stays usable meanwhile.
-  const panelEntries = allCommands().map(c => ({ name: `/${c.name}`, desc: c.summary }))
   for (const scope of ['c2c', 'group'] as const) {
-    void syncCommandPanel(panelEntries, scope)
+    void syncCommandPanel(panelEntries(scope), scope)
       .then(id => log(`command panel synced for ${scope} (${id})`))
       .catch(err => log(`command panel sync failed for ${scope}, keeping the existing one:`, err))
   }

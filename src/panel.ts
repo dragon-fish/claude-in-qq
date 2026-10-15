@@ -3,17 +3,16 @@
  * Publish the slash commands to QQ's command panel — the list that appears when
  * the operator taps "/" in the chat input.
  *
- * Run it after adding or renaming a command. Not done at startup: panels are
- * per-application and capped at 20, and a sync is a write QQ does not need on
- * every restart of a bridge whose command list changes about never.
+ * The bridge syncs both panels — private and group — at startup, updating its
+ * own panel in place; this does the same without a restart, and lists or
+ * deletes panels. Panels are per-application and capped at 20.
  *
  *   bun run panel           publish the current commands
  *   bun run panel list      show existing panels
  *   bun run panel delete <panel_id>
  */
 
-import './commands.js' // registers the commands as a side effect
-import { allCommands } from './commands.js'
+import { panelEntries } from './commands.js'
 import { deleteCommandPanel, HAS_CREDENTIALS, listCommandPanels, syncCommandPanel } from './qq.js'
 
 if (!HAS_CREDENTIALS) {
@@ -42,9 +41,9 @@ if (cmd === 'delete') {
   process.exit(0)
 }
 
-const entries = allCommands().map(c => ({ name: `/${c.name}`, desc: c.summary }))
 for (const scope of ['c2c', 'group'] as const) {
+  const entries = panelEntries(scope)
   const panelId = await syncCommandPanel(entries, scope)
   console.log(`已同步 ${entries.length} 条指令 → ${scope} ${panelId}`)
+  for (const e of entries) console.log(`  ${e.name}  ${e.desc}`)
 }
-for (const e of entries) console.log(`  ${e.name}  ${e.desc}`)

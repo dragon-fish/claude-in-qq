@@ -12,7 +12,6 @@
 
 import { listSessions } from '@anthropic-ai/claude-agent-sdk'
 import { execFileSync } from 'node:child_process'
-import { randomInt } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -62,15 +61,42 @@ export type CommandDeps = {
   restartProcess(remark: string): void
   /** Whether whoever sent this command is the owner. */
   senderIsOwner(): boolean
+  /** Which kind of chat the command was sent in. */
+  where(): CommandScope
+  /**
+   * The group's shown name and where it came from: the owner's override, the
+   * name QQ reports, or the openid's head when neither exists. Null in private chat.
+   */
+  groupName(): { name: string; source: 'owner' | 'qq' | 'openid' } | null
+  /** Set the owner's override for the group's name, or clear it with null. */
+  setGroupName(name: string | null): void
+  /**
+   * QQ's group info and this bot's state in the group, each the parsed
+   * response or, when the lookup failed, why.
+   */
+  groupInfo(): Promise<{ info: Record<string, any> | string; bot: Record<string, any> | string }>
   /** A member's display name: from the message's own mentions, then from group history. */
   nameOf(openid: string): string | null
   listOps(): { openid: string; remark: string }[]
+  listNicknames(): string[]
+  addNickname(nickname: string): 'added' | 'exists'
+  removeNickname(nickname: string): 'removed' | 'absent'
   addOp(openid: string, remark: string): 'added' | 'updated' | 'owner'
   removeOp(openid: string): 'removed' | 'owner' | 'absent'
 }
 
+/** A chat kind, and also the only one a command may be limited to. */
+export type CommandScope = 'private' | 'group'
+
 export type Command = {
   name: string
+  /**
+   * The only kind of chat this command runs in; both when absent. Process-level
+   * commands are `private`: a group conversation is one of several sharing the
+   * process, and restarting or re-pointing the process is the owner's call to
+   * make where only the owner reads.
+   */
+  scope?: CommandScope
   /**
    * Extra names that reach this command when typed. Deliberately kept out of
    * the QQ command panel: that panel is capped at 20 entries, and an alias is
@@ -98,6 +124,19 @@ export function register(...commands: Command[]): void {
 /** Registration order, which is the order /help and the QQ command panel show. */
 export function allCommands(): Command[] {
   return [...registry.values()]
+}
+
+const usableIn = (c: Command, where: CommandScope) => !c.scope || c.scope === where
+
+/**
+ * The command panel for one QQ scope. The group panel lists only what runs in
+ * a group; the private one lists everything, group-only commands included,
+ * since the owner reads it to learn what exists.
+ */
+export function panelEntries(scope: 'c2c' | 'group'): { name: string; desc: string }[] {
+  return allCommands()
+    .filter(c => scope === 'c2c' || usableIn(c, 'group'))
+    .map(c => ({ name: `/${c.name}`, desc: c.summary }))
 }
 
 /** Format a number with thousands separators. */
@@ -261,6 +300,7 @@ register(
     async run(_arg, deps) {
       const lines = ['**可用指令**']
       for (const c of registry.values()) {
+        if (!usableIn(c, deps.where())) continue
         // The command panel lists real names only, so this is where an alias
         // becomes findable at all. Bulleted because a long entry wraps on a
         // phone, and without the bullet the tail of one command reads as the
@@ -547,6 +587,7 @@ register(
   {
     name: 'resume',
     aliases: ['r'],
+    scope: 'private',
     usage: '/resume',
     summary: '从历史会话里挑一个恢复',
     async run(_arg, deps) {
@@ -644,22 +685,9 @@ register(
 
   {
     name: 'restart',
+    aliases: ['reload'],
+    scope: 'private',
     usage: '/restart [附言]',
-    summary: '重启 bridge 进程（需回确认码）',
-    async run(arg, deps) {
-      const supervisor = deps.supervisor()
-      if (!supervisor) return refuseUnsupervised(deps)
-      const code = String(randomInt(0, 1_000_000)).padStart(6, '0')
-      pendingRestart = { code, expires: Date.now() + RESTART_WINDOW_MS, remark: arg }
-      await deps.reply(
-        `60 秒内发送 \`${code}\` 确认重启，码后可以再附一句话，重启后连同附言一起交给 agent。进程退出后，${SUPERVISOR_WORDS[supervisor]}；正在进行的回复会被打断，会话会自动接回。`,
-      )
-    },
-  },
-
-  {
-    name: 'reload',
-    usage: '/reload [附言]',
     summary: '立即重启 bridge 进程，加载新代码',
     async run(arg, deps) {
       const supervisor = deps.supervisor()
@@ -728,6 +756,92 @@ register(
   },
 
   {
+    name: 'group',
+    scope: 'group',
+    usage: '/group name [set [群名]] | info',
+    summary: '这个群的名字和信息',
+    async run(arg, deps) {
+      const usage =
+        '用法：`/group name` 查看群名，`/group name set <群名>` 自定义群名，' +
+        '`/group name set` 清除自定义，`/group info` 查看群信息'
+      const [, rawSub = '', rest = ''] = /^(\S*)\s*([\s\S]*)$/.exec(arg) ?? []
+      const sub = rawSub.toLowerCase()
+
+      if (sub === 'info') {
+        await deps.reply(await groupInfoText(deps))
+        return
+      }
+      if (sub !== 'name') {
+        await deps.reply(usage)
+        return
+      }
+
+      const [, action = '', value = ''] = /^(\S*)\s*([\s\S]*)$/.exec(rest) ?? []
+      if (!action) {
+        const shown = deps.groupName()!
+        await deps.reply(`这个群显示为「${shown.name}」（${NAME_SOURCE[shown.source]}）。`)
+        return
+      }
+      if (action.toLowerCase() !== 'set') {
+        await deps.reply(usage)
+        return
+      }
+      // One line, and short: it is shown in the context of every turn and on
+      // every card that comes from this group.
+      const name = value.replace(/\s+/g, ' ').trim().slice(0, 30)
+      deps.setGroupName(name || null)
+      const shown = deps.groupName()!
+      if (name) {
+        deps.noteToAgent(`主人把这个群的显示名设为「${name}」。`)
+        await deps.reply(`已把这个群的显示名设为「${name}」。`)
+      } else {
+        deps.noteToAgent(`主人清除了这个群的自定义名字，现在显示为「${shown.name}」。`)
+        await deps.reply(`已清除自定义群名，现在显示为「${shown.name}」（${NAME_SOURCE[shown.source]}）。`)
+      }
+    },
+  },
+
+  {
+    name: 'nick',
+    usage: '/nick add|remove|list [昵称]',
+    summary: '管理能代替 @ 叫我的昵称',
+    async run(arg, deps) {
+      if (!deps.senderIsOwner()) {
+        await deps.reply('只有主人能管理昵称。')
+        return
+      }
+      const [, rawSub = '', rest = ''] = /^(\S*)\s*([\s\S]*)$/.exec(arg) ?? []
+      const sub = rawSub.toLowerCase() || 'list'
+      const nickname = rest.trim()
+
+      if (sub === 'list' || sub === 'ls') {
+        const nicks = deps.listNicknames()
+        await deps.reply(
+          nicks.length
+            ? `**昵称**（op 的群消息以昵称开头就等于 @ 我）\n${nicks.map(n => `- ${n}`).join('\n')}`
+            : '还没有昵称，用 `/nick add <昵称>` 加一个。',
+        )
+        return
+      }
+      if ((sub !== 'add' && sub !== 'remove' && sub !== 'rm') || !nickname) {
+        await deps.reply('用法：`/nick add <昵称>`、`/nick remove <昵称>`、`/nick list`')
+        return
+      }
+      if (sub === 'add') {
+        // A message opening with a slash is a command; a nickname that did
+        // would turn the owner's commands into turns.
+        if (nickname.startsWith('/')) {
+          await deps.reply('昵称不能以 `/` 开头。')
+          return
+        }
+        await deps.reply(deps.addNickname(nickname) === 'added' ? `已添加昵称「${nickname}」。` : `「${nickname}」已经是昵称了。`)
+        return
+      }
+      await deps.reply(deps.removeNickname(nickname) === 'removed' ? `已移除昵称「${nickname}」。` : `「${nickname}」不是昵称。`)
+    },
+  },
+
+  {
     name: 'version',
     aliases: ['v', 'ver'],
     usage: '/version',
@@ -749,14 +863,64 @@ register(
   },
 )
 
+// ---------------------------------------------------------------------- group
+
+const NAME_SOURCE = {
+  owner: '主人设置的名字',
+  qq: 'QQ 上的群名',
+  openid: '没拿到群名，用 openid 前 8 位代替',
+}
+
+const RECV_SETTING: Record<string, string> = {
+  all: '全部消息',
+  only_mention: '只收 @ 本 bot 的消息',
+  mention_and_context: '@ 本 bot 的消息及其上下文',
+}
+
+const ROLE: Record<string, string> = { owner: '群主', admin: '管理员', member: '成员' }
+
+async function groupInfoText(deps: CommandDeps): Promise<string> {
+  const { info, bot } = await deps.groupInfo()
+  const shown = deps.groupName()!
+  const lines = ['**群信息**', `显示名：${shown.name}（${NAME_SOURCE[shown.source]}）`]
+  if (typeof info === 'string') lines.push(`群资料：查询失败（${info}）`)
+  else {
+    if (info.group_name && info.group_name !== shown.name) lines.push(`QQ 群名：${info.group_name}`)
+    if (typeof info.group_member_num === 'number') lines.push(`成员数：${info.group_member_num}`)
+  }
+  if (typeof bot === 'string') lines.push(`本 bot 状态：查询失败（${bot}）`)
+  else {
+    if (bot.member_role) lines.push(`本 bot 身份：${ROLE[bot.member_role] ?? bot.member_role}`)
+    if (bot.recv_msg_setting) {
+      lines.push(`接收消息：${RECV_SETTING[bot.recv_msg_setting] ?? bot.recv_msg_setting}（\`${bot.recv_msg_setting}\`）`)
+    }
+    if (typeof bot.allow_proactive_msg === 'boolean') lines.push(`允许主动消息：${bot.allow_proactive_msg ? '是' : '否'}`)
+  }
+
+  // The model is only known to a live session; a parked one has none to ask.
+  let model = '会话未运行'
+  const q = deps.query()
+  if (q) {
+    try {
+      model = `\`${(await q.getContextUsage())?.model ?? '?'}\``
+    } catch {
+      model = '?'
+    }
+  }
+  lines.push(
+    '',
+    `工作目录：\`${deps.workdir()}\``,
+    `模型：${model}`,
+    `权限模式：\`${deps.permissionMode()}\``,
+    `verbose：\`${deps.verbose()}\``,
+  )
+  return lines.join('\n')
+}
+
 // ------------------------------------------------------------------- restart
 //
-// /restart takes a code typed back within a minute; /reload goes at once.
 // Without a supervisor the process would simply die and nothing would answer
-// QQ until someone reached the machine, so both refuse that case.
-
-const RESTART_WINDOW_MS = 60_000
-let pendingRestart: { code: string; expires: number; remark: string } | null = null
+// QQ until someone reached the machine, so /restart refuses that case.
 
 async function refuseUnsupervised(deps: CommandDeps): Promise<void> {
   await deps.reply(
@@ -768,32 +932,6 @@ async function refuseUnsupervised(deps: CommandDeps): Promise<void> {
 const SUPERVISOR_WORDS = {
   launchd: 'launchd 会立刻把它拉起来',
   schtasks: '计划任务的 watchdog 会在一分钟内把它拉起来',
-}
-
-/**
- * Consume `text` if it answers a pending /restart. Returns false for anything
- * else, so ordinary messages pass through untouched.
- */
-export async function confirmRestart(text: string, deps: CommandDeps): Promise<boolean> {
-  if (!pendingRestart) return false
-  if (Date.now() > pendingRestart.expires) {
-    pendingRestart = null
-    return false
-  }
-  // The code leads the message; anything after it is a remark for the agent.
-  const m = /^\s*(\d{6})(?!\d)\s*([\s\S]*)$/.exec(text)
-  if (!m) return false
-
-  const ok = m[1] === pendingRestart.code
-  const remark = [pendingRestart.remark, m[2].trim()].filter(Boolean).join('\n')
-  pendingRestart = null
-  if (!ok) {
-    await deps.reply('确认码不对，这次重启已作废。要重启请重新发 `/restart`。')
-    return true
-  }
-  await deps.reply('🔄 正在重启，稍后自动接回。')
-  deps.restartProcess(remark)
-  return true
 }
 
 /**
@@ -810,6 +948,12 @@ export async function dispatch(text: string, deps: CommandDeps): Promise<boolean
   if (!cmd) return false
 
   const arg = (m[2] ?? '').trim()
+  if (!usableIn(cmd, deps.where())) {
+    await deps.reply(
+      cmd.scope === 'private' ? `\`/${cmd.name}\` 只能在私聊里用。` : `\`/${cmd.name}\` 只能在群里用。`,
+    )
+    return true
+  }
   // Recorded before running: a command that throws still happened, and the
   // agent is better off knowing it was attempted.
   deps.recordCommand(cmd.name, arg)
