@@ -12,7 +12,7 @@
 
 import { createSdkMcpServer, query, tool } from '@anthropic-ai/claude-agent-sdk'
 import { z } from 'zod'
-import { allCommands, confirmRestart, dispatch, type CommandDeps } from './commands.js'
+import { allCommands, buildHead, confirmRestart, dispatch, type CommandDeps } from './commands.js'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { homedir, uptime } from 'node:os'
 import { join } from 'node:path'
@@ -1959,6 +1959,37 @@ function deliverWakeNote(): void {
   )
 }
 
+// ------------------------------------------------------------ crash rollback
+//
+// The launch scripts in service/ count launches in `crash-count` and, after
+// three that never got here, check out `last-good-commit`. Both files are only
+// meaningful to that pair, so the format stays a bare number and a bare hash.
+
+const CRASH_COUNT_FILE = join(STATE_DIR, 'crash-count')
+const LAST_GOOD_FILE = join(STATE_DIR, 'last-good-commit')
+/** How long a process has to stay up before its commit counts as good. */
+const HEALTHY_AFTER_MS = 60_000
+
+function resetCrashCount(): void {
+  try {
+    writeFileSync(CRASH_COUNT_FILE, '0\n')
+  } catch (err) {
+    log('crash count reset failed:', err)
+  }
+}
+
+function markHealthy(): void {
+  resetCrashCount()
+  const head = buildHead()
+  if (!head) return
+  try {
+    writeFileSync(LAST_GOOD_FILE, `${head}\n`)
+    log(`healthy for ${HEALTHY_AFTER_MS / 1000}s, last good commit ${head.slice(0, 7)}`)
+  } catch (err) {
+    log('last good commit not recorded:', err)
+  }
+}
+
 async function main(): Promise<void> {
   const state = loadState()
   workdir = state.workdir ?? process.env.QQ_BRIDGE_CWD ?? homedir()
@@ -2003,6 +2034,8 @@ async function main(): Promise<void> {
 
   await connectGateway({ onMessage: handleMessage, onButton: handleButton })
   log(`bridge up, workdir=${workdir}, mode=${permissionMode}, state=${STATE_DIR}`)
+
+  setTimeout(markHealthy, HEALTHY_AFTER_MS).unref()
 
   // After the restart notice is set, so the note and the notice arrive together.
   try {
@@ -2063,6 +2096,8 @@ async function shutdown(signal: string): Promise<void> {
   // launchd losing patience, and the successor reads the *absence* of this as
   // "died without warning" — so it has to be on disk before anything can fail.
   patchState({ stopped_at: Date.now(), stopped_by: signal, stopped_error: null })
+  // A deliberate stop is not a crash, however soon after start it comes.
+  resetCrashCount()
   setTimeout(() => process.exit(0), SHUTDOWN_GRACE_MS).unref()
   try {
     // Only when a reply was actually in flight. A restart while idle needs no

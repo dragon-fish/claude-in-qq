@@ -211,11 +211,15 @@ const BUILD = (() => {
   }
   return {
     commit: git('rev-parse', '--short', 'HEAD'),
+    head: git('rev-parse', 'HEAD'),
     branch: git('rev-parse', '--abbrev-ref', 'HEAD'),
     date: git('log', '-1', '--format=%cd', '--date=format:%Y-%m-%d %H:%M'),
     dirty: git('status', '--porcelain') !== '',
   }
 })()
+
+/** Full hash of the commit this process started on, or '' outside a repo. */
+export const buildHead = () => BUILD.head
 
 /** The SDK actually installed, which is not necessarily the range in package.json. */
 const SDK_VERSION = (() => {
@@ -633,23 +637,28 @@ register(
 
   {
     name: 'restart',
-    aliases: ['reload'],
     usage: '/restart [附言]',
-    summary: '重启 bridge 进程，加载新代码',
+    summary: '重启 bridge 进程（需回确认码）',
     async run(arg, deps) {
       const supervisor = deps.supervisor()
-      if (!supervisor) {
-        await deps.reply(
-          '这个进程不是由系统服务启动的，退出后没有东西会把它拉起来，所以不执行。' +
-            '用 `service/install.sh`（Windows 用 `service/install.ps1`）装成服务后再试。',
-        )
-        return
-      }
+      if (!supervisor) return refuseUnsupervised(deps)
       const code = String(randomInt(0, 1_000_000)).padStart(6, '0')
       pendingRestart = { code, expires: Date.now() + RESTART_WINDOW_MS, remark: arg }
       await deps.reply(
         `60 秒内发送 \`${code}\` 确认重启，码后可以再附一句话，重启后连同附言一起交给 agent。进程退出后，${SUPERVISOR_WORDS[supervisor]}；正在进行的回复会被打断，会话会自动接回。`,
       )
+    },
+  },
+
+  {
+    name: 'reload',
+    usage: '/reload [附言]',
+    summary: '立即重启 bridge 进程，加载新代码',
+    async run(arg, deps) {
+      const supervisor = deps.supervisor()
+      if (!supervisor) return refuseUnsupervised(deps)
+      await deps.reply(`🔄 正在重启，${SUPERVISOR_WORDS[supervisor]}。`)
+      deps.restartProcess(arg)
     },
   },
 
@@ -677,13 +686,19 @@ register(
 
 // ------------------------------------------------------------------- restart
 //
-// A restart cuts off whatever the agent is doing, and a tap on the command
-// panel is easy to make by accident, so it takes a code typed back within a
-// minute. Without a supervisor the process would simply die and nothing would
-// answer QQ until someone reached the machine, so that case is refused.
+// /restart takes a code typed back within a minute; /reload goes at once.
+// Without a supervisor the process would simply die and nothing would answer
+// QQ until someone reached the machine, so both refuse that case.
 
 const RESTART_WINDOW_MS = 60_000
 let pendingRestart: { code: string; expires: number; remark: string } | null = null
+
+async function refuseUnsupervised(deps: CommandDeps): Promise<void> {
+  await deps.reply(
+    '这个进程不是由系统服务启动的，退出后没有东西会把它拉起来，所以不执行。' +
+      '用 `service/install.sh`（Windows 用 `service/install.ps1`）装成服务后再试。',
+  )
+}
 
 const SUPERVISOR_WORDS = {
   launchd: 'launchd 会立刻把它拉起来',

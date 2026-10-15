@@ -33,7 +33,7 @@ harness 本身：同一套工具、同样的 skills 和 hooks、一样的权限�
   所以长任务不会把答案埋掉，也不额外花消息条数。`/verbose` 可切三档：完整过程 / 只报进度 / 只要答案
 - **审批**：工具调用弹按钮，点「允许」或「拒绝」。默认 `auto` 模式，只有模型判定有风险的操作才问
 - **提问**：Claude 需要你拿主意时会推一组按钮出来，等同于 TUI 里的 AskUserQuestion
-- **斜杠指令**：`/help` `/stop` `/clear` `/context` `/usage` `/model` `/mode` `/verbose` `/resume` `/cwd` `/status` `/version` `/restart`。`/restart` 只在以服务方式运行时可用（launchd 或 Windows 计划任务），会回一个 6 位确认码，60 秒内把它发回来才会重启进程，用于在 QQ 里加载新代码；别名 `/reload`。`/restart 附言` 或「确认码 附言」（码必须在开头）会把附言写进唤醒便条 `wake.md`：新进程起来后若该文件非空，就把内容交给 agent 自动接续并通知你，随后清空文件，原文留在 `wake.md.last`。agent 自己重启前也会往里写交接。
+- **斜杠指令**：`/help` `/stop` `/clear` `/context` `/usage` `/model` `/mode` `/verbose` `/resume` `/cwd` `/status` `/version` `/reload` `/restart`。`/reload` 立即重启进程、加载新代码；`/restart` 同样效果，但要先回一个 6 位确认码（60 秒内，码必须在消息开头）。两者都只在以服务方式运行时可用（launchd 或 Windows 计划任务）。`/reload 附言`、`/restart 附言` 或「确认码 附言」会把附言写进唤醒便条 `wake.md`：新进程起来后若该文件非空，就把内容交给 agent 自动接续并通知你，随后清空文件，原文留在 `wake.md.last`。agent 自己重启前也会往里写交接。
   启动时自动注册进 QQ 的指令面板，在聊天里点「/」直接选，不用记也不用手动同步。
   常用的另有手打别名（`/cl` `/new` → `/clear`，`/cd` → `/cwd`，`/ctx` → `/context` 等，`/help` 里列全）；
   别名不进面板，撞上正式命令名时正式的优先
@@ -149,10 +149,16 @@ launchctl print gui/$UID/local.claude-in-qq | grep -E 'state|runs'
 日常操作：
 
 ```bash
-launchctl kickstart -k gui/$UID/local.claude-in-qq    # 重启（改完代码用这个；在 QQ 里可用 /restart）
+launchctl kickstart -k gui/$UID/local.claude-in-qq    # 重启（改完代码用这个；在 QQ 里可用 /reload）
 launchctl bootout   gui/$UID/local.claude-in-qq       # 停止并卸载
 tail -f ~/.claude/channels/qq/bridge.log              # 日志
 ```
+
+**崩溃自动回滚**（macOS、Windows 的启动脚本都有）：bridge 稳定运行 60 秒后把当前 commit 记进状态目录的
+`last-good-commit`。启动脚本每次启动给 `crash-count` 加一，bridge 稳定或正常退出时清零。连续 3 次没撑到
+60 秒、且当前 HEAD 不是那个好版本时，启动脚本 `git stash -u` 收起工作区、`git checkout --detach` 到好版本
+（`bun.lock` 不同则先 `bun install`），并写一份唤醒便条：好版本起来后 agent 会说明情况，附上崩溃日志尾部。
+分支和坏提交都不动，修好后 `git checkout <原分支>`、`git stash pop` 即可回去。
 
 #### Windows
 
