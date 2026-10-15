@@ -17,6 +17,16 @@
   不必是 @ 本 bot 的那条。群主动消息实测连发 5 条全部成功
   （2025 文档写的每群每月 4 条已不适用，真实上限未知）。
 - 本 bot 自己发的群消息不会作为事件推回给自己。发送成功的响应带 `ext_info.ref_idx`，可能与引用回复有关。
+- `GROUP_AT_MESSAGE_CREATE` 的 content 已去掉对本 bot 的 @（`" test"`），且不带 `mentions`。开启全量消息后，
+  @ 本 bot 只推一条 `GROUP_MESSAGE_CREATE`（content 保留 `<@本bot>`，`mentions` 里 `is_you: true`），不另推 AT 事件。
+- `message_scene.ext` 带 `msg_idx=REFIDX_…`；`timestamp` 为 RFC3339、精确到秒。事件里没有群名。
+
+官方文档（2026 版 autogen 页）写明、未实测：
+
+- 群消息不支持流式参数，也没有群的 `stream_messages` 接口（该页 302）。群回复只能普通发送。
+- 群主动消息：每群每分钟 20 条、每天 1000 条。
+- 群文件上传 `/v2/groups/{group_openid}/files` 与单聊同参（`file_type` / `file_data` / `file_name`）。
+- 同一 msg_id 可能重复推送，需去重。
 
 ## 身份与权限
 
@@ -39,7 +49,8 @@
 - 每个对话一个独立的 Claude 会话：私聊一个，每个群各一个。session id、工作目录、模型、权限模式按对话分别保存。
 - 群会话空闲 30 分钟关闭，下次触发按 session id 恢复。
 - 群会话并发上限默认 2（可配置），超出的排队；私聊不占名额。
-- 斜杠命令作用于发出它的对话，群里只有主人能用；op 发的斜杠命令当普通消息交给 agent。审批统一发到主人私聊。
+- 斜杠命令作用于发出它的对话，群里只有主人能用（且要 @ 本 bot）；op 发的斜杠命令当普通消息交给 agent。
+  审批和 `qq_ask` 统一发到主人私聊，卡片注明来自哪个群。
 - 工作目录、模型、权限模式、verbose 按会话持久保存，在哪个对话里设就对哪个生效（如在 IPE 群里 `/cwd` 到
   IPE 仓库，该群此后一直在那里）。新群默认：verbose `off`，工作目录 `~`，模型与权限模式取全局默认。
 - 重启后只有写了唤醒便条的会话会被主动拉起；其余群会话等下次被 @ 时才恢复，那一轮附带重启提示，不主动发言。
@@ -53,33 +64,59 @@
 
 ```xml
 <turn_context>
-来源：群「测试群」(group_openid) / 私聊
-发言人：机智的小鱼君⚡️ (member_openid)，主人：是/否，bot：是/否
-时间：…
-最近群消息：（最近 10 条，触发消息之前）
+来源：群 642E2EF6E499C6B0E4C500F634C0F9CE        <!-- 私聊时为「来源：私聊」 -->
+发言人：机智的小鱼君⚡️ (8C072A8C…)，主人：是，bot：否
+时间：2026/10/16 00:59:32
+最近群消息（触发消息之前 4 条，旧→新）：           <!-- 仅群聊；最多 10 条 -->
+[00:59:25] 机智的小鱼君⚡️ (8C072A8C…) [主人]：/echo 一条来自sili的消息
+[00:59:26] SILI Official (47B30E3E…) [op][bot]：一条来自sili的消息
 </turn_context>
-<quoted_message author="…" message_id="…">…</quoted_message>   <!-- 仅引用时 -->
-<user_message>原话（@ 已转为 @昵称）</user_message>
+<user_message>
+@Claude @MacBook aaa
+</user_message>
 ```
 
-operator context 增加一节说明各块含义：只回应 `<user_message>`；不复述 `<turn_context>`；非主人发言时的行为准则。
+- 私聊和群聊的每条入站消息都包装；`<@id>` 渲染为 `@昵称`（消息自带的名字，其次 op 备注，其次历史里见过的名字）。
+- 历史行每条截 200 字、换行折成 ` ⏎ `；本 bot 自己的消息显示为「你（本 bot）」。
+- 不可信文本里的 `<turn_context` / `<user_message` / `<system-reminder` 等框架标签被改成全角 `＜`，防止伪造。
+- 事件不带群名，来源只写 group_openid。
+- `<quoted_message>` 未实现，见「待验证」。
+
+operator context 有一节说明各块含义：只回应 `<user_message>`；不复述 `<turn_context>`；非主人发言时的行为准则。
 
 ## 群历史
 
-- `node:sqlite`（bun ≥ 1.4 支持；不用 `bun:sqlite`，运行时私有接口），库在状态目录 `history.db`。表：`messages(group_openid, message_id, author_openid,
-  author_name, is_bot, content, mentions_json, created_at)`。每群保留 30 天，启动时和每小时清理一次。
-- 工具 `qq_group_history(group?, limit?, before_message_id?, query?)`：默认当前会话所在群，返回带 id 的消息列表。
-- 本 bot 自己发到群里的消息也入库。
+- `node:sqlite`（bun ≥ 1.4 支持；不用 `bun:sqlite`，运行时私有接口），库在状态目录 `history.db`，代码在 `src/history.ts`。
+  表：`messages(group_openid, message_id, author_openid, author_name, is_bot, is_self, content, mentions_json,
+  ref_idx, created_at)`，主键 `(group_openid, message_id)`，按 rowid（到达顺序）排序。保留 30 天，启动时和每小时清理一次。
+- 收到的每条群消息都入库（含其他 bot、非 op），入库同时做去重：重复推送的 msg_id 不再触发。
+- 本 bot 发到群里的消息（文字和文件）发送成功后入库，`is_self = 1`，`ref_idx` 取响应的 `ext_info.ref_idx`；
+  入站消息的 `ref_idx` 取 `msg_idx`。
+- 工具 `qq_group_history(group?, limit?, before_message_id?, query?)`：默认当前会话所在群；私聊里不给 `group`
+  时列出库里有哪些群。返回旧→新、每行带 message id。`query` 是内容或发送者名字的子串。
 
 ## 群里的回复
 
-- 默认挂在触发消息上被动回复；能流式就流式，不能则按现有逻辑退回普通发送。
-- 主动发起（如主人在私聊里让它去群里找另一个 bot）时，挂在该群最近 5 分钟内的任一条消息上；没有则同下。
-- 被动窗口过期后先试群主动消息；失败则发到主人私聊，注明来自哪个群、回复的是哪条消息。
-- agent 输出里的 `<@member_openid>` 原样保留为 QQ @；`@备注名`（op 列表里的）转成 `<@id>`。
+- 不流式：一轮的文字攒在一起，到封口时（轮次结束、`MEDIA:` 行、插入的独立消息、新消息进入会话）作为一条普通消息发出，
+  超过 1500 字分条。`MEDIA:` 文件走群上传接口，仍插在正文对应位置。
+- 每次发送挂在该群最近收到、5 分钟窗口内（留 10 秒余量）还有次数的消息上被动回复，每条最多 5 次；没有则发群主动消息。
+  候选只在内存里，重启后丢失至多 5 分钟的窗口。
+- 群发送失败时，原文转发到主人私聊，注明群和触发这一轮的消息。
+- agent 输出里的 `<@member_openid>` 原样保留；`@备注名`（op 列表里的）转成 `<@id>`，长备注优先匹配。
 
-## 待实现时验证
+## 尚未实现
 
-- bot 发出的 `<@id>` 能否让对方 bot 收到 `is_you: true`。
-- 群消息能否用流式接口。
-- 引用回复在事件里的字段（`message_reference` 或其他）。
+- 群会话并发上限与空闲关闭（接口在 `index.ts` 的 `ensureServing`；目前群会话一旦启动就常驻）。
+- bot 之间来回轮数上限。
+- 按会话分开的唤醒便条（目前只有私聊的 `wake.md`）。
+
+## 待验证
+
+- bot 发出的 `<@id>` 能否渲染成 @、能否让对方 bot 收到 `is_you: true`。2025 文档称 `<@id>` 即将弃用、
+  改用 `<qqbot-at-user id="" />`；换格式只需改 `qq.ts` 的 `toGroupMentions`。
+- 引用回复的字段。2026 版文档写的是 `message_type: 103`、被引用内容在 `msg_elements[]`、`message_scene.ext`
+  带 `ref_msg_idx`，但抓到的真实事件里还没有引用。`message_type` 非 0 的群事件会额外写进
+  `unhandled-events.jsonl`，在群里引用一条消息再 @ 本 bot 即可拿到样本；历史库已存 `ref_idx`，可据此还原被引用的消息。
+- 群 markdown（`msg_type: 2`）发送、群文件上传未在真实群里跑过；单聊同参的路径是实测可用的。
+- 文档写二进制直传上限 5MB，代码沿用单聊的 30MB 上限。
+- 未开全量消息时，同一条 @ 是否会同时以两个不同 msg_id 推送（目前按 msg_id 去重）。

@@ -33,7 +33,7 @@ harness 本身：同一套工具、同样的 skills 和 hooks、一样的权限�
   所以长任务不会把答案埋掉，也不额外花消息条数。`/verbose` 可切三档：完整过程 / 只报进度 / 只要答案
 - **审批**：工具调用弹按钮，点「允许」或「拒绝」。默认 `auto` 模式，只有模型判定有风险的操作才问
 - **提问**：Claude 需要你拿主意时会推一组按钮出来，等同于 TUI 里的 AskUserQuestion
-- **斜杠指令**：`/help` `/stop` `/clear` `/context` `/usage` `/model` `/mode` `/verbose` `/resume` `/cwd` `/status` `/version` `/reload` `/restart`。`/reload` 立即重启进程、加载新代码；`/restart` 同样效果，但要先回一个 6 位确认码（60 秒内，码必须在消息开头）。两者都只在以服务方式运行时可用（launchd 或 Windows 计划任务）。`/reload 附言`、`/restart 附言` 或「确认码 附言」会把附言写进唤醒便条 `wake.md`：新进程起来后若该文件非空，就把内容交给 agent 自动接续并通知你，随后清空文件，原文留在 `wake.md.last`。agent 自己重启前也会往里写交接。
+- **斜杠指令**：`/help` `/stop` `/clear` `/context` `/usage` `/model` `/mode` `/verbose` `/resume` `/cwd` `/status` `/version` `/op` `/reload` `/restart`。`/reload` 立即重启进程、加载新代码；`/restart` 同样效果，但要先回一个 6 位确认码（60 秒内，码必须在消息开头）。两者都只在以服务方式运行时可用（launchd 或 Windows 计划任务）。`/reload 附言`、`/restart 附言` 或「确认码 附言」会把附言写进唤醒便条 `wake.md`：新进程起来后若该文件非空，就把内容交给 agent 自动接续并通知你，随后清空文件，原文留在 `wake.md.last`。agent 自己重启前也会往里写交接。
   启动时自动注册进 QQ 的指令面板，在聊天里点「/」直接选，不用记也不用手动同步。
   常用的另有手打别名（`/cl` `/new` → `/clear`，`/cd` → `/cwd`，`/ctx` → `/context` 等，`/help` 里列全）；
   别名不进面板，撞上正式命令名时正式的优先
@@ -44,13 +44,18 @@ harness 本身：同一套工具、同样的 skills 和 hooks、一样的权限�
   扩展的话，它能直接操作你本机的 Chrome，沿用里面的登录状态。要求 CC 用 `/login` 登录（API Key 和
   `setup-token` 的长期 token 不行）；没装扩展或 Chrome 没开时，浏览器工具只会报未连接，其余照常
 - **不掉线**：会话 ID 落盘，重启机器后接着上次的上下文聊
+- **群聊**：把 bot 拉进群，op（主人，加上主人用 `/op add` 指定的人或其他 bot）@ 它就开一轮对话，
+  每个群一个独立会话，工作目录、模型、权限模式、verbose 按群分别保存（新群默认 `~`、verbose `off`）。
+  群里所有消息（含其他 bot 的）存进本地 `history.db` 保留 30 天，agent 用 `qq_group_history` 查；每轮还会
+  附上触发前的 10 条。群消息不能流式，一轮的回复攒成一条发出；`MEDIA:` 照样能发文件。审批和提问仍发到
+  主人私聊，群里只有主人能用斜杠指令。详见 [docs/group-chat.md](docs/group-chat.md)
 - **捎话**（可选）：本机任意目录的其他 CC 会话可以借这条通道给你发通知（见下）
 
 ## 架构
 
 ```
 QQ 手机客户端
-   │  C2C 私聊 / 按钮点击
+   │  私聊 / 群消息 / 按钮点击
    ▼
 腾讯开放平台 WebSocket 网关
    │
@@ -70,6 +75,8 @@ src/index.ts ──── Claude Agent SDK ──── Claude Code（订阅额�
 | `src/index.ts`    | 主循环：消息进 SDK、事件出 QQ、审批与提问的中继 |
 | `src/qq.ts`       | 协议层，只认 QQ 不认 Claude                     |
 | `src/commands.ts` | 斜杠指令注册表                                  |
+| `src/turn.ts`     | 哪些群消息触发一轮、每条消息怎么包装给 agent    |
+| `src/history.ts`  | 群消息历史（`node:sqlite`）                     |
 | `src/notify.ts`   | 单向通知入口，不经过主进程                      |
 | `src/onboard.ts`  | 扫码配置                                        |
 | `src/panel.ts`    | 把斜杠指令注册进 QQ 指令面板                    |
@@ -116,12 +123,15 @@ bun run onboard
 
 ### 3. 给别人授权（可选）👤 需要用户
 
-之后再有人给 bot 发消息，只会拿到一个配对码，必须有人在这台机器上批准：
+白名单为空时，给 bot 发消息的人会拿到一个配对码，必须有人在这台机器上批准：
 
 ```bash
 bun run pair             # 看白名单和待配对
 bun run pair <code>      # 批准
 ```
+
+白名单一旦非空，陌生人私聊既不回复也不记录，不再发配对码。要再加人，在本机编辑状态目录里
+`access.json` 的 `allowed`。
 
 这条路径故意不走 QQ：白名单成员同时拥有批准工具调用的权限，让一条聊天消息就能授权，白名单就形同虚设。
 **agent 不应替用户做这个决定**——这是在授予某人操作这台电脑的权力。
@@ -249,6 +259,8 @@ skills/install.sh --uninstall   # 卸
 ## 安全模型
 
 - **白名单即审批权**。能发消息的人就能批准工具调用，所以只加自己
+- **群里的 op 只能 @ 它开一轮对话**：不能审批、不能回答提问、不能用斜杠指令。agent 知道每条消息是谁发的、
+  是不是主人，会拒绝可能损害主人的请求——但这一层只靠提示词约束，工具调用本身照常走审批
 - `access.json` 缺失或损坏时按空白名单处理（拒绝所有），不是放行
 - 待审批的工具入参放在围栏代码块里，免得内容自己伪装成 markdown，让你看不清在批什么
 - 默认 `auto` 权限模式。`/mode` 可切 `default`（每个危险操作都问），但不提供 `bypassPermissions`——
