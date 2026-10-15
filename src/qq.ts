@@ -1017,6 +1017,24 @@ export async function sendFile(
 
 // -------------------------------------------------------------------- gateway
 
+/**
+ * Events this bridge does not act on yet (group messages, mostly), kept whole
+ * so what QQ actually sends can be read off disk instead of guessed from docs
+ * that stop at 2025. Content is clipped; the fields around it are the point.
+ */
+const UNHANDLED_FILE = join(STATE_DIR, 'unhandled-events.jsonl')
+
+function recordUnhandledEvent(type: string, d: Record<string, any>): void {
+  try {
+    const clipped = typeof d.content === 'string' ? { ...d, content: d.content.slice(0, 200) } : d
+    appendFileSync(UNHANDLED_FILE, `${JSON.stringify({ at: new Date().toISOString(), t: type, d: clipped })}\n`)
+    log(`unhandled event ${type}`)
+  } catch (err) {
+    log('unhandled event not recorded:', err)
+  }
+}
+
+
 export type InboundMessage = {
   id: string
   content: string
@@ -1150,7 +1168,10 @@ export async function connectGateway(handlers: GatewayHandlers, attempt = 0): Pr
         } catch (err) {
           log('interaction handling failed:', err)
         }
+        return
       }
+
+      recordUnhandledEvent(payload.t, d)
     })
 
     ws.addEventListener('close', () => {
