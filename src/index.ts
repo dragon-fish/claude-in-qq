@@ -965,7 +965,14 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
   dropExpiredPending(access)
 
   if (!(access.policy === 'open' || access.allowed.includes(msg.openid))) {
-    // Unknown sender: never auto-promote. Hand out a code that only takes
+    // Once there is an owner, a stranger gets no answer and leaves nothing
+    // behind: a bot that replies to anyone is a bot anyone can make buzz the
+    // owner's machine, and a pending code is a record kept for a stranger.
+    if (access.allowed.length) {
+      log('ignoring a private message from a non-allowlisted sender')
+      return
+    }
+    // First install: never auto-promote. Hand out a code that only takes
     // effect when approved from the machine itself.
     const code = randomId(6)
     access.pending[code] = { openid: msg.openid, expires_at: Date.now() + PAIRING_TTL_MS }
