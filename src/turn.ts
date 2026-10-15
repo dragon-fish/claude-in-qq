@@ -192,7 +192,7 @@ export type TurnInput = MemberLookup & {
    * Group only: the message this one quotes. `found` is its history row when
    * the quote could be traced; otherwise only the text QQ sent along.
    */
-  quoted?: { text: string; found: HistoryMessage | null }
+  quoted?: { text: string; found: HistoryMessage | null; latestOwn?: boolean }
   speaker: Speaker
   at: number
   /** Group only: the messages before the trigger, oldest first. */
@@ -269,8 +269,13 @@ export function wrapTurn(input: TurnInput): string {
       is_bot: speaker.isBot,
     },
     time: fullTime(input.at),
+    // Quoting the bot's own last message is the cheap way to address it
+    // without an @, and that message is already in the agent's context: only
+    // a marker rides along, not the text again every turn.
     quoted: input.quoted
-      ? input.quoted.found
+      ? input.quoted.latestOwn
+        ? { self: true, latest: true }
+        : input.quoted.found
         ? historyEntry(input.quoted.found, { ...input, ref: input.at, withId: true })
         : { text: input.quoted.text, traced: false }
       : undefined,

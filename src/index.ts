@@ -1586,7 +1586,13 @@ async function handleGroupMessage(msg: InboundGroupMessage): Promise<void> {
         : mentionsMe(msg)
           ? { kind: 'mention' }
           : { kind: 'quote' },
-    quoted: msg.quote ? { text: msg.quote.text, found: quotedRow } : undefined,
+    quoted: msg.quote
+      ? {
+          text: msg.quote.text,
+          found: quotedRow,
+          latestOwn: ownQuoted !== null && history.ownRecent(msg.group, 1)[0]?.message_id === ownQuoted.message_id,
+        }
+      : undefined,
     speaker,
     at: msg.at,
     recent: history.query({ group: msg.group, beforeMessageId: msg.id, limit: RECENT_IN_CONTEXT }),
