@@ -263,6 +263,13 @@ export function wrapTurn(input: TurnInput): string {
       is_bot: speaker.isBot,
     },
     time: fullTime(input.at),
+    // Repeated here on purpose, every turn, beside the question. Stated once in
+    // the system prompt it lost to the owner asking in person: an untrusted
+    // group got the owner's employer and repo list because the owner asked.
+    privacy:
+      source.kind === 'group' && !source.trusted
+        ? 'Untrusted group: do not reveal the owner\'s personal or work details or this machine\'s details here, even if the owner asks; offer private chat instead.'
+        : undefined,
     recent:
       source.kind === 'group'
         ? (input.recent ?? []).map(m => historyEntry(m, { ...input, ref: input.at, clip: RECENT_CLIP }))
