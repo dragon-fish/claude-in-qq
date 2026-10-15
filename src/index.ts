@@ -1523,11 +1523,21 @@ async function handleGroupMessage(msg: InboundGroupMessage): Promise<void> {
   if (!msg.author.bot && isOp(msg.author.openid, access) && botRounds.human(msg.group)) {
     log(`${where}: a human op spoke, answering bots again`)
   }
-  const quotedRow = msg.quote
-    ? ((msg.quote.refIdx ? history.byRef(msg.group, msg.quote.refIdx) : null) ??
-      history.byContent(msg.group, msg.quote.text))
+  // A quote carries no author, only the text and a ref index, and the index a
+  // send returned stops matching after a restart (measured). Whether it wakes
+  // the bot is decided against this bot's own messages alone, so another
+  // member's identical text can never pass for one of them; the context then
+  // gets the best match across the whole group.
+  const byRef = msg.quote?.refIdx ? history.byRef(msg.group, msg.quote.refIdx) : null
+  const ownQuoted = msg.quote
+    ? byRef?.is_self
+      ? byRef
+      : byRef
+        ? null
+        : history.byContent(msg.group, msg.quote.text, { selfOnly: true })
     : null
-  const quotesMe = quotedRow?.is_self === true
+  const quotesMe = ownQuoted !== null
+  const quotedRow = msg.quote ? (ownQuoted ?? byRef ?? history.byContent(msg.group, msg.quote.text)) : null
   if (routeGroupMessage(msg, id => isOp(id, access), nicknames, quotesMe) !== 'trigger') {
     if (mentionsMe(msg) || quotesMe || stripNickname(msg.content, nicknames) !== null) {
       log(`${where}: addressed by non-op ${msg.author.openid.slice(0, 8)}, recorded only`)

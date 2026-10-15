@@ -169,16 +169,19 @@ export class History {
    * `ref_msg_idx` a later quote of that message carries (measured). Exact
    * text first, then the newest message starting with the quote's opening.
    */
-  byContent(group: string, text: string): HistoryMessage | null {
+  byContent(group: string, text: string, opts: { selfOnly?: boolean } = {}): HistoryMessage | null {
     const quoted = text.trim()
     if (!quoted) return null
+    const self = opts.selfOnly ? ' AND is_self = 1' : ''
     const exact = this.db
-      .prepare(`SELECT ${COLUMNS} FROM messages WHERE group_openid = ? AND content = ? ORDER BY rowid DESC LIMIT 1`)
+      .prepare(`SELECT ${COLUMNS} FROM messages WHERE group_openid = ? AND content = ?${self} ORDER BY rowid DESC LIMIT 1`)
       .get(group, quoted) as Row | undefined
     if (exact) return fromRow(exact)
     const head = `${quoted.slice(0, 40).replace(/[\\%_]/g, c => `\\${c}`)}%`
     const prefix = this.db
-      .prepare(`SELECT ${COLUMNS} FROM messages WHERE group_openid = ? AND content LIKE ? ESCAPE '\\' ORDER BY rowid DESC LIMIT 1`)
+      .prepare(
+        `SELECT ${COLUMNS} FROM messages WHERE group_openid = ? AND content LIKE ? ESCAPE '\\'${self} ORDER BY rowid DESC LIMIT 1`,
+      )
       .get(group, head) as Row | undefined
     return prefix ? fromRow(prefix) : null
   }
