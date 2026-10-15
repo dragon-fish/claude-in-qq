@@ -1086,6 +1086,12 @@ export async function connectGateway(handlers: GatewayHandlers, attempt = 0): Pr
     const token = await ensureToken()
     const ws = new WebSocket(url)
     gw.ws = ws
+    // QQ closes every gateway connection about every 30 minutes as routine. A
+    // connection that got as far as READY/RESUMED was healthy, so its close
+    // reconnects at once with the backoff reset; only connections that never
+    // came up back off. Carrying `attempt` across healthy connections is what
+    // once left the bridge deaf for a full minute after every routine close.
+    let established = false
 
     ws.addEventListener('open', () => log('gateway connected'))
 
@@ -1136,11 +1142,13 @@ export async function connectGateway(handlers: GatewayHandlers, attempt = 0): Pr
       const d = payload.d ?? {}
 
       if (payload.t === 'READY') {
+        established = true
         gw.sessionId = d.session_id ?? null
         log('ready, session', gw.sessionId)
         return
       }
       if (payload.t === 'RESUMED') {
+        established = true
         log('session resumed')
         return
       }
@@ -1177,13 +1185,14 @@ export async function connectGateway(handlers: GatewayHandlers, attempt = 0): Pr
       recordUnhandledEvent(payload.t, d)
     })
 
-    ws.addEventListener('close', () => {
+    ws.addEventListener('close', event => {
       if (gw.heartbeat) clearInterval(gw.heartbeat)
       gw.heartbeat = null
       if (gw.closed) return
-      const delay = Math.min(60_000, 2000 * 2 ** attempt)
-      log(`gateway closed, reconnecting in ${delay}ms`)
-      setTimeout(() => void connectGateway(handlers, attempt + 1), delay)
+      const next = established ? 0 : attempt + 1
+      const delay = established ? 1000 : Math.min(60_000, 2000 * 2 ** attempt)
+      log(`gateway closed (${event.code}${event.reason ? ` ${event.reason}` : ''}), reconnecting in ${delay}ms`)
+      setTimeout(() => void connectGateway(handlers, next), delay)
     })
 
     ws.addEventListener('error', err => log('gateway error:', err))
