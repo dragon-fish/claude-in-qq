@@ -163,6 +163,26 @@ export class History {
     return row ? fromRow(row) : null
   }
 
+  /**
+   * The message a quote points at, by the text QQ quoted. The fallback for
+   * `byRef`: a send's `ext_info.ref_idx` does not always equal the
+   * `ref_msg_idx` a later quote of that message carries (measured). Exact
+   * text first, then the newest message starting with the quote's opening.
+   */
+  byContent(group: string, text: string): HistoryMessage | null {
+    const quoted = text.trim()
+    if (!quoted) return null
+    const exact = this.db
+      .prepare(`SELECT ${COLUMNS} FROM messages WHERE group_openid = ? AND content = ? ORDER BY rowid DESC LIMIT 1`)
+      .get(group, quoted) as Row | undefined
+    if (exact) return fromRow(exact)
+    const head = `${quoted.slice(0, 40).replace(/[\\%_]/g, c => `\\${c}`)}%`
+    const prefix = this.db
+      .prepare(`SELECT ${COLUMNS} FROM messages WHERE group_openid = ? AND content LIKE ? ESCAPE '\\' ORDER BY rowid DESC LIMIT 1`)
+      .get(group, head) as Row | undefined
+    return prefix ? fromRow(prefix) : null
+  }
+
   /** This bot's own messages in a group, newest first. */
   ownRecent(group: string, limit: number): HistoryMessage[] {
     const rows = this.db

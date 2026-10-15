@@ -1523,7 +1523,10 @@ async function handleGroupMessage(msg: InboundGroupMessage): Promise<void> {
   if (!msg.author.bot && isOp(msg.author.openid, access) && botRounds.human(msg.group)) {
     log(`${where}: a human op spoke, answering bots again`)
   }
-  const quotedRow = msg.quote?.refIdx ? history.byRef(msg.group, msg.quote.refIdx) : null
+  const quotedRow = msg.quote
+    ? ((msg.quote.refIdx ? history.byRef(msg.group, msg.quote.refIdx) : null) ??
+      history.byContent(msg.group, msg.quote.text))
+    : null
   const quotesMe = quotedRow?.is_self === true
   if (routeGroupMessage(msg, id => isOp(id, access), nicknames, quotesMe) !== 'trigger') {
     if (mentionsMe(msg) || quotesMe || stripNickname(msg.content, nicknames) !== null) {
