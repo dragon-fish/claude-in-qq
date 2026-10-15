@@ -266,8 +266,8 @@ const GROUP_PASSIVE: PassiveRule = { maxUses: 5, ttlMs: 5 * 60 * 1000 }
 
 /**
  * A group message is only picked as a reply target while this much of its
- * window is left. The window runs from when QQ took the message, which is a
- * little before it reached us, and the reply still has to travel back.
+ * window is left: QQ's timestamp is in whole seconds, our clock is not QQ's,
+ * and the reply still has to travel back.
  */
 const GROUP_PASSIVE_MARGIN_MS = 10_000
 
@@ -332,15 +332,19 @@ function claimPassive(msgId: string | undefined): string | null {
  *
  * Kept in memory only. The window is five minutes, so a restart loses at most
  * that much, and a busy group would otherwise rewrite a file on every message.
- * The clock starts on arrival rather than on first use: the group window is
- * counted from the message, and five minutes leaves no slack for guessing.
+ * The clock starts at QQ's own timestamp for the message, not on arrival and
+ * not on first use: QQ counts the window from the message, and a push that
+ * arrives late (a resumed gateway replays what it missed) has already spent
+ * part of it. Arrival is used only when it is earlier, so a clock that runs
+ * behind QQ's can never stretch the window.
  */
 const groupInbound = new Map<string, { msgId: string; entry: PassiveEntry }[]>()
 
-export function rememberGroupInbound(group: string, msgId: string): void {
+/** `at` is the message's QQ timestamp, in milliseconds. */
+export function rememberGroupInbound(group: string, msgId: string, at: number): void {
   const list = groupInbound.get(group) ?? []
   if (list.some(m => m.msgId === msgId)) return
-  list.push({ msgId, entry: { used: 0, firstAt: Date.now() } })
+  list.push({ msgId, entry: { used: 0, firstAt: Math.min(at, Date.now()) } })
   groupInbound.set(group, list)
 }
 
@@ -538,25 +542,39 @@ export function toGroupMentions(text: string, ops: Record<string, string> = load
   return out
 }
 
+/**
+ * POST one message to a group: passive on the newest message that still has a
+ * use left, active otherwise. A passive send QQ refuses is tried once more as
+ * an active one — the window is judged on our clock and QQ judges it on its
+ * own, so a target picked near its end can be refused — and only a refused
+ * active send throws.
+ */
+async function postGroupMessage(
+  group: string,
+  body: Record<string, unknown>,
+): Promise<{ id?: string; ext_info?: { ref_idx?: string } }> {
+  const post = (passiveId: string | null) =>
+    qqFetch(`/v2/groups/${group}/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ ...body, msg_seq: msgSeq++, ...(passiveId ? { msg_id: passiveId } : {}) }),
+    })
+  const passiveId = claimGroupPassive(group)
+  let res = await post(passiveId)
+  if (!res.ok && passiveId) {
+    log(`group passive send refused [${res.status}]:`, (await res.text()).slice(0, 300), '— retrying as active')
+    res = await post(null)
+  }
+  if (!res.ok) {
+    const detail = await res.text()
+    log(`group send failed [${res.status}] active:`, detail.slice(0, 300))
+    throw new Error(`QQ group send failed: ${res.status} ${detail.slice(0, 120)}`)
+  }
+  return (await res.json()) as { id?: string; ext_info?: { ref_idx?: string } }
+}
+
 async function postGroupText(group: string, text: string): Promise<void> {
   for (const chunk of chunkText(toGroupMentions(text))) {
-    const passiveId = claimGroupPassive(group)
-    const body: Record<string, unknown> = {
-      markdown: { content: chunk },
-      msg_type: 2,
-      msg_seq: msgSeq++,
-    }
-    if (passiveId) body.msg_id = passiveId
-    const res = await qqFetch(`/v2/groups/${group}/messages`, {
-      method: 'POST',
-      body: JSON.stringify(body),
-    })
-    if (!res.ok) {
-      const detail = await res.text()
-      log(`group send failed [${res.status}] passive=${Boolean(passiveId)}:`, detail.slice(0, 300))
-      throw new Error(`QQ group send failed: ${res.status} ${detail.slice(0, 120)}`)
-    }
-    const data = (await res.json()) as { id?: string; ext_info?: { ref_idx?: string } }
+    const data = await postGroupMessage(group, { markdown: { content: chunk }, msg_type: 2 })
     groupSent(group, { id: String(data.id ?? ''), refIdx: data.ext_info?.ref_idx ?? null, content: chunk })
   }
 }
@@ -1455,11 +1473,14 @@ async function withRetry(attempts: number, delayMs: number, call: () => Promise<
  * arriving as a separate message. Markdown is not rendered there, which is why
  * long prose still goes on its own.
  */
-function mediaBody(fileInfo: string, passiveId: string | null, caption?: string): Record<string, unknown> {
-  const send: Record<string, unknown> = { msg_type: 7, media: { file_info: fileInfo }, msg_seq: msgSeq++ }
+function mediaPayload(fileInfo: string, caption?: string): Record<string, unknown> {
+  const send: Record<string, unknown> = { msg_type: 7, media: { file_info: fileInfo } }
   if (caption) send.content = caption.slice(0, MAX_CHUNK)
-  if (passiveId) send.msg_id = passiveId
   return send
+}
+
+function mediaBody(fileInfo: string, passiveId: string | null, caption?: string): Record<string, unknown> {
+  return { ...mediaPayload(fileInfo, caption), msg_seq: msgSeq++, ...(passiveId ? { msg_id: passiveId } : {}) }
 }
 
 /** Send a local file to a user as a native QQ attachment. */
@@ -1480,18 +1501,14 @@ export async function sendFile(
 
 /**
  * Send a local file to a group. The group upload endpoint takes the same body
- * as the single-chat one, which is the one exercised in practice.
+ * as the single-chat one, which is the one exercised in practice. Throws when
+ * QQ refuses the upload or the message, active retry included; the caller
+ * decides where the file goes instead.
  */
 export async function sendGroupFile(group: string, path: string, caption?: string): Promise<void> {
   await beforeSend(group)
   const fileInfo = await uploadFile(`/v2/groups/${group}`, path)
-  const passiveId = claimGroupPassive(group)
-  const res = await qqFetch(`/v2/groups/${group}/messages`, {
-    method: 'POST',
-    body: JSON.stringify(mediaBody(fileInfo, passiveId, caption)),
-  })
-  if (!res.ok) throw new Error(`发送失败 ${res.status}: ${(await res.text()).slice(0, 200)}`)
-  const data = (await res.json()) as { id?: string; ext_info?: { ref_idx?: string } }
+  const data = await postGroupMessage(group, mediaPayload(fileInfo, caption))
   const label = mediaKind(path) === MEDIA_IMAGE ? '图片' : '文件'
   groupSent(group, {
     id: String(data.id ?? ''),

@@ -406,7 +406,8 @@ const privateChat: Chat = {
  * and the seal in runSession. Each post is passive on the newest group message
  * that still has a use left, and active otherwise.
  *
- * Text QQ refuses goes to the owner's private chat rather than nowhere.
+ * Text and files QQ refuses, active retry included, go to the owner's private
+ * chat rather than nowhere.
  */
 function groupChat(group: string): Chat {
   const undelivered = (text: string, err: unknown) => forwardUndelivered(group, text, err)
@@ -418,7 +419,15 @@ function groupChat(group: string): Chat {
         await undelivered(text, err)
       }
     },
-    sendFile: (path, caption) => sendGroupFile(group, path, caption),
+    sendFile: async (path, caption) => {
+      try {
+        await sendGroupFile(group, path, caption)
+      } catch (err) {
+        await undelivered(`[文件] ${path}${caption ? `\n${caption}` : ''}`, err)
+        const owner = operatorOpenid()
+        if (owner) await sendFile(owner, path, lastInboundMsgId.get(owner), caption)
+      }
+    },
     openStream: () => createGroupStream(group, undelivered),
     replyTo: () => groupReplyTarget(group),
     owns: id => id === group,
@@ -1437,7 +1446,7 @@ async function handleGroupMessage(msg: InboundGroupMessage): Promise<void> {
     log(`${where}: duplicate push of ${msg.id.slice(-8)} ignored`)
     return
   }
-  rememberGroupInbound(msg.group, msg.id)
+  rememberGroupInbound(msg.group, msg.id, msg.at)
   const naming = refreshGroupName(msg.group)
 
   const access = loadAccess()
