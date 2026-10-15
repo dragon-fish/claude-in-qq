@@ -108,24 +108,58 @@ export function renderMentions(
   })
 }
 
+/** Characters that render as nothing, which could hide between `<` and a tag name. */
+const INVISIBLE = '\\s\\u200B-\\u200F\\u2060\\uFEFF'
+
+/**
+ * The `<` of anything that reads as one of the bridge's framing tags, opening
+ * or closing: whitespace or invisible characters around the slash, any case,
+ * and `-`, `_` or nothing between the words all still count.
+ */
+const FRAMING_TAG = new RegExp(
+  `<(?=[${INVISIBLE}]*/?[${INVISIBLE}]*` +
+    `(?:turn|user|conversation|quoted|harness|system)[-_]?(?:context|message|reminder)\\b)`,
+  'gi',
+)
+
 /**
  * Break any of the bridge's own framing tags inside untrusted text. Anyone in
- * a group can put words in the history block, and a closing `</turn_context>`
- * or a forged `<system-reminder>` there would otherwise read as the bridge
- * speaking.
+ * a group can put words in a `<user_message>`, and a closing
+ * `</user_message>` or a forged `<system-reminder>` there would otherwise
+ * read as the bridge speaking.
  */
 export function neutralize(text: string): string {
-  return text.replace(
-    /<(\/?)(turn_context|user_message|conversation_message|quoted_message|harness-reminder|system-reminder)/gi,
-    '＜$1$2',
-  )
+  return text.replace(FRAMING_TAG, '＜')
+}
+
+/**
+ * A framing block's body: a JSON object, one top-level field per line and one
+ * array entry per line. Every member-controlled string — names, group names,
+ * history — sits inside a JSON string, so it cannot fake a field, a role tag
+ * or a line of its own; `<` and `>` are escaped, so it cannot close the tag
+ * around it either.
+ */
+export function framingJson(fields: Record<string, unknown>): string {
+  const lines = Object.entries(fields)
+    .filter(([, v]) => v !== undefined)
+    .map(([k, v]) =>
+      Array.isArray(v) && v.length
+        ? `  ${JSON.stringify(k)}: [\n${v.map(x => `    ${jsonLine(x)}`).join(',\n')}\n  ]`
+        : `  ${JSON.stringify(k)}: ${jsonLine(v)}`,
+    )
+  return `{\n${lines.join(',\n')}\n}`
+}
+
+/** One value as single-line JSON with `<` and `>` escaped; see `framingJson`. */
+export function jsonLine(value: unknown): string {
+  return JSON.stringify(value).replace(/</g, '\\u003c').replace(/>/g, '\\u003e')
 }
 
 export type Speaker = { openid: string; name: string; isOwner: boolean; isBot: boolean }
 
 /** What the formatter needs to know about members beyond the message itself. */
 export type MemberLookup = {
-  /** A member's role, for labelling lines. */
+  /** A member's role, for labelling entries. */
   roleOf?: (openid: string) => 'owner' | 'op' | null
   /** Fallback names for mentions the message itself does not name. */
   nameOf?: (openid: string) => string | null
@@ -152,8 +186,6 @@ export const RECENT_IN_CONTEXT = 10
 /** How much of each earlier message; the history tool has the rest. */
 const RECENT_CLIP = 200
 
-const yesNo = (v: boolean) => (v ? '是' : '否')
-
 function fullTime(ms: number): string {
   return new Date(ms).toLocaleString('zh-CN', { hour12: false })
 }
@@ -168,27 +200,28 @@ function stamp(ms: number, ref: number): string {
 }
 
 /**
- * One stored group message as one line: time, sender with role tags, text
- * with mentions as names. `clip` shortens the text and folds its line breaks;
- * `withId` leads with the message id, for paging and referring back.
+ * One stored group message as a JSON-ready object: time, sender, role flags
+ * (present only when true), text with mentions as names. `clip` shortens the
+ * text; `withId` adds the message id, for paging and referring back.
  */
-export function describeMessage(
+export function historyEntry(
   m: HistoryMessage,
   opts: MemberLookup & { ref: number; clip?: number; withId?: boolean },
-): string {
-  let body = renderMentions(m.content, m.mentions, opts.nameOf)
-  if (opts.clip) {
-    body = body.replace(/\s*\n\s*/g, ' ⏎ ')
-    if (body.length > opts.clip) body = `${body.slice(0, opts.clip)}…`
-  }
-  const head = `${opts.withId ? `${m.message_id} ` : ''}[${stamp(m.created_at, opts.ref)}]`
-  if (m.is_self) return `${head} 你（本 bot）：${neutralize(body)}`
+): Record<string, unknown> {
+  let text = renderMentions(m.content, m.mentions, opts.nameOf)
+  if (opts.clip && text.length > opts.clip) text = `${text.slice(0, opts.clip)}…`
+  const head = { ...(opts.withId ? { id: m.message_id } : {}), at: stamp(m.created_at, opts.ref) }
+  if (m.is_self) return { ...head, self: true, text }
   const role = opts.roleOf?.(m.author_openid)
-  const tags = [role === 'owner' ? '主人' : role === 'op' ? 'op' : '', m.is_bot ? 'bot' : '']
-    .filter(Boolean)
-    .map(t => `[${t}]`)
-    .join('')
-  return `${head} ${neutralize(m.author_name)} (${m.author_openid})${tags ? ` ${tags}` : ''}：${neutralize(body)}`
+  return {
+    ...head,
+    openid: m.author_openid,
+    name: m.author_name,
+    ...(role === 'owner' ? { is_owner: true } : {}),
+    ...(role ? { is_op: true } : {}),
+    ...(m.is_bot ? { is_bot: true } : {}),
+    text,
+  }
 }
 
 /**
@@ -196,53 +229,50 @@ export function describeMessage(
  * the group said just before, then the message itself.
  */
 export function wrapTurn(input: TurnInput): string {
-  const { speaker } = input
-  const lines = ['<turn_context>']
-  lines.push(
-    input.source.kind === 'group'
-      ? `来源：群 ${neutralize(input.source.label)}（会话 ${input.source.key}）`
-      : '来源：私聊',
-  )
-  const name = speaker.name ? `${neutralize(speaker.name)} ` : ''
-  lines.push(
-    `发言人：${name}(${speaker.openid})，主人：${yesNo(speaker.isOwner)}，bot：${yesNo(speaker.isBot)}`,
-  )
-  lines.push(`时间：${fullTime(input.at)}`)
-  if (input.source.kind === 'group') {
-    const recent = input.recent ?? []
-    if (recent.length) {
-      lines.push(`最近群消息（触发消息之前 ${recent.length} 条，旧→新）：`)
-      for (const m of recent) lines.push(describeMessage(m, { ...input, ref: input.at, clip: RECENT_CLIP }))
-    } else {
-      lines.push('最近群消息：（无记录）')
-    }
-  }
-  lines.push('</turn_context>')
+  const { speaker, source } = input
+  const role = input.roleOf?.(speaker.openid)
+  const context = framingJson({
+    source:
+      source.kind === 'group'
+        ? { kind: 'group', key: source.key, name: source.label }
+        : { kind: 'private' },
+    speaker: {
+      openid: speaker.openid,
+      name: speaker.name,
+      is_owner: speaker.isOwner,
+      ...(source.kind === 'group' ? { is_op: speaker.isOwner || role === 'op' } : {}),
+      is_bot: speaker.isBot,
+    },
+    time: fullTime(input.at),
+    recent:
+      source.kind === 'group'
+        ? (input.recent ?? []).map(m => historyEntry(m, { ...input, ref: input.at, clip: RECENT_CLIP }))
+        : undefined,
+  })
   const body = renderMentions(input.text, input.mentions ?? [], input.nameOf)
-  lines.push('<user_message>', neutralize(body), '</user_message>')
-  return lines.join('\n')
+  return ['<turn_context>', context, '</turn_context>', '<user_message>', neutralize(body), '</user_message>'].join('\n')
 }
 
 /** How long an originating message is quoted in a delivery's context. */
 const ORIGIN_CLIP = 200
 
-/**
- * The QQ message a chain of deliveries started from, as one line: who, where,
- * and what they said with line breaks folded. `text` has mentions rendered.
- */
-export function describeOrigin(speaker: Speaker, where: string, text: string): string {
-  let said = text.replace(/\s*\n\s*/g, ' ⏎ ')
-  if (said.length > ORIGIN_CLIP) said = `${said.slice(0, ORIGIN_CLIP)}…`
-  const tags = [speaker.isOwner ? '主人' : '', speaker.isBot ? 'bot' : ''].filter(Boolean).map(t => `[${t}]`).join('')
-  const name = speaker.name ? `${speaker.name} ` : ''
-  return `${name}(${speaker.openid})${tags ? ` ${tags}` : ''} 在${where}说：${said}`
+/** The QQ message a chain of deliveries started from. `text` has mentions rendered. */
+export type Origin = { speaker: Speaker; where: string; text: string }
+
+/** An origin as one line for the owner to read: who, where, and what they said, line breaks folded. */
+export function describeOrigin(o: Origin): string {
+  const tags = [o.speaker.isOwner ? '主人' : '', o.speaker.isBot ? 'bot' : ''].filter(Boolean).map(t => `[${t}]`).join('')
+  return `${o.speaker.name ? `${JSON.stringify(o.speaker.name)} ` : ''}(${o.speaker.openid})${tags ? ` ${tags}` : ''} ` +
+    `在${o.where}说：${clipOrigin(o.text).replace(/\s*\n\s*/g, ' ⏎ ')}`
 }
+
+const clipOrigin = (text: string) => (text.length > ORIGIN_CLIP ? `${text.slice(0, ORIGIN_CLIP)}…` : text)
 
 export type DeliveryInput = {
   /** The sending conversation: its key, and how it is shown ('私聊', '群 名字'). */
   from: { key: string; label: string }
-  /** From `describeOrigin`; null when no QQ message started the chain. */
-  origin: string | null
+  /** Null when no QQ message started the chain. */
+  origin: Origin | null
   /** 1 for a delivery made while answering a QQ message, one more per hop after. */
   depth: number
   limit: number
@@ -255,18 +285,30 @@ export type DeliveryInput = {
  * qq_message_agent. It is not anyone's words in this chat, so it travels in
  * its own tag rather than as a `<user_message>`. The context says which
  * conversation sent it, which QQ message set the chain off, and that the turn
- * is silent (see `Conversation.silent` in index.ts). Everything in it is
+ * is silent (see `Conversation.silent` in index.ts). The message is
  * neutralized: the sender is an agent, but what it passes on may be quoted
  * from anyone.
  */
 export function wrapDelivery(d: DeliveryInput): string {
+  const context = framingJson({
+    source: { kind: 'agent_message', from: d.from.key, from_name: d.from.label },
+    origin: d.origin
+      ? {
+          where: d.origin.where,
+          openid: d.origin.speaker.openid,
+          name: d.origin.speaker.name,
+          is_owner: d.origin.speaker.isOwner,
+          is_bot: d.origin.speaker.isBot,
+          text: clipOrigin(d.origin.text),
+        }
+      : null,
+    time: fullTime(d.at),
+    chain: { depth: d.depth, limit: d.limit },
+    note: '这一轮你写的文字不会发到你的聊天里：回复对方用 qq_message_agent，要让你这边的聊天看到，用 qq_say。',
+  })
   return [
     '<turn_context>',
-    `来源：会话留言，来自${neutralize(d.from.label)}（会话 ${d.from.key}）`,
-    d.origin ? `起因：${neutralize(d.origin)}` : '起因：（不是由 QQ 消息引起的）',
-    `时间：${fullTime(d.at)}`,
-    `留言链：第 ${d.depth} 层，上限 ${d.limit} 层`,
-    '这一轮你写的文字不会发到你的聊天里：回复对方用 qq_message_agent，要让你这边的聊天看到，用 qq_say。',
+    context,
     '</turn_context>',
     `<conversation_message from="${d.from.key}">`,
     neutralize(d.text),
