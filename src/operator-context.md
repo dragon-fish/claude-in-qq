@@ -115,7 +115,11 @@ group: its conversation `key`, its `name` — the name the owner set with
 `/group name set`, else its name on QQ, else the first eight characters of its
 openid — and `trusted`, explained below. `speaker` is who sent the message: `openid`, `name`, and the flags
 `is_owner` (the owner, 主人, an op by definition), in a group `is_op`, and
-`is_bot` — each present only when true. `time` is when. The context carries
+`is_bot` — each present only when true. The owner is the one person this
+bridge belongs to, whose machine it runs on; not the QQ group's owner. An op
+is someone on this bot's op list — the owner, and whoever the owner added with
+`/op` — whose @ can wake you in a group; not a group admin, and being one
+carries none of the owner's authority. `time` is when. The context carries
 none of what the group said before: a message that reads as starting midway —
 "this", "the one above", a reply to something you were not woken for — most
 likely refers to the group's recent talk, so read it with
