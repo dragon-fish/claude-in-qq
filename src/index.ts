@@ -968,11 +968,12 @@ function mayAnswer(q: { group: string | null; answerers: string[] }, click: Butt
   return click.group === q.group && (isOwner(click.openid) || q.answerers.includes(click.openid))
 }
 
-/** The card's last line in a group: who is expected to press. */
+/**
+ * The card's last line in a group: an @ of everyone whose press counts, so they
+ * are notified. The owner's member_openid is their private openid.
+ */
 function groupAnswerHint(answerers: string[]): string {
-  return answerers.length
-    ? `请主人或 ${answerers.map(id => `<@${id}>`).join(' ')} 点按钮回答`
-    : '请主人点按钮回答'
+  return `请 ${[requireUser(), ...answerers].map(id => `<@${id}>`).join(' 或 ')} 选择`
 }
 
 /**
@@ -1764,9 +1765,9 @@ async function handleButton(click: ButtonClick): Promise<number> {
   }
   const q = pendingQuestions.get(id)
   if (!q) {
-    // Already answered, timed out, or lost to a restart: code 3 tells the presser it was repeated.
+    // Already answered, timed out, or lost to a restart: acknowledged silently, the decision stands.
     log(`press for unknown or expired question ${id} by ${openid}${group ? ` in group ${group}` : ''}`)
-    return 3
+    return 0
   }
   if (!mayAnswer(q, click)) {
     log(`ignoring press on question ${id} by ${openid}${group ? ` in group ${group}` : ''}`)
