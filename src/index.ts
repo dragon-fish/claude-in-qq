@@ -1570,6 +1570,7 @@ function compactSession(conv: Conversation): Promise<CompactOutcome> | null {
       resolve(r)
     }
     enqueue(conv, '/compact', [])
+    ensureServing(conv)
   })
 }
 
