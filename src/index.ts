@@ -80,6 +80,7 @@ import {
   STATE_DIR,
   syncCommandPanel,
   onBeforeSend,
+  type ButtonClick,
   type GroupMember,
   type InboundGroupMessage,
   type InboundMessage,
@@ -924,16 +925,21 @@ const pendingQuestions = new Map<
      * the sentence never reaches the agent.
      */
     buttonsOnly?: boolean
+    /** The group the card was posted in, or null for private chat. */
+    group: string | null
+    /** Group members who may answer besides the owner; see `mayAnswer`. */
+    answerers: string[]
   }
 >()
 
 /**
- * Post a question and its keyboard. Called again, with the same id, when the
- * operator turns a page — the pending promise is untouched, only the message
- * showing the choices is new.
+ * Post a question and its keyboard, in the group that raised it or else in
+ * private chat. Called again, with the same id, when the operator turns a page
+ * — the pending promise is untouched, only the message showing the choices is
+ * new.
  */
 async function postQuestion(
-  user: string,
+  group: string | null,
   id: string,
   options: string[],
   render: (mode: AskLayout['mode']) => string,
@@ -944,7 +950,35 @@ async function postQuestion(
     layout.pages > 1
       ? `${render(layout.mode)}\n\n第 ${layout.page + 1}/${layout.pages} 页`
       : render(layout.mode)
+  if (group) {
+    await sendToGroup(group, body, layout.keyboard)
+    return
+  }
+  const user = requireUser()
   await sendToQQ(user, body, lastInboundMsgId.get(user), layout.keyboard)
+}
+
+/**
+ * Who may press a question's buttons. A card in a group is visible to, and
+ * pressable by, every member — QQ's own per-button permission is not relied on
+ * — so the press itself is checked: the owner, plus whoever the agent named.
+ */
+function mayAnswer(q: { group: string | null; answerers: string[] }, click: ButtonClick): boolean {
+  if (q.group === null) return click.group === null && isAllowed(click.openid)
+  return click.group === q.group && (isOwner(click.openid) || q.answerers.includes(click.openid))
+}
+
+/** The card's last line in a group: who is expected to press. */
+function groupAnswerHint(answerers: string[]): string {
+  return answerers.length
+    ? `请主人或 ${answerers.map(id => `<@${id}>`).join(' ')} 点按钮回答`
+    : '请主人点按钮回答'
+}
+
+/** A member's answer reaches the agent marked as theirs, so it is never read as the owner's word. */
+function memberAnswer(choice: string, openid: string): string {
+  const remark = loadAccess().ops[openid]
+  return `${choice}\n\n（群成员 ${remark ? `${remark}（${openid}）` : openid} 点选，不是主人的回答）`
 }
 
 function settleApproval(id: string, allow: boolean): boolean {
@@ -968,8 +1002,8 @@ function settleQuestion(id: string, text: string, images: FetchedImage[] = []): 
 }
 
 /**
- * Cards go to the owner's private chat whichever conversation raised them, so
- * one raised from a group says which.
+ * Approval cards go to the owner's private chat whichever conversation raised
+ * them, so one raised from a group says which. Questions stay in their group.
  */
 function originNote(conv: Conversation): string | null {
   const group = groupOf(conv)
@@ -977,7 +1011,7 @@ function originNote(conv: Conversation): string | null {
 }
 
 /**
- * The card's last line: how to answer it. Only a card the private
+ * An approval card's last line: how to answer it. Only a card the private
  * conversation raised takes a typed answer; see handleMessage.
  */
 function answerHint(conv: Conversation, typed: string): string {
@@ -1049,7 +1083,8 @@ function qqToolsFor(conv: Conversation) {
           'whenever you would otherwise stop and ask — a fork in the approach, a missing detail, ' +
           'a confirmation before something hard to undo. ' +
           (groupOf(conv)
-            ? 'Asked from a group, it is answered only by tapping an option. '
+            ? 'Asked from a group, it is posted in that group and answered only by tapping an option. ' +
+              'Only the owner may tap unless you name others in answerers; anyone else is ignored. '
             : 'They may also reply with free text instead of picking an option, in which case you get ' +
               'their words verbatim, along with any images they send. ') +
           'Keep options short: 20 characters or less renders the text on the button itself.',
@@ -1064,13 +1099,27 @@ function qqToolsFor(conv: Conversation) {
                 'rather than in prose before the call; the card is the one thing sure to reach them.',
             ),
           options: z.array(z.string()).min(2).max(8).describe('Between 2 and 8 choices'),
+          ...(groupOf(conv)
+            ? {
+                answerers: z
+                  .array(z.string())
+                  .optional()
+                  .describe(
+                    'member_openids of group members who may tap an answer besides the owner. Name the ' +
+                      'person a requirement is being settled with. A question that authorizes something ' +
+                      'names nobody, so only the owner can answer it. A member\'s answer comes back marked ' +
+                      'as theirs: a member\'s word, not the owner\'s.',
+                  ),
+              }
+            : {}),
         },
-        async ({ question, details, options }) => {
-          const user = requireUser()
+        async ({ question, details, options, answerers: named }) => {
+          const group = groupOf(conv)
+          const answerers = group ? (named ?? []).filter(id => !isOwner(id)) : []
           const id = randomId()
 
           const render = (mode: AskLayout['mode']) => {
-            const lines = [`**${question}**`, ...[originNote(conv)].filter(x => x !== null), '']
+            const lines = [`**${question}**`, '']
             if (details?.trim()) lines.push(details.trim(), '')
             if (mode === 'letters') {
               // Buttons carry only a letter, so the list has to carry the meaning.
@@ -1081,12 +1130,12 @@ function qqToolsFor(conv: Conversation) {
               options.forEach(opt => lines.push(`· ${opt}`))
               lines.push('')
             }
-            lines.push(answerHint(conv, '点按钮选择，或直接打字回答'))
+            lines.push(group ? groupAnswerHint(answerers) : '点按钮选择，或直接打字回答')
             return lines.join('\n')
           }
 
           log(`question ${id} posting: ${question.slice(0, 60)}`)
-          await postQuestion(user, id, options, render)
+          await postQuestion(group, id, options, render)
           log(`question ${id} posted`)
 
           const answer = await new Promise<QuestionAnswer>(resolve => {
@@ -1094,7 +1143,7 @@ function qqToolsFor(conv: Conversation) {
               pendingQuestions.delete(id)
               resolve({ text: '(操作者未在 15 分钟内回答)', images: [] })
             }, QUESTION_TIMEOUT_MS)
-            pendingQuestions.set(id, { resolve, timer, options, render, conversation: conv.key })
+            pendingQuestions.set(id, { resolve, timer, options, render, conversation: conv.key, group, answerers })
           })
 
           return {
@@ -1687,45 +1736,49 @@ async function readAttachments(attachments: Attachment[]): Promise<{ images: Fet
   return { images, notes }
 }
 
-async function handleButton(openid: string, buttonData: string): Promise<void> {
-  // Clicking a button approves a tool call, so it is gated exactly like a message.
-  if (!isAllowed(openid)) {
-    log(`ignoring interaction from non-allowlisted openid ${openid}`)
-    return
-  }
+async function handleButton(click: ButtonClick): Promise<number> {
+  const { openid, group, data } = click
 
-  const approval = APPROVE_BUTTON_RE.exec(buttonData)
+  const approval = APPROVE_BUTTON_RE.exec(data)
   if (approval) {
+    // Clicking a button approves a tool call, so it is gated exactly like a
+    // message. Approval cards are only ever posted in private chat.
+    if (group !== null || !isAllowed(openid)) {
+      log(`ignoring approval press from ${group ? `group ${group} member` : 'non-allowlisted openid'} ${openid}`)
+      return 4
+    }
     settleApproval(approval[1], approval[2] === 'allow')
-    return
+    return 0
   }
 
-  const turn = PAGE_BUTTON_RE.exec(buttonData)
+  const turn = PAGE_BUTTON_RE.exec(data)
+  const ask = turn ? null : ASK_BUTTON_RE.exec(data)
+  const id = turn?.[1] ?? ask?.[1]
+  if (!id) {
+    log(`unrecognized button_data: ${data.slice(0, 60)}`)
+    return 0
+  }
+  const q = pendingQuestions.get(id)
+  if (!q) {
+    log(`press for unknown or expired question ${id}`)
+    return 0
+  }
+  if (!mayAnswer(q, click)) {
+    log(`ignoring press on question ${id} by ${openid}${group ? ` in group ${group}` : ''}`)
+    return 4
+  }
+
   if (turn) {
-    const q = pendingQuestions.get(turn[1])
-    if (!q) {
-      log(`page turn for unknown or expired question ${turn[1]}`)
-      return
-    }
     // A new message rather than an edit: QQ has no way to rewrite a keyboard in
-    // place, and the question stays open either way.
-    await postQuestion(openid, turn[1], q.options, q.render, Number(turn[2]))
-    return
+    // place, and the question stays open either way. Not awaited: the press is
+    // acknowledged once this returns, and QQ flags a slow acknowledgement.
+    postQuestion(q.group, id, q.options, q.render, Number(turn[2])).catch(err => log('page turn failed:', err))
+    return 0
   }
 
-  const ask = ASK_BUTTON_RE.exec(buttonData)
-  if (ask) {
-    const q = pendingQuestions.get(ask[1])
-    if (!q) {
-      log(`click for unknown or expired question ${ask[1]}`)
-      return
-    }
-    const choice = q.options[Number(ask[2])]
-    if (choice !== undefined) settleQuestion(ask[1], choice)
-    return
-  }
-
-  log(`unrecognized button_data: ${buttonData.slice(0, 60)}`)
+  const choice = q.options[Number(ask![2])]
+  if (choice !== undefined) settleQuestion(id, isOwner(openid) ? choice : memberAnswer(choice, openid))
+  return 0
 }
 
 // -------------------------------------------------------------- session state
@@ -1827,17 +1880,17 @@ async function askChoice(
   renderBody: (mode: AskLayout['mode']) => string,
   buttonsOnly = false,
 ): Promise<number> {
-  const user = requireUser()
+  const group = groupOf(conv)
   const id = randomId()
 
-  await postQuestion(user, id, options, renderBody)
+  await postQuestion(group, id, options, renderBody)
 
   const answer = await new Promise<QuestionAnswer>(resolve => {
     const timer = setTimeout(() => {
       pendingQuestions.delete(id)
       resolve({ text: '', images: [] })
     }, QUESTION_TIMEOUT_MS)
-    pendingQuestions.set(id, { options, resolve, timer, render: renderBody, buttonsOnly, conversation: conv.key })
+    pendingQuestions.set(id, { options, resolve, timer, render: renderBody, buttonsOnly, conversation: conv.key, group, answerers: [] })
   })
   return options.indexOf(answer.text)
 }

@@ -583,9 +583,12 @@ export async function recallGroupMessage(group: string, messageId: string): Prom
   if (!res.ok) throw new Error(`撤回失败 ${res.status}: ${(await res.text()).slice(0, 200)}`)
 }
 
-async function postGroupText(group: string, text: string): Promise<void> {
-  for (const chunk of chunkText(toGroupMentions(text))) {
-    const data = await postGroupMessage(group, { markdown: { content: chunk }, msg_type: 2 })
+async function postGroupText(group: string, text: string, keyboard?: Record<string, unknown>): Promise<void> {
+  const chunks = chunkText(toGroupMentions(text))
+  for (const [i, chunk] of chunks.entries()) {
+    const body: Record<string, unknown> = { markdown: { content: chunk }, msg_type: 2 }
+    if (keyboard && i === chunks.length - 1) body.keyboard = keyboard
+    const data = await postGroupMessage(group, body)
     groupSent(group, { id: String(data.id ?? ''), refIdx: data.ext_info?.ref_idx ?? null, content: chunk })
   }
 }
@@ -634,9 +637,9 @@ export const fetchGroupBotState = (group: string) => groupLookup<GroupBotState>(
  *
  * @see https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages.post.html
  */
-export async function sendToGroup(group: string, text: string): Promise<void> {
+export async function sendToGroup(group: string, text: string, keyboard?: Record<string, unknown>): Promise<void> {
   await beforeSend(group)
-  await postGroupText(group, text)
+  await postGroupText(group, text, keyboard)
 }
 
 // ------------------------------------------------------------------ streaming
@@ -1637,8 +1640,12 @@ export function parseGroupEvent(type: string, d: Record<string, any>): InboundGr
 export type GatewayHandlers = {
   onMessage: (msg: InboundMessage) => Promise<void>
   onGroupMessage: (msg: InboundGroupMessage) => Promise<void>
-  onButton: (openid: string, buttonData: string) => Promise<void>
+  /** Resolves to the code the click is acknowledged with: 0 handled, 4 not this clicker's to press. */
+  onButton: (click: ButtonClick) => Promise<number>
 }
+
+/** A button press. `group` is null when it was pressed in private chat. */
+export type ButtonClick = { openid: string; group: string | null; data: string }
 
 const gw = {
   ws: null as WebSocket | null,
@@ -1656,12 +1663,17 @@ async function getGatewayUrl(): Promise<string> {
   return data.url
 }
 
-/** ACK an interaction promptly or QQ shows an error indicator on the button. */
-async function ackInteraction(id: string): Promise<void> {
+/**
+ * ACK an interaction promptly or QQ shows an error indicator on the button.
+ * Code 4 tells the clicker they have no permission; the full list is in the
+ * button page of the docs (0 ok, 1 failed, 2 too frequent, 3 repeated, 4 no
+ * permission, 5 admins only).
+ */
+async function ackInteraction(id: string, code: number): Promise<void> {
   try {
     const res = await qqFetch(`/interactions/${id}`, {
       method: 'PUT',
-      body: JSON.stringify({ code: 0 }),
+      body: JSON.stringify({ code }),
     })
     if (!res.ok) log(`interaction ack failed [${res.status}]`)
   } catch (err) {
@@ -1781,14 +1793,17 @@ export async function connectGateway(handlers: GatewayHandlers, attempt = 0): Pr
 
       if (payload.t === 'INTERACTION_CREATE') {
         const id = d.id ? String(d.id) : ''
-        if (id) await ackInteraction(id)
-        const openid = String(d.user_openid ?? d.author?.user_openid ?? d.author?.member_openid ?? '')
-        const buttonData = String(d.data?.resolved?.button_data ?? '')
+        // A group press names its clicker group_member_openid; user_openid is private chat only.
+        const group = d.group_openid ? String(d.group_openid) : null
+        const openid = String(d.group_member_openid ?? d.user_openid ?? d.author?.user_openid ?? d.author?.member_openid ?? '')
+        const data = String(d.data?.resolved?.button_data ?? '')
+        let code = 1
         try {
-          await handlers.onButton(openid, buttonData)
+          code = await handlers.onButton({ openid, group, data })
         } catch (err) {
           log('interaction handling failed:', err)
         }
+        if (id) await ackInteraction(id, code)
         return
       }
 
