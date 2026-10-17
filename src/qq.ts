@@ -1665,7 +1665,8 @@ async function getGatewayUrl(): Promise<string> {
 
 /**
  * ACK an interaction promptly or QQ shows an error indicator on the button.
- * Code 4 tells the clicker they have no permission; the full list is in the
+ * An ack is not a message: it spends no quota, and a non-zero code shows only
+ * the clicker a small notice. Code 4 tells the clicker they have no permission; the full list is in the
  * button page of the docs (0 ok, 1 failed, 2 too frequent, 3 repeated, 4 no
  * permission, 5 admins only).
  */

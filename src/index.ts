@@ -977,13 +977,19 @@ function groupAnswerHint(answerers: string[]): string {
 }
 
 /**
- * A group answer reaches the agent with who pressed it: everyone in the group
- * sees the card, so a bare choice says nothing about whose word it is.
+ * A group answer reaches the agent as JSON naming who pressed it, in the shape
+ * of turn_context's speaker: everyone in the group sees the card, so a bare
+ * choice says nothing about whose word it is.
  */
 function groupAnswer(choice: string, openid: string): string {
-  if (isOwner(openid)) return `${choice}\n\n（主人点选）`
-  const remark = loadAccess().ops[openid]
-  return `${choice}\n\n（群成员 ${remark ? `${remark}（${openid}）` : openid} 点选，不是主人的回答）`
+  const access = loadAccess()
+  const name = history.nameOf(openid) ?? access.ops[openid] ?? null
+  const by = {
+    openid,
+    ...(name ? { name } : {}),
+    ...(isOwner(openid, access) ? { is_owner: true } : isOp(openid, access) ? { is_op: true } : {}),
+  }
+  return JSON.stringify({ choice, by })
 }
 
 function settleApproval(id: string, allow: boolean): boolean {
@@ -1112,8 +1118,9 @@ function qqToolsFor(conv: Conversation) {
                   .describe(
                     'member_openids of group members who may tap an answer besides the owner. Name the ' +
                       'person a requirement is being settled with. A question that authorizes something ' +
-                      'names nobody, so only the owner can answer it. Every answer comes back marked with ' +
-                      'who tapped it; a member\'s answer is a member\'s word, not the owner\'s.',
+                      'names nobody, so only the owner can answer it. The answer comes back as JSON, ' +
+                      '{"choice", "by": {openid, name, is_owner | is_op}}, or {"choice": null, "timed_out": true}; ' +
+                      'a member\'s answer is a member\'s word, not the owner\'s.',
                   ),
               }
             : {}),
@@ -1146,7 +1153,10 @@ function qqToolsFor(conv: Conversation) {
           const answer = await new Promise<QuestionAnswer>(resolve => {
             const timer = setTimeout(() => {
               pendingQuestions.delete(id)
-              resolve({ text: '(操作者未在 15 分钟内回答)', images: [] })
+              resolve({
+                text: group ? JSON.stringify({ choice: null, timed_out: true }) : '(操作者未在 15 分钟内回答)',
+                images: [],
+              })
             }, QUESTION_TIMEOUT_MS)
             pendingQuestions.set(id, { resolve, timer, options, render, conversation: conv.key, group, answerers })
           })
