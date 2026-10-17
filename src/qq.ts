@@ -1640,8 +1640,7 @@ export function parseGroupEvent(type: string, d: Record<string, any>): InboundGr
 export type GatewayHandlers = {
   onMessage: (msg: InboundMessage) => Promise<void>
   onGroupMessage: (msg: InboundGroupMessage) => Promise<void>
-  /** Resolves to the code the click is acknowledged with: 0 handled, 4 not this clicker's to press. */
-  onButton: (click: ButtonClick) => Promise<number>
+  onButton: (click: ButtonClick) => Promise<void>
 }
 
 /** A button press. `group` is null when it was pressed in private chat. */
@@ -1665,9 +1664,10 @@ async function getGatewayUrl(): Promise<string> {
 
 /**
  * ACK an interaction promptly or QQ shows an error indicator on the button.
- * Code 4 tells the clicker they have no permission; the full list is in the
- * button page of the docs (0 ok, 1 failed, 2 too frequent, 3 repeated, 4 no
- * permission, 5 admins only).
+ * An ack is not a message and spends no quota. Codes, from the button page of
+ * the docs: 0 ok, 1 failed, 2 too frequent, 3 repeated, 4 no permission, 5
+ * admins only — 0 and 1 are the only ones sent: a press that does not count is
+ * acked 0 like any other, so nobody is told anything.
  */
 async function ackInteraction(id: string, code: number): Promise<void> {
   try {
@@ -1797,10 +1797,11 @@ export async function connectGateway(handlers: GatewayHandlers, attempt = 0): Pr
         const group = d.group_openid ? String(d.group_openid) : null
         const openid = String(d.group_member_openid ?? d.user_openid ?? d.author?.user_openid ?? d.author?.member_openid ?? '')
         const data = String(d.data?.resolved?.button_data ?? '')
-        let code = 1
+        let code = 0
         try {
-          code = await handlers.onButton({ openid, group, data })
+          await handlers.onButton({ openid, group, data })
         } catch (err) {
+          code = 1
           log('interaction handling failed:', err)
         }
         if (id) await ackInteraction(id, code)

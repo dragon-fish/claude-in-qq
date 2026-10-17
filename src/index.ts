@@ -1741,7 +1741,7 @@ async function readAttachments(attachments: Attachment[]): Promise<{ images: Fet
   return { images, notes }
 }
 
-async function handleButton(click: ButtonClick): Promise<number> {
+async function handleButton(click: ButtonClick): Promise<void> {
   const { openid, group, data } = click
 
   const approval = APPROVE_BUTTON_RE.exec(data)
@@ -1750,10 +1750,10 @@ async function handleButton(click: ButtonClick): Promise<number> {
     // message. Approval cards are only ever posted in private chat.
     if (group !== null || !isAllowed(openid)) {
       log(`ignoring approval press from ${group ? `group ${group} member` : 'non-allowlisted openid'} ${openid}`)
-      return 4
+      return
     }
     settleApproval(approval[1], approval[2] === 'allow')
-    return 0
+    return
   }
 
   const turn = PAGE_BUTTON_RE.exec(data)
@@ -1761,17 +1761,17 @@ async function handleButton(click: ButtonClick): Promise<number> {
   const id = turn?.[1] ?? ask?.[1]
   if (!id) {
     log(`unrecognized button_data: ${data.slice(0, 60)}`)
-    return 0
+    return
   }
   const q = pendingQuestions.get(id)
   if (!q) {
-    // Already answered, timed out, or lost to a restart: acknowledged silently, the decision stands.
+    // Already answered, timed out, or lost to a restart: the decision stands.
     log(`press for unknown or expired question ${id} by ${openid}${group ? ` in group ${group}` : ''}`)
-    return 0
+    return
   }
   if (!mayAnswer(q, click)) {
     log(`ignoring press on question ${id} by ${openid}${group ? ` in group ${group}` : ''}`)
-    return 4
+    return
   }
 
   if (turn) {
@@ -1779,13 +1779,12 @@ async function handleButton(click: ButtonClick): Promise<number> {
     // place, and the question stays open either way. Not awaited: the press is
     // acknowledged once this returns, and QQ flags a slow acknowledgement.
     postQuestion(q.group, id, q.options, q.render, Number(turn[2])).catch(err => log('page turn failed:', err))
-    return 0
+    return
   }
 
   const choice = q.options[Number(ask![2])]
   // Command panels match the bare choice against their labels, so only qq_ask carries the presser.
   if (choice !== undefined) settleQuestion(id, q.group && !q.buttonsOnly ? groupAnswer(choice, openid) : choice)
-  return 0
 }
 
 // -------------------------------------------------------------- session state
