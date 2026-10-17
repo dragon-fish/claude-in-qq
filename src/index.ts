@@ -1012,6 +1012,21 @@ function settleQuestion(id: string, text: string, images: FetchedImage[] = []): 
 }
 
 /**
+ * A group question its answerer talks past instead of tapping is dropped. The
+ * agent is blocked on the card, so the new message would otherwise sit unread
+ * until the card timed out. The card stays in the group; a later press on it
+ * finds nothing and is ignored.
+ */
+function supersedeQuestions(conv: Conversation, openid: string): void {
+  for (const [id, q] of pendingQuestions) {
+    if (q.conversation !== conv.key || q.group === null || q.buttonsOnly) continue
+    if (!isOwner(openid) && !q.answerers.includes(openid)) continue
+    log(`question ${id} superseded by a message from ${openid}`)
+    settleQuestion(id, JSON.stringify({ choice: null, superseded: true }))
+  }
+}
+
+/**
  * Approval cards go to the owner's private chat whichever conversation raised
  * them, so one raised from a group says which. Questions stay in their group.
  */
@@ -1118,7 +1133,9 @@ function qqToolsFor(conv: Conversation) {
                     'member_openids of group members who may tap an answer besides the owner. Name the ' +
                       'person a requirement is being settled with. A question that authorizes something ' +
                       'names nobody, so only the owner can answer it. The answer comes back as JSON, ' +
-                      '{"choice", "by": {openid, name, is_owner, is_op}}, or {"choice": null, "timed_out": true}. is_op means ' +
+                      '{"choice", "by": {openid, name, is_owner, is_op}}; {"choice": null, "timed_out": true} after 15 minutes; ' +
+                      '{"choice": null, "superseded": true} when someone who may answer messages you instead, ' +
+                      'their message following as the next turn. is_op means ' +
                       'on this bot\'s op list (the owner included), not a group admin; ' +
                       'a member\'s answer is a member\'s word, not the owner\'s.',
                   ),
@@ -1706,6 +1723,7 @@ async function handleGroupMessage(msg: InboundGroupMessage): Promise<void> {
   })
   log(`${where}: trigger from ${msg.author.openid.slice(0, 8)}: ${msg.content.slice(0, 60)}`)
   conv.chain = { id: randomId(), depth: 0, origin: { speaker, where: `群 ${label}`, text: rendered } }
+  supersedeQuestions(conv, msg.author.openid)
   enqueue(conv, withCommandLog(conv, wrapped), images)
   ensureServing(conv)
 }

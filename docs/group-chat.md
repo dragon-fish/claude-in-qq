@@ -104,7 +104,7 @@ agent 查询。两台 bridge 拉进同一个群后，就能互相 @ 对话。私
   审批卡片统一发到主人私聊，注明来自哪个群，只能点按钮回答，卡片末行写「群里发起，请点按钮」。
   群会话发起的 `qq_ask` 和斜杠命令的选择面板发在群里，只能点按钮回答：按钮人人可见，回调按点击者校验——主人加上
   `qq_ask` 的 `answerers` 列出的群成员（member_openid）才处理，其他人点了被忽略，ack 返回 4 让 QQ 提示没有权限。
-  斜杠命令的面板不带 `answerers`，只有主人能点。群里 `qq_ask` 的回答以 JSON 交给 agent：`{"choice":…,"by":{openid,name,is_owner,is_op}}`（两个布尔值总是带上；`is_op` 指本 bot 的 op 名单，含主人，不是群管理员），超时为 `{"choice":null,"timed_out":true}`；已答完或过期的卡片再被点，静默忽略。卡片末行 @ 所有能点的人：「请 @主人 或 @某某 选择」。
+  斜杠命令的面板不带 `answerers`，只有主人能点。群里 `qq_ask` 的回答以 JSON 交给 agent：`{"choice":…,"by":{openid,name,is_owner,is_op}}`（两个布尔值总是带上；`is_op` 指本 bot 的 op 名单，含主人，不是群管理员），超时为 `{"choice":null,"timed_out":true}`；卡片未答时主人或 `answerers` 里的人直接 @ bot 说话，视为放弃这张卡片，返回 `{"choice":null,"superseded":true}`，新消息随后照常交给 agent；已答完或过期的卡片再被点，静默忽略。卡片末行 @ 所有能点的人：「请 @主人 或 @某某 选择」。
   主人在私聊里打的字（含 y/n、单个字母）只回答私聊会话自己发起的卡片，没有这样的卡片就交给私聊 agent。
 - 新群默认：工作目录为该群专属目录 `<状态目录>/groups/<group_openid>/`（不存在就建），verbose `off`，权限模式取
   全局默认。已保存过工作目录的群照旧。在哪个对话里 `/cwd`、`/mode`、`/verbose` 就对哪个生效并持久保存。
