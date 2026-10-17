@@ -40,6 +40,11 @@ export type CommandDeps = {
   sessionId(): string | null
   setSessionId(id: string | null): void
   /**
+   * Compact the session, after any turn in progress. Resolves with how it
+   * ended, or is null when there is no session to compact.
+   */
+  compact(): Promise<{ ok: boolean; error?: string; pre?: number; post?: number }> | null
+  /**
    * Tell the agent something it cannot observe. Delivered with the next real
    * message, since commands happen entirely outside its view.
    */
@@ -342,6 +347,27 @@ register(
       deps.setSessionId(null)
       deps.restartSession('clear')
       await deps.reply('🧹 已清空上下文，下一条消息开始新会话。')
+    },
+  },
+
+  {
+    name: 'compact',
+    usage: '/compact',
+    summary: '压缩上下文',
+    async run(_arg, deps) {
+      const pending = deps.compact()
+      if (!pending) {
+        await deps.reply('会话尚未启动，没有可压缩的上下文。')
+        return
+      }
+      await deps.reply('🗜️ 开始压缩上下文，正在进行的那一轮结束后执行。')
+      const r = await pending
+      const k = (n?: number) => (n === undefined ? '?' : `${Math.round(n / 1000)}k`)
+      await deps.reply(
+        r.ok
+          ? `✅ 压缩完成：${k(r.pre)} → ${k(r.post)} tokens。`
+          : `❌ 压缩失败：${r.error ?? '原因未知'}`,
+      )
     },
   },
 

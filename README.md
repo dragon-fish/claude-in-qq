@@ -33,7 +33,7 @@ harness 本身：同一套工具、同样的 skills 和 hooks、一样的权限�
   所以长任务不会把答案埋掉，也不额外花消息条数。`/verbose` 可切三档：完整过程 / 只报进度 / 只要答案
 - **审批**：工具调用弹按钮，点「允许」或「拒绝」。默认 `auto` 模式，只有模型判定有风险的操作才问
 - **提问**：Claude 需要你拿主意时会推一组按钮出来，等同于 TUI 里的 AskUserQuestion
-- **斜杠指令**：`/help` `/stop` `/clear` `/context` `/usage` `/model` `/mode` `/verbose` `/resume` `/cwd` `/status` `/version` `/op` `/nick` `/group` `/restart`。
+- **斜杠指令**：`/help` `/stop` `/clear` `/compact` `/context` `/usage` `/model` `/mode` `/verbose` `/resume` `/cwd` `/status` `/version` `/op` `/nick` `/group` `/restart`。
   `/restart`（别名 `/reload`）立即重启进程、加载新代码，只在以服务方式运行时可用（launchd 或 Windows 计划任务）。
   `/restart 附言` 会把附言写进唤醒便条 `wake.md`：新进程起来后若该文件非空，就把内容交给私聊里的 agent 自动接续并
   通知你，随后清空文件，原文留在 `wake.md.last`。agent 自己重启前也会往里写交接。

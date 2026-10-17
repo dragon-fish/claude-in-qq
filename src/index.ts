@@ -501,6 +501,8 @@ class Conversation {
    * answered count as well — see `busy`.
    */
   inTurn = false
+  /** Settles the /compact that is waiting on this session; see `compactSession`. */
+  compactWaiter: ((r: CompactOutcome) => void) | null = null
   /**
    * Messages handed to the session that no turn has finished answering, by
    * uuid, with who sent them. Claude Code lists the messages a turn took on
@@ -1537,6 +1539,40 @@ async function handleMessage(msg: InboundMessage): Promise<void> {
   enqueue(conv, withCommandLog(conv, wrapped), images)
 }
 
+/** How a /compact ended. */
+type CompactOutcome = { ok: boolean; error?: string; pre?: number; post?: number }
+
+/** Compaction rewrites the whole conversation through the model; past this it is treated as lost. */
+const COMPACT_TIMEOUT_MS = 10 * 60_000
+
+/**
+ * Compact a session the way /compact does in a terminal: the command goes in
+ * as a user message and Claude Code runs it when the session takes it, after
+ * any turn in progress. A parked session is resumed to take it. A failure
+ * settles on the status message that reports it; a success on the
+ * compact_boundary that follows that status and carries the token counts.
+ * Null when there is no session yet.
+ *
+ * Compaction is also what makes a resumed session drop its recorded system
+ * prompt and tool definitions and render them afresh.
+ */
+function compactSession(conv: Conversation): Promise<CompactOutcome> | null {
+  if (!conv.query && !conv.sessionId()) return null
+  if (conv.compactWaiter) return Promise.resolve({ ok: false, error: '已有一次压缩在进行中' })
+  return new Promise(resolve => {
+    const timer = setTimeout(() => {
+      conv.compactWaiter = null
+      resolve({ ok: false, error: '10 分钟内没有结果' })
+    }, COMPACT_TIMEOUT_MS)
+    conv.compactWaiter = r => {
+      clearTimeout(timer)
+      conv.compactWaiter = null
+      resolve(r)
+    }
+    enqueue(conv, '/compact', [])
+  })
+}
+
 /**
  * Hand a message to `conv`'s session, or to its queue until one runs. Image
  * first, then the words about it — the order the person sent them in. `from`
@@ -1935,6 +1971,7 @@ function commandDeps(conv: Conversation, origin: CommandOrigin): CommandDeps {
     },
     sessionId: () => conv.sessionId(),
     setSessionId: id => conv.setSessionId(id),
+    compact: () => compactSession(conv),
     noteToAgent: text => noteToAgent(conv, text),
     recordCommand: (name, args) => recordCommand(conv, name, args),
     permissionMode: () => conv.permissionMode,
@@ -2910,6 +2947,11 @@ async function runSession(conv: Conversation): Promise<void> {
       // Persist immediately: a crash before the first reply should still leave
       // a resumable session behind.
       if (m.session_id) conv.setSessionId(m.session_id)
+    } else if (m.type === 'system' && m.subtype === 'status' && m.compact_result) {
+      log(`[${conv.key}] compact ${m.compact_result}${m.compact_error ? `: ${m.compact_error}` : ''}`)
+      if (m.compact_result !== 'success') conv.compactWaiter?.({ ok: false, error: m.compact_error })
+    } else if (m.type === 'system' && m.subtype === 'compact_boundary') {
+      conv.compactWaiter?.({ ok: true, pre: m.compact_metadata?.pre_tokens, post: m.compact_metadata?.post_tokens })
     } else if (m.type === 'system' && m.subtype === 'background_tasks_changed') {
       liveTasks.clear()
       for (const t of m.tasks ?? []) if (!t.ambient) liveTasks.add(t.task_id)
