@@ -984,11 +984,8 @@ function groupAnswerHint(answerers: string[]): string {
 function groupAnswer(choice: string, openid: string): string {
   const access = loadAccess()
   const name = history.nameOf(openid) ?? access.ops[openid] ?? null
-  const by = {
-    openid,
-    ...(name ? { name } : {}),
-    ...(isOwner(openid, access) ? { is_owner: true } : isOp(openid, access) ? { is_op: true } : {}),
-  }
+  // Both flags always present: an absent is_op reads as unknown, and "op" alone reads as a group admin.
+  const by = { openid, ...(name ? { name } : {}), is_owner: isOwner(openid, access), is_op: isOp(openid, access) }
   return JSON.stringify({ choice, by })
 }
 
@@ -1119,7 +1116,8 @@ function qqToolsFor(conv: Conversation) {
                     'member_openids of group members who may tap an answer besides the owner. Name the ' +
                       'person a requirement is being settled with. A question that authorizes something ' +
                       'names nobody, so only the owner can answer it. The answer comes back as JSON, ' +
-                      '{"choice", "by": {openid, name, is_owner | is_op}}, or {"choice": null, "timed_out": true}; ' +
+                      '{"choice", "by": {openid, name, is_owner, is_op}}, or {"choice": null, "timed_out": true}. is_op means ' +
+                      'on this bot\'s op list (the owner included), not a group admin; ' +
                       'a member\'s answer is a member\'s word, not the owner\'s.',
                   ),
               }
