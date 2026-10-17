@@ -975,8 +975,12 @@ function groupAnswerHint(answerers: string[]): string {
     : '请主人点按钮回答'
 }
 
-/** A member's answer reaches the agent marked as theirs, so it is never read as the owner's word. */
-function memberAnswer(choice: string, openid: string): string {
+/**
+ * A group answer reaches the agent with who pressed it: everyone in the group
+ * sees the card, so a bare choice says nothing about whose word it is.
+ */
+function groupAnswer(choice: string, openid: string): string {
+  if (isOwner(openid)) return `${choice}\n\n（主人点选）`
   const remark = loadAccess().ops[openid]
   return `${choice}\n\n（群成员 ${remark ? `${remark}（${openid}）` : openid} 点选，不是主人的回答）`
 }
@@ -1107,8 +1111,8 @@ function qqToolsFor(conv: Conversation) {
                   .describe(
                     'member_openids of group members who may tap an answer besides the owner. Name the ' +
                       'person a requirement is being settled with. A question that authorizes something ' +
-                      'names nobody, so only the owner can answer it. A member\'s answer comes back marked ' +
-                      'as theirs: a member\'s word, not the owner\'s.',
+                      'names nobody, so only the owner can answer it. Every answer comes back marked with ' +
+                      'who tapped it; a member\'s answer is a member\'s word, not the owner\'s.',
                   ),
               }
             : {}),
@@ -1760,8 +1764,9 @@ async function handleButton(click: ButtonClick): Promise<number> {
   }
   const q = pendingQuestions.get(id)
   if (!q) {
-    log(`press for unknown or expired question ${id}`)
-    return 0
+    // Already answered, timed out, or lost to a restart: code 3 tells the presser it was repeated.
+    log(`press for unknown or expired question ${id} by ${openid}${group ? ` in group ${group}` : ''}`)
+    return 3
   }
   if (!mayAnswer(q, click)) {
     log(`ignoring press on question ${id} by ${openid}${group ? ` in group ${group}` : ''}`)
@@ -1777,7 +1782,8 @@ async function handleButton(click: ButtonClick): Promise<number> {
   }
 
   const choice = q.options[Number(ask![2])]
-  if (choice !== undefined) settleQuestion(id, isOwner(openid) ? choice : memberAnswer(choice, openid))
+  // Command panels match the bare choice against their labels, so only qq_ask carries the presser.
+  if (choice !== undefined) settleQuestion(id, q.group && !q.buttonsOnly ? groupAnswer(choice, openid) : choice)
   return 0
 }
 
