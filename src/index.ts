@@ -504,6 +504,17 @@ class Conversation {
   /** Settles the /compact that is waiting on this session; see `compactSession`. */
   compactWaiter: ((r: CompactOutcome) => void) | null = null
   /**
+   * How many tokens the context held after the session's latest model call,
+   * which is what the next call reads back. 0 until a call runs in this process.
+   */
+  contextTokens = 0
+  /** Auto-compaction has already been tried on this context; a new model call clears it. See `autoCompactDue`. */
+  autoCompactTried = false
+  /** Groups only: park once the auto-compaction started at idle time has finished. */
+  parkAfterCompact = false
+  /** What auto-compaction did while nobody was talking, shown at the top of the next reply here. */
+  compactNote: string | null = null
+  /**
    * Messages handed to the session that no turn has finished answering, by
    * uuid, with who sent them. Claude Code lists the messages a turn took on
    * its result and reports each `completed` after it; either settles one.
@@ -1600,6 +1611,8 @@ function compactSession(conv: Conversation): Promise<CompactOutcome> | null {
 function enqueue(conv: Conversation, text: string, images: FetchedImage[], from: InputKind = 'human'): void {
   conv.lastActivity = Date.now()
   conv.startFailed = false
+  // Wanted again: a session someone is talking to is not parked when it finishes.
+  conv.parkAfterCompact = false
   const blocks: ContentBlock[] = images.map(image => ({
     type: 'image',
     source: { type: 'base64', media_type: image.mediaType, data: image.data },
@@ -2812,7 +2825,7 @@ async function runSession(conv: Conversation): Promise<void> {
   async function trace(text: string): Promise<void> {
     if (conv.silent()) return
     try {
-      streamer ??= newStreamer()
+      streamer ??= await openStreamer()
       await streamer.push(text, 'trace')
       traceTail = text
     } catch (err) {
@@ -2826,7 +2839,7 @@ async function runSession(conv: Conversation): Promise<void> {
   async function traceNow(text: string): Promise<void> {
     if (conv.silent()) return
     try {
-      streamer ??= newStreamer()
+      streamer ??= await openStreamer()
       if (await streamer.pushNow(text, 'trace')) {
         traceTail = text
       }
@@ -2927,6 +2940,24 @@ async function runSession(conv: Conversation): Promise<void> {
     return s
   }
 
+  /**
+   * A new streamer, led by the auto-compaction note when one is waiting: it
+   * rides at the top of the reply rather than going out on its own, so the
+   * operator learns of it when they next talk here, not from a buzz while
+   * nobody was. Not into a streamer resuming a cut-off code block, where it
+   * would land inside the block; the next one takes it.
+   */
+  async function openStreamer(): Promise<LineStreamer> {
+    const resuming = carriedFence !== null
+    const s = newStreamer()
+    const note = conv.compactNote
+    if (note && !resuming) {
+      conv.compactNote = null
+      await s.push(`${note}\n\n`)
+    }
+    return s
+  }
+
   for await (const message of q as any) {
     const m = message as any
     // Anything at all, a subagent's frames included, is the session not idle.
@@ -2970,6 +3001,7 @@ async function runSession(conv: Conversation): Promise<void> {
       log(`[${conv.key}] compact ${m.compact_result}${m.compact_error ? `: ${m.compact_error}` : ''}`)
       if (m.compact_result !== 'success') conv.compactWaiter?.({ ok: false, error: m.compact_error })
     } else if (m.type === 'system' && m.subtype === 'compact_boundary') {
+      conv.contextTokens = m.compact_metadata?.post_tokens ?? 0
       conv.compactWaiter?.({ ok: true, pre: m.compact_metadata?.pre_tokens, post: m.compact_metadata?.post_tokens })
     } else if (m.type === 'system' && m.subtype === 'background_tasks_changed') {
       liveTasks.clear()
@@ -3054,7 +3086,7 @@ async function runSession(conv: Conversation): Promise<void> {
           streamedText = true
         } else if (delta?.type === 'text_delta') {
           if (!streamer) {
-            streamer = newStreamer()
+            streamer = await openStreamer()
             log(`[${conv.key}] streamer #${streamer.id} created for ${conv.chat.replyTo()?.slice(-8) ?? 'none'}`)
           }
           streamedText = true
@@ -3091,6 +3123,17 @@ async function runSession(conv: Conversation): Promise<void> {
           )
           .join(', ')} streamedText=${streamedText}`,
       )
+      // Everything this call read plus what it wrote is what the next call
+      // reads back. A synthetic message (an interrupted turn's stand-in) reports
+      // zeros and says nothing about the context.
+      const u = m.message?.usage
+      const tokens = u
+        ? (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.output_tokens ?? 0)
+        : 0
+      if (tokens > 0) {
+        conv.contextTokens = tokens
+        conv.autoCompactTried = false
+      }
       for (const b of m.message?.content ?? []) {
         if (b.type === 'text' && b.text.trim() && conv.silent()) {
           log(`[${conv.key}] silent turn: ${b.text.length} chars not posted`)
@@ -3448,13 +3491,56 @@ function freeSlotsForWaiting(): void {
   }
 }
 
+// ------------------------------------------------------------ auto-compaction
+//
+// A big context left idle is compacted while its prompt cache is still warm:
+// the compaction reads it at the cached rate, and the next message starts from
+// the summary instead of re-reading all of it at full price once the cache has
+// gone. The private session is compacted shortly before the cache expires; a
+// group parks sooner than that, so it is compacted when it is due to park and
+// parked once that has finished.
+
+const AUTO_COMPACT_TOKENS = Number(process.env.QQ_AUTO_COMPACT_TOKENS) || 256_000
+/** Just inside the one-hour prompt cache. */
+const AUTO_COMPACT_IDLE_MS = (Number(process.env.QQ_AUTO_COMPACT_IDLE_MINUTES) || 55) * 60_000
+
+/** Whether `conv`'s context is big enough to compact, and has not been tried since it last grew. */
+function autoCompactDue(conv: Conversation): boolean {
+  return !conv.autoCompactTried && conv.contextTokens >= AUTO_COMPACT_TOKENS
+}
+
+function autoCompact(conv: Conversation, parkAfter: boolean): void {
+  const idle = spokenGap(Date.now() - conv.lastActivity)
+  const pending = compactSession(conv)
+  if (!pending) return
+  log(`[${conv.key}] auto-compacting ${conv.contextTokens} tokens after ${idle} idle`)
+  // Once per context, success or not: a compaction that failed is not retried
+  // every tick until the next model call gives it a new context to try on.
+  conv.autoCompactTried = true
+  // After compactSession, whose enqueue clears it.
+  conv.parkAfterCompact = parkAfter
+  const k = (n?: number) => (n === undefined ? '?' : `${Math.round(n / 1000)}k`)
+  void pending.then(r => {
+    if (r.ok) conv.compactNote = `🗜️ 空闲时已自动压缩上下文：${k(r.pre)} → ${k(r.post)}`
+    else log(`[${conv.key}] auto-compact failed: ${r.error ?? 'unknown'}`)
+  })
+}
+
 setInterval(
   () => {
     const now = Date.now()
-    for (const conv of servingGroups()) {
-      if (!conv.busy() && now - conv.lastActivity >= GROUP_IDLE_MS) {
-        park(conv, `idle for ${spokenGap(now - conv.lastActivity)}`)
+    for (const key of serving) {
+      const conv = conversations.get(key)!
+      if (conv.parking || conv.busy() || conv.compactWaiter) continue
+      if (conv.parkAfterCompact) {
+        conv.parkAfterCompact = false
+        park(conv, 'auto-compacted while idle')
+        continue
       }
+      const idle = now - conv.lastActivity
+      const parkDue = key !== PRIVATE_KEY && idle >= GROUP_IDLE_MS
+      if (autoCompactDue(conv) && (idle >= AUTO_COMPACT_IDLE_MS || parkDue)) autoCompact(conv, parkDue)
+      else if (parkDue) park(conv, `idle for ${spokenGap(idle)}`)
     }
     if (waiting.length) freeSlotsForWaiting()
   },
