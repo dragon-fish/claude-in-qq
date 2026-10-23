@@ -42,8 +42,9 @@ harness 本身：同一套工具、同样的 skills 和 hooks、一样的权限�
   常用的另有手打别名（`/cl` `/new` → `/clear`，`/cd` → `/cwd`，`/ctx` → `/context` 等，`/help` 里列全）；
   别名不进面板，撞上正式命令名时正式的优先
 - **图片进出**：发图给它看；它用**顶头独占一行**的 `MEDIA:/绝对路径` 把文件发回来，文件会插在正文
-  对应的位置而不是堆在末尾。一条消息只能带一个附件，所以多个文件它会打包成 zip——手机 QQ 能直接
-  预览 zip 里的图，不用解压
+  对应的位置而不是堆在末尾。10MB 以内的 png/jpeg/gif/webp 直接嵌在消息正文里，几张都行；其他文件
+  作为附件发送，一条消息只能带一个附件，所以多个文件它会打包成 zip——手机 QQ 能直接预览 zip 里的
+  内容，不用解压
 - **用你的浏览器**：会话总是带 `--chrome` 启动，装了 [Claude in Chrome](https://chromewebstore.google.com/detail/claude/fcoeoabgfenejglbffodgkkbkcdhcgfn)
   扩展的话，它能直接操作你本机的 Chrome，沿用里面的登录状态。要求 CC 用 `/login` 登录（API Key 和
   `setup-token` 的长期 token 不行）；没装扩展或 Chrome 没开时，浏览器工具只会报未连接，其余照常
@@ -307,8 +308,13 @@ skills/install.sh --uninstall   # 卸
   `<details>` 折叠实测不支持。本项目的过程日志（trace）正是靠代码块渲染和它超过约 15 行自动折叠的
   特性，这两点都只有实测支撑，官方没有承诺
 - **按钮文字上限约 20 字**，且随屏幕宽度变化。选项过长时自动降级为截断标签，再不行退成 A/B/C/D
-- **一条消息只能带一个附件**：`media` 传数组会被拒（`40011000 请求数据异常`），markdown 里的外链
-  图片也不会被渲染。多张图只能打包成 zip——手机 QQ 可以直接预览里面的图，电脑版则需要下载
+- **一条消息只能带一个附件**：`media` 传数组会被拒（`40011000 请求数据异常`）。多个文件只能打包成
+  zip——手机 QQ 可以直接预览里面的内容，电脑版则需要下载
+- **图片走[素材管理](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/material-management.html)嵌进 markdown**：
+  上传后得到 `qqbot-media://` 引用，私聊和群通用。文档说宽高可选，实测**必填**——
+  `![alt](qqbot-media://…)` 只会显示成 `[alt]` 文字，要写成 `![alt #600px #300px](…)`。每个 bot
+  上限 100 张，满了 prepare 回 HTTP 400 `40035007`；**同一文件重复上传不去重**，各占一个名额。
+  删除不影响已发出的消息（发送时平台已转存）
 - **文件上限 200MB**：base64 直传（`file_data`）只收 5MB 以内，超过实测回 HTTP 500
   `850012 call inner proxy error`，所以 3.5MB 以上的文件走分片上传（`upload_prepare` → 逐片 PUT +
   `upload_part_finish` → 合并）。图片超 20MB、视频超 30MB 时 QQ 会降级成普通文件发送

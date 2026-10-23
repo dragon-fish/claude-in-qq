@@ -21,6 +21,7 @@ import {
 import { open } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
+import { imageSize } from 'image-size'
 
 // ---------------------------------------------------------------- paths & env
 
@@ -1281,9 +1282,10 @@ export async function fetchImage(
 }
 
 /**
- * A line of exactly `MEDIA:/absolute/path` asks for that file to be sent as a
- * native attachment. Claude has no way to hand over a file otherwise — it can
- * describe a screenshot or a log, but not give it to you.
+ * A line of exactly `MEDIA:/absolute/path` asks for that file to be handed
+ * over: an image is shown in place (see uploadInlineImage), anything else is
+ * sent as a native attachment. Claude has no way to hand over a file
+ * otherwise — it can describe a screenshot or a log, but not give it to you.
  */
 export const MEDIA_LINE_RE = /^MEDIA:[ \t]*(\S.*?)[ \t]*$/gm
 
@@ -1529,6 +1531,125 @@ export async function sendGroupFile(group: string, path: string, caption?: strin
     refIdx: data.ext_info?.ref_idx ?? null,
     content: `[${label}] ${basename(path)}${caption ? `\n${caption}` : ''}`,
   })
+}
+
+// -------------------------------------------------------------- inline images
+//
+// The bot's material library holds images that markdown can reference as
+// `qqbot-media://…`, so a picture sits inside the message that talks about it
+// instead of arriving as an attachment of its own. A reference belongs to the
+// bot, not to a chat: one upload works in private and group chats alike.
+//
+// @see https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/material-management.html
+
+const MATERIAL_MAX_BYTES = 10 * 1024 * 1024
+
+/** prepare/complete refuse with this once the library holds 100 images. */
+const MATERIAL_QUOTA_FULL = '40035007'
+
+/**
+ * Upload an image to the material library and return the markdown line that
+ * shows it, or null when the library does not take the file (png, jpeg, gif
+ * and webp up to 10MB; SVG and the rest go as attachments).
+ *
+ * The size is not optional, whatever the docs say: without `#Wpx #Hpx` QQ
+ * renders the image as the literal text `[alt]`. `#` and brackets are kept out
+ * of the alt text, where they would be read as part of that syntax.
+ *
+ * QQ does not deduplicate — the same file uploaded twice takes two of the 100
+ * slots, with two image_ids. When the library is full the oldest image goes;
+ * messages already sent keep it, because QQ copies the image at send time.
+ */
+export async function uploadInlineImage(path: string): Promise<string | null> {
+  const contentType = IMAGE_MEDIA_TYPES[path.split('.').pop()?.toLowerCase() ?? '']
+  if (!contentType || statSync(path).size > MATERIAL_MAX_BYTES) return null
+
+  const bytes = readFileSync(path)
+  const dim = imageSize(bytes)
+  // EXIF orientations 5-8 turn the picture a quarter, so it shows rotated.
+  const turned = (dim.orientation ?? 1) >= 5
+  const width = turned ? dim.height : dim.width
+  const height = turned ? dim.width : dim.height
+
+  let url: string
+  try {
+    url = await uploadMaterial(path, bytes, contentType)
+  } catch (err) {
+    if (!String(err).includes(MATERIAL_QUOTA_FULL)) throw err
+    await deleteOldestMaterial()
+    url = await uploadMaterial(path, bytes, contentType)
+  }
+  const alt = basename(path).replace(/[#[\]]/g, '')
+  return `![${alt} #${width}px #${height}px](${url})`
+}
+
+/** prepare, PUT the bytes to the presigned COS URL, complete. Returns the `qqbot-media://` URL. */
+async function uploadMaterial(path: string, bytes: Buffer<ArrayBuffer>, contentType: string): Promise<string> {
+  const prepareRes = await withRetry(UPLOAD_ATTEMPTS, 1000, () =>
+    qqFetch('/v2/media-images/prepare', {
+      method: 'POST',
+      body: JSON.stringify({
+        file_name: basename(path),
+        file_size: bytes.byteLength,
+        content_type: contentType,
+        md5: createHash('md5').update(bytes).digest('hex'),
+        sha1: createHash('sha1').update(bytes).digest('hex'),
+      }),
+    }),
+  )
+  if (!prepareRes.ok) throw new Error(`素材预上传失败 ${prepareRes.status}: ${(await prepareRes.text()).slice(0, 200)}`)
+  const prepare = (await prepareRes.json()) as { upload_id?: string; presigned_url?: string }
+  if (!prepare.upload_id || !prepare.presigned_url) {
+    throw new Error(`素材预上传响应缺少 upload_id 或 presigned_url: ${JSON.stringify(prepare).slice(0, 200)}`)
+  }
+
+  // COS answers 403 unless Content-Type is exactly what prepare declared.
+  const url = prepare.presigned_url
+  const put = await withRetry(UPLOAD_ATTEMPTS, 1000, () =>
+    fetch(url, {
+      method: 'PUT',
+      body: bytes,
+      headers: { 'Content-Type': contentType },
+      signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS),
+    }),
+  )
+  if (!put.ok) throw new Error(`素材上传失败 ${put.status}: ${(await put.text()).slice(0, 200)}`)
+  const etag = (put.headers.get('etag') ?? '').replace(/"/g, '')
+
+  const completeRes = await withRetry(UPLOAD_ATTEMPTS, 1000, () =>
+    qqFetch('/v2/media-images/complete', {
+      method: 'POST',
+      body: JSON.stringify({ upload_id: prepare.upload_id, md5: etag }),
+    }),
+  )
+  if (!completeRes.ok) {
+    throw new Error(`素材确认失败 ${completeRes.status}: ${(await completeRes.text()).slice(0, 200)}`)
+  }
+  const done = (await completeRes.json()) as { url?: string }
+  if (!done.url) throw new Error(`素材确认响应缺少 url: ${JSON.stringify(done).slice(0, 200)}`)
+  return done.url
+}
+
+/** Free a slot by deleting the oldest image in the library. */
+async function deleteOldestMaterial(): Promise<void> {
+  let oldest: { image_id: string; created_at: number } | null = null
+  let cursor = ''
+  do {
+    const res = await qqFetch(`/v2/media-images${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`)
+    if (!res.ok) throw new Error(`素材列表获取失败 ${res.status}: ${(await res.text()).slice(0, 200)}`)
+    // Numbers arrive as strings ("total":"2", "created_at":"1792725093").
+    const page = (await res.json()) as { images?: { image_id: string; created_at: string }[]; next_cursor?: string }
+    for (const img of page.images ?? []) {
+      const createdAt = Number(img.created_at)
+      if (!oldest || createdAt < oldest.created_at) oldest = { image_id: img.image_id, created_at: createdAt }
+    }
+    cursor = page.next_cursor ?? ''
+  } while (cursor)
+  if (!oldest) throw new Error('素材库已满，但列表为空')
+
+  const res = await qqFetch(`/v2/media-images/${oldest.image_id}/delete`, { method: 'DELETE' })
+  if (!res.ok) throw new Error(`素材删除失败 ${res.status}: ${(await res.text()).slice(0, 200)}`)
+  log(`material library full, deleted oldest ${oldest.image_id}`)
 }
 
 // -------------------------------------------------------------------- gateway

@@ -80,6 +80,7 @@ import {
   STATE_DIR,
   syncCommandPanel,
   onBeforeSend,
+  uploadInlineImage,
   type ButtonClick,
   type GroupMember,
   type InboundGroupMessage,
@@ -1276,8 +1277,8 @@ function qqToolsFor(conv: Conversation) {
         "Post text to this conversation's own QQ chat — the private chat, or this group. Only needed in a " +
           'turn started by a message from another agent: such a turn is silent, and what you write in it ' +
           'reaches nobody. Use it when the owner or this chat should see something then. In any other turn ' +
-          'just write; your words are posted anyway. MEDIA:/absolute/path lines in the text are sent as ' +
-          'files, as in an ordinary reply.',
+          'just write; your words are posted anyway. MEDIA:/absolute/path lines in the text show images ' +
+          'in place and send other files, as in an ordinary reply.',
         { text: z.string().min(1).describe('What to post, markdown as in an ordinary reply') },
         async ({ text }) => {
           try {
@@ -2164,10 +2165,38 @@ function summariseResult(name: string, content: unknown): string | null {
   return shown.join('\n')
 }
 
-/** Send a reply, pulling out any MEDIA: lines and uploading those files. */
+/**
+ * The markdown line that shows the image at `path` in place, or null when it
+ * has to go as an attachment instead: not an image the material library
+ * takes, or the upload failed. A failed upload falls back rather than drops,
+ * because the file was asked for either way.
+ */
+async function inlineImage(conv: Conversation, path: string): Promise<string | null> {
+  try {
+    const line = await uploadInlineImage(nativePath(path, conv.workdir))
+    if (line) log(`inlined image ${path}`)
+    return line
+  } catch (err) {
+    log(`inline upload failed for ${path}, sending as attachment:`, err)
+    return null
+  }
+}
+
+/**
+ * Send a reply. MEDIA lines naming an image become that image in place; the
+ * rest are pulled out and sent as attachments.
+ */
 async function deliverReply(conv: Conversation, text: string): Promise<void> {
+  const found = [...text.matchAll(MEDIA_LINE_RE)].map(m => m[1].trim())
+  const inline = new Map<string, string | null>()
+  for (const p of found) if (!inline.has(p)) inline.set(p, await inlineImage(conv, p))
+
   const paths: string[] = []
+  let shown = false
   const prose = text.replace(MEDIA_LINE_RE, (_m, p: string) => {
+    const line = inline.get(p.trim())
+    shown ||= Boolean(line)
+    if (line) return line
     paths.push(p.trim())
     return ''
   })
@@ -2176,8 +2205,8 @@ async function deliverReply(conv: Conversation, text: string): Promise<void> {
 
   // One file with a short note becomes a single captioned message — the note
   // belongs to the file. Longer prose goes separately so it keeps its markdown,
-  // which a caption does not render.
-  const asCaption = paths.length === 1 && remaining.length > 0 && remaining.length <= CAPTION_LIMIT
+  // which a caption does not render; so does any text showing an image.
+  const asCaption = !shown && paths.length === 1 && remaining.length > 0 && remaining.length <= CAPTION_LIMIT
   if (remaining && !asCaption) await conv.chat.send(remaining)
 
   for (const [i, path] of paths.entries()) {
@@ -2240,6 +2269,8 @@ class LineStreamer {
 
   constructor(
     private readonly open: () => StreamHandle,
+    /** The markdown line showing an image in place, or null when it must go as an attachment. */
+    private readonly inlineImage: (path: string) => Promise<string | null>,
     private readonly sendMedia: (path: string) => Promise<void>,
     private readonly sendText: (text: string) => Promise<void>,
   ) {}
@@ -2670,13 +2701,24 @@ class LineStreamer {
         prose += line
         continue
       }
-      // A file interrupts the stream: the text before it is finished and sent,
-      // the attachment goes out, and what follows starts a new one. That is what
-      // puts the picture where the writing referred to it, instead of stacking
-      // every image after the prose has ended.
+      // An image the material library takes stays in the stream, as a
+      // markdown line where the MEDIA line was. The text before it is queued
+      // first so it is not held up by the upload; what arrives meanwhile piles
+      // up behind and goes out together once the upload returns.
       await flush()
-      // flush only queued it. The picture may not overtake the words that
-      // introduce it, so the drain has to finish before the message closes.
+      const inline = await this.inlineImage(media[1])
+      if (inline !== null) {
+        prose += `${inline}${line.endsWith('\n') ? '\n' : ''}`
+        continue
+      }
+      // Any other file interrupts the stream: the text before it is finished
+      // and sent, the attachment goes out, and what follows starts a new one.
+      // That is what puts the file where the writing referred to it, instead of
+      // stacking every one after the prose has ended.
+      //
+      // The flush above only queued the text. The file may not overtake the
+      // words that introduce it, so the drain has to finish before the
+      // message closes.
       await this.settle()
       await this.stream?.end()
       this.stream = null
@@ -2786,11 +2828,24 @@ async function runSession(conv: Conversation): Promise<void> {
   let carriedFence: string | null = null
 
   /**
-   * Whether the streamer is sending an attachment from one of its own MEDIA
-   * lines. It ends its own message before the file goes out, so the seal that
-   * `sendFile` runs on the way finds nothing above it to close.
+   * Whether the streamer is handling one of its own MEDIA lines: uploading an
+   * image to show in place, or sending an attachment. An attachment ends the
+   * streamer's message itself before it goes out, so the seal `sendFile` runs
+   * on the way finds nothing above it to close. An upload takes seconds, and a
+   * send from elsewhere in that time — a command reply, qq_ask — must not seal
+   * the stream either: the image would land after it, in a stream nothing
+   * closes.
    */
   let sendingOwnMedia = false
+
+  async function ownMedia<T>(work: () => Promise<T>): Promise<T> {
+    sendingOwnMedia = true
+    try {
+      return await work()
+    } finally {
+      sendingOwnMedia = false
+    }
+  }
 
   async function closeStreamer(reason = 'before send'): Promise<boolean> {
     if (streamer) log(`sealing streamer #${streamer.id}: ${reason}${sendingOwnMedia ? ' (skipped: own media)' : ''}`)
@@ -2916,17 +2971,16 @@ async function runSession(conv: Conversation): Promise<void> {
   function newStreamer(): LineStreamer {
     const s = new LineStreamer(
       () => conv.chat.openStream(),
-      async path => {
-        sendingOwnMedia = true
-        try {
-          await conv.chat.sendFile(nativePath(path, conv.workdir))
-          log(`sent file ${path}`)
-        } catch (err) {
-          log(`failed to send ${path}:`, err)
-        } finally {
-          sendingOwnMedia = false
-        }
-      },
+      path => ownMedia(() => inlineImage(conv, path)),
+      path =>
+        ownMedia(async () => {
+          try {
+            await conv.chat.sendFile(nativePath(path, conv.workdir))
+            log(`sent file ${path}`)
+          } catch (err) {
+            log(`failed to send ${path}:`, err)
+          }
+        }),
       async text => {
         await conv.chat.send(text)
       },
