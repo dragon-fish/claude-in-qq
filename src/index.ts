@@ -1080,7 +1080,7 @@ async function askApproval(
   // shows, its braces and asterisks would otherwise read as formatting and
   // could disguise what is actually being approved.
   const body = [
-    `**🔐 Claude 要用 ${sanitize(toolName, 40)}**`,
+    `**🔐 Claude 要用 ${sanitize(toolLabel(toolName), 40)}**`,
     ...[originNote(conv)].filter(x => x !== null),
     '',
     '```',
@@ -2100,6 +2100,27 @@ function formatDuration(ms: number): string {
   return s < 60 ? `${s} 秒` : `${Math.floor(s / 60)} 分 ${s % 60} 秒`
 }
 
+/**
+ * A tool's name as shown to the operator. An MCP name carries its routing —
+ * `mcp__plugin_playwright_playwright__browser_navigate` — which in a row of
+ * names is mostly noise; this keeps the server and the tool, as
+ * `playwright·browser_navigate`. Plugin servers are named `plugin_<plugin>_<server>`
+ * and claude.ai connectors `claude_ai_<name>`; a plugin whose server shares its
+ * name collapses to one, and a tool that repeats its server's name drops it
+ * (`Notion·search`, not `Notion·notion-search`). Built-in tools pass through.
+ */
+function toolLabel(name: string): string {
+  const mcp = /^mcp__(.+?)__(.+)$/.exec(name)
+  if (!mcp) return name
+  let server = mcp[1].replace(/^claude_ai_/, '').replace(/^plugin_/, '')
+  const half = (server.length - 1) / 2
+  if (server[half] === '_' && server.slice(0, half) === server.slice(half + 1)) server = server.slice(0, half)
+  const tool = mcp[2]
+  const own = server.toLowerCase()
+  const repeats = [`${own}-`, `${own}_`].some(p => tool.toLowerCase().startsWith(p))
+  return `${server}·${repeats ? tool.slice(own.length + 1) : tool}`
+}
+
 /** Spawning a subagent is announced by its own start line instead. */
 function isSubagentTool(name: string): boolean {
   return name === 'Agent' || name === 'Task'
@@ -2137,7 +2158,7 @@ function summariseTool(name: string, input: Record<string, any>, workdir: string
     }
   })()
 
-  return arg ? `⚙️ ${name}  ${arg}` : `⚙️ ${name}`
+  return arg ? `⚙️ ${toolLabel(name)}  ${arg}` : `⚙️ ${toolLabel(name)}`
 }
 
 /**
@@ -3213,10 +3234,10 @@ async function runSession(conv: Conversation): Promise<void> {
             // Written straight through: without a newline to end it, a
             // buffered write would sit invisible until the next entry.
             if (lastKind === 'tools') {
-              await traceNow(`、${b.name}`)
+              await traceNow(`、${toolLabel(b.name)}`)
             } else {
               await traceEndLine()
-              await traceNow(`⚙️ ${b.name}`)
+              await traceNow(`⚙️ ${toolLabel(b.name)}`)
               traceStarted = true
               lastKind = 'tools'
             }
